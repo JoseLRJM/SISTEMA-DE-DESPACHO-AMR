@@ -1,0 +1,843 @@
+<!DOCTYPE html>
+
+<html lang="es">
+<head>
+<meta charset="UTF-8"/>
+<meta content="width=device-width,initial-scale=1" name="viewport"/>
+<title>SISTEMA DE DESPACHO LITE</title>
+<link href="/static/styles.css" rel="stylesheet"/>
+</head>
+<body>
+<header class="topbar"><div class="topbar-logo topbar-logo-left"><img alt="CRBT" src="/static/logo-crbt-white.png"/></div><div class="topbar-center"><div class="brand">SISTEMA DE DESPACHO LITE</div><div class="status status-centered" id="connStatus">Conectando…</div></div><div class="topbar-logo topbar-logo-right"><img alt="Mabuchi Motor" src="/static/logo-mabuchi.png"/></div></header>
+<main class="layout">
+<a href="/api/logs/download" download="app.log" id="btnDownloadLogs" style="position:fixed;top:64px;right:16px;z-index:20;padding:9px 10px;border-radius:10px;border:1px solid #24324a;background:#111a2a;color:#e7eefc;text-decoration:none;line-height:1;white-space:nowrap;">Descargar LOGS</a>
+<section class="panel grid-panel">
+<div class="panel-title">
+<div class="title-left"></div>
+<div class="title-right">
+<button class="btn ghost" id="btnCenterGrid" type="button">Centrar</button>
+<div class="legend">
+<span class="dot" style="background:#16a34a"></span> AGV libre
+            <span class="dot" style="background:#2563eb"></span> AGV en tarea
+            <span class="dot" style="background:#f59e0b"></span> AGV en pausa / espera
+            <span class="dot" style="background:#dc2626"></span> AGV con error
+            <span class="dot" style="background:#6b7280"></span> AGV sin conexión
+          </div>
+</div>
+</div>
+<div class="canvas-wrap" style="position:relative;">
+<canvas height="1000" id="gridCanvas" tabindex="0" width="1000"></canvas>
+<div class="cell-hover-tooltip hidden" id="cellHoverTooltip"></div>
+<div class="robot-monitor-panel" id="robotMonitorPanel">
+<div class="robot-monitor-header" id="robotMonitorHeader">
+<div>
+<div class="robot-monitor-title">Estado AMR</div>
+<div class="robot-monitor-subtitle" id="robotMonitorSubtitle"></div>
+</div>
+<div class="robot-monitor-actions">
+<button class="btn ghost robot-monitor-mini-btn" id="btnRobotMonitorRefresh" type="button">↻</button>
+</div>
+</div>
+<div class="robot-monitor-body" id="robotMonitorBody">
+<div class="robot-monitor-empty">Sin datos todavía.</div>
+</div>
+<div class="robot-monitor-resize-handle" id="robotMonitorResizeHandle"></div>
+</div>
+</div>
+<div class="hint">
+        Tip: rueda del mouse para zoom, click derecho/medio para mover. Las áreas, celdas, racks y materiales se guardan en la base de datos.
+      </div>
+</section>
+<div class="splitter splitter-v" id="splitterV" title="Arrastra para cambiar el ancho de Acciones"></div>
+<div class="splitter splitter-h" id="splitter" title="Arrastra para cambiar el alto de la matriz"></div>
+<aside class="panel side-panel">
+<div class="panel-title">Acciones</div>
+<div class="card" id="card-workstation">
+<h3>Estación de trabajo</h3>
+<div class="row two-col">
+<div>
+<label>Ventana</label>
+<select id="operatorWindowSelect">
+<option value="">Selecciona una ventana</option>
+</select>
+</div>
+<div>
+<label>Contraseña</label>
+<input id="operatorWindowPassword" placeholder="Si aplica" type="password"/>
+</div>
+</div>
+
+<div class="operator-buttons-wrap" id="operatorButtonsBox">
+<div class="small">Selecciona una ventana y captura su contraseña para ver los botones.</div>
+</div>
+<div class="card hidden" id="operatorActionPanel">
+<h3 id="operatorActionPanelTitle">Parámetros de la acción</h3>
+<div class="small" id="operatorActionPanelModeLabel"></div>
+<div class="row two-col hidden" id="operatorActionInlineCells">
+<div class="operator-action-col">
+<label>Origen seleccionado</label>
+<div class="list-box compact-box"><div class="small" id="operatorActionSourceLabel">Sin seleccionar</div></div>
+<button class="btn ghost" id="btnOperatorActionPickSource" type="button">Seleccionar en matriz</button>
+</div>
+<div class="operator-action-col">
+<div id="operatorActionDestinationCellWrap">
+<label>Destino seleccionado</label>
+<div class="list-box compact-box"><div class="small" id="operatorActionDestinationLabel">Sin seleccionar</div></div>
+<button class="btn ghost" id="btnOperatorActionPickDestination" type="button">Seleccionar en matriz</button>
+</div>
+<div class="hidden" id="operatorActionAreaWrap">
+<label>Área destino</label>
+<select id="operatorActionAreaSelect"><option value="">Selecciona</option></select>
+<div class="small" id="operatorActionAreaDestinationLabel">Sin configurar</div>
+</div>
+</div>
+</div>
+<div class="row two-col hidden" id="operatorActionRackInfoRow">
+<div>
+<label>Material</label><select id="operatorActionMaterial"><option value="">Selecciona</option></select></div>
+<div>
+<label>Rack en celda seleccionada</label>
+<div class="list-box"><div class="small" id="operatorActionRackInfo">Sin seleccionar</div></div>
+</div>
+</div>
+<div id="operatorActionPointFields" class="hidden">
+<div id="operatorActionDynamicFields"></div>
+</div>
+<div class="row two-col" id="operatorActionAgvTaskRow">
+<div><label>AGV</label><input id="operatorActionAgv" type="text" placeholder="Ej. AGV01"/></div>
+<div><label>Tipo de tarea</label><input id="operatorActionTaskTyp" type="text" value="A01"/></div>
+</div>
+<div class="row">
+<button class="btn preview-accent" id="btnOperatorActionPreview" type="button">Vista previa</button>
+<button class="btn ghost" id="btnOperatorActionPanelClear" type="button">Limpiar selección</button>
+</div>
+<div class="small" id="operatorWindowMsg"></div>
+</div>
+</div>
+<div class="card" id="card-general">
+<h3>Configuración general</h3>
+<div class="row two-col">
+<div>
+<label>Filas</label>
+<input disabled="" id="dispRows" max="100" min="1" type="number"/>
+</div>
+<div>
+<label>Columnas</label>
+<input disabled="" id="dispCols" max="100" min="1" type="number"/>
+</div>
+</div>
+<div class="row two-col">
+<button class="btn danger" disabled="" id="btnHideConfiguredRange">Ocultar rango</button>
+<button class="btn" disabled="" id="btnShowConfiguredRange">Mostrar rango</button>
+</div>
+<div class="row two-col">
+<div>
+<label>Refresh fallback (s)</label>
+<input disabled="" id="runtimeRefreshSeconds" max="120" min="2" step="1" type="number" value="5"/>
+</div>
+<div>
+<label>Reconexión WebSocket (s)</label>
+<input disabled="" id="runtimeReconnectSeconds" max="60" min="1" step="1" type="number" value="3"/>
+</div>
+</div>
+<div class="row two-col">
+<div>
+<label>Escala X posición AGV</label>
+<input disabled="" id="agvOverlayScaleX" max="1000000" min="-1000000" step="0.0001" type="number" value="1"/>
+</div>
+<div>
+<label>Escala Y posición AGV</label>
+<input disabled="" id="agvOverlayScaleY" max="1000000" min="-1000000" step="0.0001" type="number" value="1"/>
+</div>
+</div>
+<div class="row two-col">
+<div>
+<label>Offset X posición AGV</label>
+<input disabled="" id="agvOverlayOffsetX" max="1000000" min="-1000000" step="0.1" type="number" value="0"/>
+</div>
+<div>
+<label>Offset Y posición AGV</label>
+<input disabled="" id="agvOverlayOffsetY" max="1000000" min="-1000000" step="0.1" type="number" value="0"/>
+</div>
+</div>
+<div class="row two-col">
+<div>
+<label>Rotación posición AGV (°)</label>
+<input disabled="" id="agvOverlayRotationDeg" max="3600" min="-3600" step="0.1" type="number" value="0"/>
+</div>
+<div>
+<label>Espejo X posición AGV</label>
+<select disabled="" id="agvOverlayMirrorX">
+<option value="0">No</option>
+<option value="1">Sí</option>
+</select>
+</div>
+</div>
+<div class="row two-col">
+<div>
+<label>Espejo Y posición AGV</label>
+<select disabled="" id="agvOverlayMirrorY">
+<option value="0">No</option>
+<option value="1">Sí</option>
+</select>
+</div>
+<div>
+<label>Invertir giro/orientación carrito</label>
+<select disabled="" id="agvIconAngleMirror">
+<option selected="" value="0">No</option>
+<option value="1">Sí</option>
+</select>
+</div>
+<div>
+<label>Offset orientación carrito AGV (°)</label>
+<input disabled="" id="agvOrientationOffsetDeg" max="3600" min="-3600" step="0.1" type="number" value="0"/>
+</div>
+</div>
+<div class="row"><hr style="width:100%;border:none;border-top:1px solid rgba(255,255,255,.08);margin:6px 0 2px"></div>
+<div class="row"><label><b>Cliente externo</b></label></div>
+<div class="row">
+<label>IP cliente</label>
+<input disabled="" id="clientIp" type="text"/>
+<button class="btn" disabled="" id="btnSaveClientIp">Guardar</button>
+</div>
+<div class="row"><label><b>Fondo de matriz</b></label></div>
+<div class="row"><input accept="image/*" disabled="" id="bgFile" type="file"/><button class="btn" disabled="" id="btnUploadBg">Subir imagen</button></div>
+<div class="row two-col">
+<div><label>Scale X</label><input disabled="" id="bgScaleX" max="20" min="0.05" step="0.05" type="number" value="1"/></div>
+<div><label>Scale Y</label><input disabled="" id="bgScaleY" max="20" min="0.05" step="0.05" type="number" value="1"/></div>
+</div>
+<div class="row two-col">
+<div><label>Offset X</label><input disabled="" id="bgOffX" max="1000" min="-1000" step="0.25" type="number" value="0"/></div>
+<div><label>Offset Y</label><input disabled="" id="bgOffY" max="1000" min="-1000" step="0.25" type="number" value="0"/></div>
+</div>
+<div class="small" id="bgStateLbl">Sin imagen</div>
+<div class="row">
+<button class="btn primary" disabled="" id="btnSaveGeneralConfig">Guardar configuración</button>
+</div>
+</div>
+<div class="card" id="card-history">
+<h3>Historial</h3>
+<div class="row">
+<button class="btn" id="btnRefreshOrders">Actualizar historial</button>
+<button class="btn" id="btnSimulateComplete">Simular tarea finalizada</button>
+<button class="btn danger" id="btnUndoOrder">Cancelar</button>
+<button class="btn danger" id="btnDeleteOrder" style="display:none;">Borrar del historial</button>
+</div>
+<div class="list-box" id="ordersList"></div>
+<div class="list-box" id="orderDetailBox">
+<div class="small">Selecciona una tarea del historial.</div>
+</div>
+<div class="small" id="orderMsg"></div>
+</div>
+<div class="card" id="card-cell">
+<h3>Celda seleccionada</h3>
+<div class="small" id="selectedCellTitle">Celda (0, 0)</div>
+<div class="row two-col">
+<div>
+<label>Fila</label>
+<input disabled="" id="cellY" type="number"/>
+</div>
+<div>
+<label>Columna</label>
+<input disabled="" id="cellX" type="number"/>
+</div>
+</div>
+<div class="row">
+<label>Código</label>
+<input disabled="" id="cellCode" type="text"/>
+</div>
+<div class="row two-col">
+<div>
+<label>Estado</label>
+<select disabled="" id="cellStatus">
+<option value="0">Libre</option>
+<option value="1">Ocupada</option>
+</select>
+</div>
+<div>
+<label>Habilitada</label>
+<select disabled="" id="cellEnabled">
+<option value="1">Sí</option>
+<option value="0">No</option>
+</select>
+</div>
+</div>
+<div class="row two-col">
+<div>
+<label>Visible</label>
+<select disabled="" id="cellVisible">
+<option value="1">Sí</option>
+<option value="0">No</option>
+</select>
+</div>
+<div>
+<label>Área</label>
+<select disabled="" id="cellArea">
+<option value="">Sin área</option>
+</select>
+</div>
+</div>
+<div class="row">
+<label>Rack</label>
+<select disabled="" id="cellRack">
+<option value="">Sin rack</option>
+</select>
+</div>
+<div class="row two-col">
+<div>
+<label>Estado de reserva</label>
+<select disabled="" id="cellReservationState">
+<option value="0">No reservado</option>
+<option value="1">Reservado</option>
+</select>
+</div>
+<div>
+<label>Rack asociado</label>
+<input disabled="" id="cellReservationRack" readonly="" type="text"/>
+</div>
+</div>
+<div class="row">
+<label>Tarea de reserva</label>
+<input disabled="" id="cellReservationTask" readonly="" type="text"/>
+</div>
+<div class="row">
+<label>Nota</label>
+<textarea disabled="" id="cellNote" rows="3"></textarea>
+</div>
+<div class="row">
+<button class="btn primary" disabled="" id="btnSaveCell">Guardar celda</button>
+</div>
+<div class="small" id="cellMsg"></div>
+</div>
+<div class="card" id="card-areas">
+<h3>Áreas</h3>
+<input id="areaId" type="hidden"/>
+<div class="row two-col">
+<div><label>Código</label><input disabled="" id="areaCode" type="text"/></div>
+<div><label>Nombre</label><input disabled="" id="areaName" type="text"/></div>
+</div>
+<div class="row two-col">
+<div><label>Tipo</label><input disabled="" id="areaType" type="text"/></div>
+<div><label>Color</label><input disabled="" id="areaColor" type="color" value="#4f46e5"/></div>
+</div>
+<div class="row two-col">
+<div><label>Prioridad</label><input disabled="" id="areaPriority" max="9999" min="0" type="number"/></div>
+<div><label>Activa</label><select disabled="" id="areaActive"><option value="1">Sí</option><option value="0">No</option></select></div>
+</div>
+<div class="row"><label>Descripción</label><textarea disabled="" id="areaDescription" rows="2"></textarea></div>
+<div class="row"><button class="btn primary" disabled="" id="btnSaveArea">Guardar área</button><button class="btn ghost" disabled="" id="btnNewArea">Nueva</button><button class="btn danger" disabled="" id="btnDeleteArea">Borrar</button></div>
+<div class="list-box" id="areasList"></div>
+<div class="small" id="areaMsg"></div>
+</div>
+<div class="card" id="card-materials">
+<h3>Materiales</h3>
+<input id="materialId" type="hidden"/>
+<div class="row two-col">
+<div><label>Código</label><input disabled="" id="materialCode" type="text"/></div>
+<div><label>Nombre</label><input disabled="" id="materialName" type="text"/></div>
+</div>
+<div class="row two-col">
+<div><label>Color</label><input disabled="" id="materialColor" type="color" value="#7c3aed"/></div>
+<div><label>Activo</label><select disabled="" id="materialActive"><option value="1">Sí</option><option value="0">No</option></select></div>
+</div>
+<div class="row"><label>Descripción</label><textarea disabled="" id="materialDescription" rows="2"></textarea></div>
+<div class="row"><button class="btn primary" disabled="" id="btnSaveMaterial">Guardar material</button><button class="btn ghost" disabled="" id="btnNewMaterial">Nuevo</button><button class="btn danger" disabled="" id="btnDeleteMaterial">Borrar</button></div>
+<div class="list-box" id="materialsList"></div>
+<div class="small" id="materialMsg"></div>
+</div>
+<div class="card" id="card-racks">
+<h3>Racks</h3>
+<input id="rackId" type="hidden"/>
+<div class="row two-col">
+<div><label>Código</label><input disabled="" id="rackCode" type="text"/></div>
+<div><label>Nombre</label><input disabled="" id="rackName" type="text"/></div>
+</div>
+<div class="row two-col">
+<div><label>Estado</label><input disabled="" id="rackStatus" type="text" value="disponible"/></div>
+<div><label>Material</label><select disabled="" id="rackMaterial"><option value="">Sin material</option></select></div>
+</div>
+<div class="row two-col">
+<div><label>Estado de reserva</label><select disabled="" id="rackReservationState"><option value="0">No reservado</option><option value="1">Reservado</option></select></div>
+<div><label>Tarea de reserva</label><input disabled="" id="rackReservationTask" readonly="" type="text"/></div>
+</div>
+<div class="row two-col">
+<div><label>Lote</label><input disabled="" id="rackLot" type="text"/></div>
+<div><label>Cant.</label><input disabled="" id="rackQty" min="0" type="number" value="0"/></div>
+</div>
+<div class="row two-col">
+<div><label>Cód. fabricante</label><input disabled="" id="rackMfgCode" type="text"/></div>
+<div><label>FIFO ingreso</label><input disabled="" id="rackFifo" type="datetime-local"/></div>
+</div>
+<div class="row"><label>Últ. movimiento</label><input disabled="" id="rackMoved" type="datetime-local"/></div>
+<div class="row"><label>Comentario</label><textarea disabled="" id="rackComment" rows="2"></textarea></div>
+<div class="row">
+<div>
+<label>Características del rack</label>
+<div id="rackCustomFields"></div>
+<button class="btn ghost" disabled="" id="btnAddRackCustomField" type="button">Agregar característica</button>
+</div>
+</div>
+<div class="row"><button class="btn primary" disabled="" id="btnSaveRack">Guardar rack</button><button class="btn ghost" disabled="" id="btnNewRack">Nuevo</button><button class="btn danger" disabled="" id="btnDeleteRack">Borrar</button></div>
+<div class="list-box" id="racksList"></div>
+<div class="small" id="rackMsg"></div>
+</div>
+<div class="card" id="card-operator-windows">
+<h3>Ventanas configurables</h3>
+<div class="row">
+<label>Ventana</label>
+<select disabled="" id="adminWindowSelect">
+<option value="">Selecciona una ventana</option>
+</select>
+</div>
+<input id="operatorWindowId" type="hidden"/>
+<div class="row two-col">
+<div><label>Nombre</label><input disabled="" id="operatorWindowName" type="text"/></div>
+<div><label>Activa</label><select disabled="" id="operatorWindowActive"><option value="1">Sí</option><option value="0">No</option></select></div>
+</div>
+<div class="row two-col">
+<div><label>Color fondo</label><input disabled="" id="operatorWindowBgColor" type="color" value="#0f2747"/></div>
+<div><label>Cant. botones</label><input disabled="" id="operatorWindowButtonCount" max="24" min="1" type="number" value="1"/></div>
+</div>
+<div class="row">
+<label>Contraseña</label>
+<input disabled="" id="operatorWindowPasswordAdmin" placeholder="Deja vacío para quitarla" type="text"/>
+</div>
+<div class="row">
+<button class="btn primary" disabled="" id="btnSaveOperatorWindow">Guardar ventana</button>
+<button class="btn ghost" disabled="" id="btnNewOperatorWindow">Nueva</button>
+<button class="btn danger" disabled="" id="btnDeleteOperatorWindow">Borrar ventana</button>
+</div>
+<div class="list-box" id="operatorButtonList">
+<div class="small">Guarda o selecciona una ventana para configurar sus botones.</div>
+</div>
+<div class="row two-col">
+<div><label># Botón</label><input disabled="" id="operatorButtonIndex" type="number"/></div>
+<div><label>Activo</label><select disabled="" id="operatorButtonActive"><option value="1">Sí</option><option value="0">No</option></select></div>
+</div>
+<div class="row two-col">
+<div><label>Texto</label><input disabled="" id="operatorButtonLabel" type="text"/></div>
+<div><label>Color</label><input disabled="" id="operatorButtonColor" type="color" value="#1f4b99"/></div>
+</div>
+<div class="row two-col">
+<div><label>Modo</label><select disabled="" id="operatorButtonMode"><option value="fifo">Solicitud FIFO</option><option value="direct_move">Movimiento directo</option><option value="direct_move_config">Movimiento directo configurable</option><option value="point_to_area">Mover de punto a área</option><option value="cancel_return">Cancelar/devolver</option></select></div>
+<div><label>Prioridad</label><select disabled="" id="operatorButtonPriority"><option value="normal">Normal</option><option value="alta">Alta</option><option value="urgente">Urgente</option></select></div>
+</div>
+<div id="operatorButtonFifoFields">
+<div class="row two-col">
+<div><label>Área origen</label><select disabled="" id="operatorButtonSourceArea"><option value="">Selecciona</option></select></div>
+<div><label>Área destino</label><select disabled="" id="operatorButtonDestinationArea"><option value="">Selecciona</option></select></div>
+</div>
+<div class="row">
+<label>Material</label><select disabled="" id="operatorButtonMaterial"><option value="">Selecciona</option></select>
+</div>
+</div>
+<div id="operatorButtonPointAreaFields">
+<div class="row">
+<div><label>Área destino</label><select disabled="" id="operatorButtonPointDestinationArea"><option value="">Selecciona</option></select></div>
+</div>
+<div class="row">
+<div>
+<label>Materiales visibles para operador</label>
+<div class="list-box" id="operatorButtonPointMaterialList"><div class="small">Sin materiales capturados.</div></div>
+</div>
+</div>
+<div class="row hidden" id="operatorButtonPointCustomSection">
+<div>
+<label>Características visibles</label>
+<div id="operatorButtonPointCustomFields"></div>
+<button class="btn ghost" disabled="" id="btnAddOperatorPointField" type="button">Agregar característica</button>
+</div>
+</div>
+</div>
+
+<div id="operatorButtonCancelFields">
+<div class="row">
+<label>Matter Area</label><input disabled="" id="operatorButtonCancelMatterArea" placeholder="Ej. AREA01" type="text"/>
+</div>
+</div>
+<div id="operatorButtonDirectFields">
+<div class="row two-col">
+<div>
+<label>Celda origen</label>
+<input id="operatorButtonSourceCell" type="hidden" value=""/>
+<div class="list-box"><div class="small" id="operatorButtonSourceCellLabel">No seleccionada</div></div>
+<button class="btn ghost" disabled="" id="btnOperatorButtonPickSource" type="button">Elegir en matriz</button>
+</div>
+<div>
+<label>Celda destino</label>
+<input id="operatorButtonDestinationCell" type="hidden" value=""/>
+<div class="list-box"><div class="small" id="operatorButtonDestinationCellLabel">No seleccionada</div></div>
+<button class="btn ghost" disabled="" id="btnOperatorButtonPickDestination" type="button">Elegir en matriz</button>
+</div>
+</div>
+</div>
+<div class="row two-col">
+<div><label>AGV</label><input disabled="" id="operatorButtonAgv" type="text"/></div>
+<div><label>Tipo de tarea</label><input disabled="" id="operatorButtonTaskTyp" type="text" value="A01"/></div>
+</div>
+<div class="row">
+<label>Comentario</label><input disabled="" id="operatorButtonComment" type="text"/>
+</div>
+<div class="row config-save-row">
+<button class="btn primary" disabled="" id="btnSaveOperatorButton">Guardar botón</button>
+</div>
+<div class="small" id="operatorWindowAdminMsg"></div>
+</div>
+<div class="card" id="card-direct-move">
+<h3>Solicitar movimiento</h3>
+<div class="row two-col">
+<div>
+<label>Origen seleccionado</label>
+<div class="list-box"><div class="small" id="directSourceCellLabel">Sin seleccionar</div></div>
+</div>
+<div>
+<label>Destino seleccionado</label>
+<div class="list-box"><div class="small" id="directDestinationCellLabel">Sin seleccionar</div></div>
+</div>
+</div>
+<div class="row">
+<button class="btn" id="btnDirectPickSource">Elegir origen en tabla</button>
+<button class="btn" id="btnDirectPickDestination">Elegir destino en tabla</button>
+<button class="btn ghost" id="btnDirectClearSelection">Limpiar selección</button>
+</div>
+<div class="row two-col">
+<div>
+<label>Prioridad interna</label>
+<select id="directPriority">
+<option value="normal">Normal</option>
+<option value="alta">Alta</option>
+<option value="urgente">Urgente</option>
+</select>
+</div>
+<div>
+<label>AGV</label>
+<input id="directAgvCode" placeholder="Ej. AGV01" type="text"/>
+</div>
+</div>
+<div class="row two-col">
+<div>
+<label>Tipo de tarea</label>
+<input id="directTaskTyp" placeholder="Ej. A01" type="text" value="A01"/>
+</div>
+<div>
+<label>Comentario</label>
+<input id="directComment" placeholder="Ej. Movimiento directo por ajuste de layout" type="text"/>
+</div>
+</div>
+<div class="row">
+<button class="btn primary" id="btnExecuteDirectMove">Crear movimiento directo</button>
+</div>
+<div class="small" id="directMsg"></div>
+</div>
+<div class="card" id="card-fifo">
+<h3>Solicitar FIFO</h3>
+<div class="row two-col">
+<div>
+<label>Área origen</label>
+<select id="fifoSourceArea">
+<option value="">Selecciona</option>
+</select>
+</div>
+<div>
+<label>Área destino</label>
+<select id="fifoDestinationArea">
+<option value="">Selecciona</option>
+</select>
+</div>
+</div>
+<div class="row two-col">
+<div>
+<label>Material</label>
+<select id="fifoMaterial">
+<option value="">Selecciona</option>
+</select>
+</div>
+<div>
+<label>Prioridad interna</label>
+<select id="fifoPriority">
+<option value="normal">Normal</option>
+<option value="alta">Alta</option>
+<option value="urgente">Urgente</option>
+</select>
+</div>
+</div>
+<div class="row two-col">
+<div>
+<label>AGV</label>
+<input id="fifoAgvCode" placeholder="Ej. AGV01" type="text"/>
+</div>
+<div>
+<label>Tipo de tarea</label>
+<input id="fifoTaskTyp" placeholder="Ej. A01" type="text" value="A01"/>
+</div>
+</div>
+<div class="row">
+<label>Comentario</label>
+<textarea id="fifoComment" placeholder="Ej. Reabastecer línea 2" rows="2"></textarea>
+</div>
+<div class="row">
+<button class="btn" id="btnValidateFifo">Validar selección</button>
+<button class="btn primary" id="btnExecuteFifo">Ejecutar movimiento</button>
+</div>
+<div class="list-box" id="fifoPreviewBox">
+<div class="small">Sin validación todavía.</div>
+</div>
+<div class="small" id="fifoMsg"></div>
+</div>
+
+<div class="card" id="card-debug-rcs">
+<h3>Consola debug RCS</h3>
+<div class="row two-col">
+<div>
+<label>URL base</label>
+<input id="statusQueryBaseUrl" placeholder="Ej. http://192.168.1.50:8182" type="text"/>
+</div>
+<div>
+<label>Endpoint</label>
+<input id="statusQueryEndpoint" placeholder="/rcms/services/rest/hikRpcService/queryTaskStatus" type="text"/>
+</div>
+</div>
+<div class="row">
+<label>JSON libre a enviar</label>
+<button class="btn primary" id="btnSendStatusQuery" type="button">Enviar</button>
+</div>
+<div class="list-box json-box">
+<textarea class="json-pre json-editor" id="orderStatusQueryRequestBox" placeholder="Escribe aquí cualquier JSON para enviarlo a la URL base y endpoint configurados." rows="10"></textarea>
+</div>
+<div class="row">
+<div class="small"><b>Mensajes enviados y recibidos</b></div>
+</div>
+<div class="list-box json-box">
+<div class="console-log-box" id="orderStatusQueryResponseBox">Aún no hay mensajes.</div>
+</div>
+</div>
+<div class="card" id="card-config-rcs">
+<h3>Configuración RCS</h3>
+<div class="row">
+<label>URL base</label>
+<input disabled="" id="rcsBaseUrl" placeholder="Ej. http://192.168.1.50:8080" type="text"/>
+</div>
+<div class="row">
+<label>Endpoint crear tarea</label>
+<input disabled="" id="rcsEndpoint" placeholder="/rcs/task/create" type="text"/>
+</div>
+<div class="row">
+<label>Endpoint consultar tarea</label>
+<input disabled="" id="rcsQueryEndpoint" placeholder="/rcms/services/rest/hikRpcService/queryTaskStatus" type="text"/>
+</div>
+<div class="row">
+<label>Endpoint cancelar tarea</label>
+<input disabled="" id="rcsCancelEndpoint" placeholder="/rcms/services/rest/hikRpcService/cancelTask" type="text"/>
+</div>
+<div class="row">
+<label>Endpoint stop robot</label>
+<input disabled="" id="rcsStopEndpoint" placeholder="/rcms/services/rest/hikRpcService/stopRobot" type="text"/>
+</div>
+<div class="row">
+<label>Endpoint resume robot</label>
+<input disabled="" id="rcsResumeEndpoint" placeholder="/rcms/services/rest/hikRpcService/resumeRobot" type="text"/>
+</div>
+<div class="row">
+<label>Endpoint estado AMR</label>
+<input disabled="" id="rcsAgvStatusEndpoint" placeholder="/rcms-dps/rest/queryAgvStatus" type="text"/>
+</div>
+<div class="row two-col">
+<div>
+<label>Frecuencia monitoreo tarea (s)</label>
+<input disabled="" id="rcsTaskMonitorInterval" min="0.2" placeholder="3.0" step="0.1" type="number"/>
+</div>
+<div>
+<label>Frecuencia monitoreo AGV (s)</label>
+<input disabled="" id="rcsAgvMonitorInterval" min="0.2" placeholder="5.0" step="0.1" type="number"/>
+</div>
+</div>
+<div class="row two-col">
+<div>
+<label>Cleanup min age (min)</label>
+<input disabled="" id="cleanupMinAgeMinutes" min="1" placeholder="30" step="1" type="number"/>
+</div>
+<div>
+<label>Force release min age (min)</label>
+<input disabled="" id="forceReleaseMinAgeMinutes" min="1" placeholder="20" step="1" type="number"/>
+</div>
+</div>
+<div class="row two-col">
+<div>
+<label>Habilitar mapShortName</label>
+<select disabled="" id="rcsEnableMapShortName">
+<option value="1">Sí</option>
+<option value="0">No</option>
+</select>
+</div>
+<div>
+<label>Map Short Name estado AMR</label>
+<input disabled="" id="rcsMapShortName" placeholder="AA" type="text"/>
+</div>
+</div>
+<div class="row two-col">
+<div>
+<label>Habilitar mapCode</label>
+<select disabled="" id="rcsEnableMapCode">
+<option value="0">No</option>
+<option value="1">Sí</option>
+</select>
+</div>
+<div>
+<label>Map Code estado AMR</label>
+<input disabled="" id="rcsMapCode" placeholder="Opcional" type="text"/>
+</div>
+</div>
+<div class="row two-col">
+<div>
+<label>Monitoreo AMR</label>
+<select disabled="" id="rcsEnableAmrMonitor">
+<option value="1">Habilitado</option>
+<option value="0">Deshabilitado</option>
+</select>
+</div>
+<div></div>
+</div>
+<div class="row">
+<label>Panel Estado AMR</label>
+<div class="small" style="padding:10px 12px;border:1px solid rgba(255,255,255,.12);border-radius:10px;background:rgba(255,255,255,.03);">Si se deshabilita, se oculta el panel y se detienen las solicitudes periódicas al RCS.</div>
+</div>
+<div class="row">
+<label>Payload estado AMR</label>
+<div class="small" style="padding:10px 12px;border:1px solid rgba(255,255,255,.12);border-radius:10px;background:rgba(255,255,255,.03);">
+reqCode automático · reqTime automático · mapShortName configurable y habilitable · mapCode configurable y habilitable · stop/resume con robotCount=1, mapCode y robots=[robotCode]
+</div>
+</div>
+<div class="row two-col">
+<div>
+<label>TokenCode</label>
+<input disabled="" id="rcsTokenCode" placeholder="Opcional" type="text"/>
+</div>
+<div>
+<label>Verify TLS</label>
+<select disabled="" id="rcsVerifyTls">
+<option value="0">No</option>
+<option value="1">Sí</option>
+</select>
+</div>
+</div>
+<div class="row">
+<label>Authorization header</label>
+<input disabled="" id="rcsAuthHeader" placeholder="Bearer ... (opcional)" type="text"/>
+</div>
+<div class="row">
+<button class="btn primary" disabled="" id="btnSaveRcsConfig">Guardar RCS</button>
+<button class="btn" disabled="" id="btnTestRcsConfig">Probar config</button>
+</div>
+<div class="list-box">
+<div class="small" id="rcsResolvedInfo">Sin configuración cargada.</div>
+</div>
+<div class="small" id="rcsConfigMsg"></div>
+</div>
+<div class="card" id="card-admin-password">
+<h3>Cambio de contraseña admin</h3>
+<div class="row"><label>Actual</label><input disabled="" id="oldPwd" type="password"/></div>
+<div class="row"><label>Nueva</label><input disabled="" id="newPwd" type="password"/></div>
+<div class="row"><button class="btn" disabled="" id="btnChangePwd">Cambiar contraseña</button></div>
+</div>
+<div class="card" id="card-admin-login">
+<h3>Admin</h3>
+<div class="row">
+<label>Contraseña</label>
+<input id="adminPwd" placeholder="admin" type="password"/>
+</div>
+<div class="row">
+<button class="btn primary" id="btnAdminLogin">Entrar</button>
+<button class="btn" id="btnAdminLock" style="display:none;">Bloquear Admin</button>
+<div class="pill" id="adminState">Bloqueado</div>
+</div>
+<div id="adminActions" style="display:none;">
+<div class="row">
+<button class="btn" id="cleanupDiagnosisBtn" type="button">Diagn&oacute;stico y limpieza</button>
+<div class="pill cleanup-warning hidden" id="cleanupHealthBadge">Hay racks reservados inconsistentes</div>
+</div>
+<div class="small" id="adminMsg"></div>
+</div>
+</div>
+</aside>
+</main>
+<div class="modal hidden" id="cleanupDiagnosisModal">
+<div class="modal-card diagnosis-modal-card">
+<div class="modal-header">
+<h3>Diagn&oacute;stico y limpieza</h3>
+<div class="small" id="cleanupDiagnosisGeneratedAt">Solo lectura. No se ejecutan acciones autom&aacute;ticas.</div>
+</div>
+<div class="modal-body diagnosis-modal-body">
+<section class="diagnosis-section">
+<h4>Racks hu&eacute;rfanos</h4>
+<div class="diagnosis-table-wrap" id="diagnosisOrphanRacks">Sin datos.</div>
+</section>
+<section class="diagnosis-section">
+<h4>&Oacute;rdenes inconsistentes</h4>
+<div class="diagnosis-table-wrap" id="diagnosisInconsistentOrders">Sin datos.</div>
+</section>
+<section class="diagnosis-section">
+<h4>Racks inconsistentes</h4>
+<div class="diagnosis-table-wrap" id="diagnosisInconsistentRacks">Sin datos.</div>
+</section>
+<section class="diagnosis-section diagnosis-advanced-section">
+<h4>Recuperaci&oacute;n avanzada</h4>
+<div class="small">Racks bloqueados por &oacute;rdenes activas viejas</div>
+<div class="diagnosis-table-wrap" id="diagnosisOldActiveRacks">Sin datos.</div>
+<div class="row diagnosis-advanced-actions">
+<button class="btn danger force-release-btn" id="btnForceReleaseOldActiveRacks" type="button">Forzar cierre local y liberar rack seleccionado</button>
+<button class="btn warn hidden" id="createOldActiveOrderTestBtn" type="button" style="display:none">Crear orden activa vieja de prueba</button>
+</div>
+</section>
+<section class="diagnosis-section">
+<h4>Locations inconsistentes</h4>
+<div class="diagnosis-table-wrap" id="diagnosisInconsistentLocations">Sin datos.</div>
+</section>
+<section class="diagnosis-section">
+<h4>Integrity check</h4>
+<div class="diagnosis-table-wrap" id="diagnosisIntegrityCheck">Sin datos.</div>
+</section>
+<div class="small" id="cleanupDiagnosisMsg"></div>
+</div>
+<div class="row">
+<button class="btn primary" id="btnRefreshCleanupDiagnosis" type="button">Refrescar diagn&oacute;stico</button>
+<button class="btn" id="btnSelectSafeCleanup" type="button">Seleccionar todos los seguros</button>
+<button class="btn danger" id="btnCleanSelected" type="button">Limpiar seleccionados</button>
+<button class="btn danger" id="btnCloseSelectedOrders" type="button">Cerrar &oacute;rdenes seleccionadas</button>
+<button class="btn danger" id="btnReleaseSelectedRacks" type="button">Liberar racks seleccionados</button>
+<button class="btn danger" id="btnResolveSelectedInconsistentRacks" type="button">Resolver racks inconsistentes seleccionados</button>
+</div>
+</div>
+</div>
+<div class="modal hidden" id="cleanupConfirmModal">
+<div class="modal-card cleanup-confirm-card">
+<div class="modal-header">
+<h3>Confirmar cierre local</h3>
+</div>
+<div class="modal-body">
+<div class="small">Esta acci&oacute;n cerrar&aacute; &uacute;nicamente &oacute;rdenes locales ya canceladas en RCS y liberar&aacute; sus racks asociados si es seguro hacerlo. No modifica locations ni elimina historial. &iquest;Continuar?</div>
+<div class="small" id="cleanupConfirmMsg"></div>
+</div>
+<div class="row">
+<button class="btn ghost" id="btnCancelCleanupClose" type="button">Cancelar</button>
+<button class="btn danger" id="btnConfirmCleanupClose" type="button">Continuar</button>
+</div>
+</div>
+</div>
+<div class="modal hidden" id="operatorActionModal">
+<div class="modal-card">
+<div class="modal-header">
+<h3 id="operatorActionModalTitle">Confirmar solicitud</h3>
+</div>
+<div class="modal-body">
+<div class="list-box json-box"><pre class="json-pre" id="operatorActionPreview">Sin datos.</pre></div>
+<div class="small" id="operatorActionModalMsg"></div>
+</div>
+<div class="row">
+<button class="btn ghost" id="btnOperatorActionCancel" type="button">Cancelar</button>
+<button class="btn primary" id="btnOperatorActionConfirm" type="button">Enviar</button>
+</div>
+</div>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>
