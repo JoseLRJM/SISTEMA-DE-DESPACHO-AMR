@@ -2,15 +2,22 @@ from datetime import datetime, timedelta
 from typing import List, Optional
 import asyncio
 import contextlib
+import shutil
+import stat
 import threading
 import random
 import re
 import json
 import hashlib
 import os
+import platform
 import secrets
+import subprocess
+import sys
 import tempfile
 import traceback
+import zipfile
+from pathlib import PurePosixPath
 
 from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse
@@ -64,6 +71,7 @@ NO_MATERIAL_NAME = "Sin material"
 NO_MATERIAL_COLOR = "#94a3b8"
 RACK_RESERVATION_ACTIVE_STATUSES = ("pending_dispatch", "dispatched", "in_progress", "cancel_requested_total", "cancel_requested_undo")
 logger = get_logger("app.main")
+SOFTWARE_UPDATE_LOCK = threading.Lock()
 
 
 class RuntimeWebSocketManager:
@@ -310,6 +318,41 @@ class TestCreateOldActiveOrderOut(BaseModel):
     order_id: int
     rack_id: int
     diagnosis: dict = {}
+
+
+class SoftwareUpdateValidationOut(BaseModel):
+    ok: bool
+    staging_id: str = ""
+    staging_dir: str = ""
+    max_size_mb: int = 200
+    detected_files: List[str] = []
+    blocked_files: List[str] = []
+    errors: List[str] = []
+    warnings: List[str] = []
+
+
+class SoftwareUpdateApplyIn(BaseModel):
+    staging_id: Optional[str] = None
+
+
+class SoftwareUpdateApplyOut(BaseModel):
+    ok: bool
+    applied_files: List[str] = []
+    skipped_files: List[str] = []
+    backup_path: str = ""
+    rollback: bool = False
+    warnings: List[str] = []
+    errors: List[str] = []
+
+
+class SoftwareUpdateRestartOut(BaseModel):
+    ok: bool
+    mode: str = ""
+    os: str = ""
+    service: str = ""
+    command: str = ""
+    message: str = ""
+    errors: List[str] = []
 
 
 class RcsConfigTestOut(BaseModel):
@@ -852,6 +895,11 @@ def ensure_default_settings():
             "runtime_reconnect_seconds": "3.0",
             "cleanup_min_age_minutes": "30",
             "force_release_min_age_minutes": "20",
+            "software_restart_mode": "systemd" if platform.system() == "Linux" else ("windows_script" if platform.system() == "Windows" else "manual"),
+            "software_update_systemd_service": "agv-app",
+            "software_restart_script": "restart_app.bat",
+            "software_update_keep_backups": "5",
+            "software_update_max_uncompressed_mb": "500",
         }
         for k, v in defaults.items():
             if not get_setting(db, k, ""):
@@ -2190,6 +2238,704 @@ def admin_set_background_transform(payload: BackgroundTransformIn, x_admin_token
         set_setting(db, "bg_offset_y", str(payload.offset_y))
         filename = get_setting(db, "bg_filename", "")
     return BackgroundOut(filename=filename, url=f"/static/uploads/{filename}" if filename else None, scale_x=payload.scale_x, scale_y=payload.scale_y, offset_x=payload.offset_x, offset_y=payload.offset_y, scale=(payload.scale_x + payload.scale_y) / 2.0)
+
+
+def _software_update_max_size_mb() -> int:
+    raw = os.getenv("SOFTWARE_UPDATE_MAX_MB", "")
+    try:
+        if raw.strip():
+            return max(1, min(2048, int(float(raw))))
+    except Exception:
+        pass
+    return 200
+
+
+def _software_update_int_setting(key: str, default: int, *, env_key: str = "", minimum: int = 1, maximum: int = 100000) -> int:
+    raw = os.getenv(env_key or key.upper(), "")
+    try:
+        if raw.strip():
+            return max(minimum, min(maximum, int(float(raw))))
+    except Exception:
+        pass
+    with SessionLocal() as db:
+        try:
+            value = get_setting(db, key, str(default))
+            return max(minimum, min(maximum, int(float(value or default))))
+        except Exception:
+            return default
+
+
+def _software_update_keep_backups() -> int:
+    return _software_update_int_setting("software_update_keep_backups", 5, minimum=1, maximum=1000)
+
+
+def _software_update_max_uncompressed_mb() -> int:
+    return _software_update_int_setting("software_update_max_uncompressed_mb", 500, env_key="SOFTWARE_UPDATE_MAX_UNCOMPRESSED_MB", minimum=1, maximum=10240)
+
+
+def _is_dangerous_zip_path(raw_name: str) -> bool:
+    name = (raw_name or "").replace("\\", "/").strip()
+    if not name or name.startswith("/") or re.match(r"^[A-Za-z]:", name):
+        return True
+    path = PurePosixPath(name)
+    return any(part in {"", ".", ".."} for part in path.parts)
+
+
+def _is_blocked_update_path(rel_path: str) -> Optional[str]:
+    normalized = rel_path.replace("\\", "/").strip("/")
+    if not normalized:
+        return "ruta vacia"
+    parts = [p for p in normalized.split("/") if p]
+    name = parts[-1].lower()
+    lower_parts = [p.lower() for p in parts]
+    if name.endswith((".db", ".sqlite", ".sqlite3", ".db-wal", ".db-shm", ".sqlite-wal", ".sqlite-shm")):
+        return "base de datos local"
+    if name == ".env" or name.startswith(".env."):
+        return "archivo .env local"
+    if name.startswith(".") and name not in {".gitignore"}:
+        return "archivo oculto protegido"
+    if any(p in {"data", "logs", "backups", ".venv", "venv", "__pycache__", ".git"} for p in lower_parts):
+        return "directorio local protegido"
+    if name in {"config.json", "config.local.json", "local_config.json", "settings.local.json"}:
+        return "configuracion local protegida"
+    return None
+
+
+def _zip_entry_is_symlink_or_special(info: zipfile.ZipInfo) -> Optional[str]:
+    mode = (info.external_attr >> 16) & 0o170000
+    if mode == 0:
+        return None
+    if stat.S_ISLNK(mode):
+        return "symlink bloqueado"
+    if not stat.S_ISREG(mode) and not stat.S_ISDIR(mode):
+        return "archivo especial bloqueado"
+    return None
+
+
+def _software_update_staging_root() -> str:
+    return os.path.abspath(os.path.join("updates", "staging"))
+
+
+def _software_update_latest_metadata_path() -> str:
+    return os.path.abspath(os.path.join("updates", "latest_validated.json"))
+
+
+def _software_update_validation_metadata_path(staging_dir: str) -> str:
+    return os.path.abspath(os.path.join(staging_dir, "validation.json"))
+
+
+def _write_software_update_validation_metadata(staging_dir: str, metadata: dict) -> None:
+    os.makedirs(os.path.dirname(_software_update_latest_metadata_path()), exist_ok=True)
+    with open(_software_update_validation_metadata_path(staging_dir), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+    with open(_software_update_latest_metadata_path(), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+
+def _remove_path_quietly(path: str) -> None:
+    with contextlib.suppress(Exception):
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        elif os.path.exists(path):
+            os.remove(path)
+
+
+def _prune_old_paths(paths: List[str], keep: int) -> None:
+    existing = [p for p in paths if os.path.exists(p)]
+    existing.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    for path in existing[keep:]:
+        _remove_path_quietly(path)
+
+
+def _cleanup_software_update_staging() -> None:
+    staging_root = _software_update_staging_root()
+    os.makedirs(staging_root, exist_ok=True)
+    keep = _software_update_keep_backups()
+    now = datetime.utcnow().timestamp()
+    max_age_seconds = 7 * 24 * 60 * 60
+    staging_dirs = []
+    for name in os.listdir(staging_root):
+        path = os.path.abspath(os.path.join(staging_root, name))
+        if os.path.commonpath([staging_root, path]) != staging_root or not os.path.isdir(path):
+            continue
+        metadata_path = _software_update_validation_metadata_path(path)
+        remove = False
+        if not os.path.exists(metadata_path):
+            remove = True
+        else:
+            with contextlib.suppress(Exception):
+                metadata = _read_json_file(metadata_path)
+                if metadata.get("ok") is not True:
+                    remove = True
+        if now - os.path.getmtime(path) > max_age_seconds:
+            remove = True
+        if remove:
+            _remove_path_quietly(path)
+        else:
+            staging_dirs.append(path)
+    _prune_old_paths(staging_dirs, keep)
+
+
+def _read_json_file(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data if isinstance(data, dict) else {}
+
+
+def _resolve_validated_software_staging(staging_id: Optional[str]) -> tuple[str, dict]:
+    if staging_id:
+        if os.path.basename(staging_id) != staging_id or staging_id in {".", ".."}:
+            raise HTTPException(status_code=400, detail="staging_id invalido")
+        staging_dir = os.path.abspath(os.path.join(_software_update_staging_root(), staging_id))
+        if os.path.commonpath([_software_update_staging_root(), staging_dir]) != _software_update_staging_root():
+            raise HTTPException(status_code=400, detail="staging fuera de updates/staging")
+        metadata_path = _software_update_validation_metadata_path(staging_dir)
+        if not os.path.exists(metadata_path):
+            raise HTTPException(status_code=400, detail="staging no validado")
+        metadata = _read_json_file(metadata_path)
+    else:
+        latest_path = _software_update_latest_metadata_path()
+        if not os.path.exists(latest_path):
+            raise HTTPException(status_code=400, detail="no existe staging validado")
+        metadata = _read_json_file(latest_path)
+        staging_dir = os.path.abspath(str(metadata.get("staging_dir") or ""))
+
+    if not os.path.exists(staging_dir) or not os.path.isdir(staging_dir):
+        raise HTTPException(status_code=400, detail="staging_dir no existe")
+    if os.path.commonpath([_software_update_staging_root(), staging_dir]) != _software_update_staging_root():
+        raise HTTPException(status_code=400, detail="staging fuera de updates/staging")
+    if metadata.get("ok") is not True:
+        raise HTTPException(status_code=400, detail="staging no fue validado correctamente")
+    if metadata.get("blocked_files"):
+        raise HTTPException(status_code=400, detail="staging contiene archivos bloqueados")
+    return staging_dir, metadata
+
+
+def _is_protected_software_path(rel_path: str) -> Optional[str]:
+    normalized = rel_path.replace("\\", "/").strip("/")
+    blocked = _is_blocked_update_path(normalized)
+    if blocked:
+        return blocked
+    parts = [p.lower() for p in normalized.split("/") if p]
+    if any(p in {"updates", "backups", "logs", "data", ".venv", "venv", "__pycache__"} for p in parts):
+        return "ruta protegida de la aplicacion"
+    return None
+
+
+def _run_app_py_compile(root_dir: str) -> tuple[bool, List[str], List[str]]:
+    warnings: List[str] = []
+    errors: List[str] = []
+    compile_targets = []
+    for name in ("main.py", "models.py", "monitor_service.py", "fifo_service.py"):
+        if os.path.exists(os.path.join(root_dir, name)):
+            compile_targets.append(name)
+        else:
+            warnings.append(f"{name} no existe; py_compile omitido para ese archivo.")
+    if not compile_targets:
+        return True, warnings, errors
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "py_compile", *compile_targets],
+            cwd=root_dir,
+            text=True,
+            capture_output=True,
+            timeout=60,
+        )
+        if proc.returncode != 0:
+            errors.append("py_compile fallo.")
+            if proc.stderr:
+                errors.append(proc.stderr.strip()[:4000])
+            return False, warnings, errors
+    except subprocess.TimeoutExpired:
+        errors.append("py_compile excedio el tiempo maximo de validacion.")
+        return False, warnings, errors
+    except Exception as exc:
+        errors.append(f"No se pudo ejecutar py_compile: {exc}")
+        return False, warnings, errors
+    return True, warnings, errors
+
+
+def _create_software_backup(app_root: str, timestamp: str) -> str:
+    backup_dir = os.path.abspath(os.path.join(app_root, "backups", "software"))
+    os.makedirs(backup_dir, exist_ok=True)
+    backup_path = os.path.abspath(os.path.join(backup_dir, f"app_backup_{timestamp}.zip"))
+    with zipfile.ZipFile(backup_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for root, dirs, files in os.walk(app_root):
+            rel_root = os.path.relpath(root, app_root)
+            rel_root = "" if rel_root == "." else rel_root.replace("\\", "/")
+            dirs[:] = [
+                d for d in dirs
+                if not _is_protected_software_path(f"{rel_root}/{d}".strip("/"))
+                and d.lower() not in {".git"}
+            ]
+            for filename in files:
+                full_path = os.path.join(root, filename)
+                rel_path = os.path.relpath(full_path, app_root).replace("\\", "/")
+                if _is_protected_software_path(rel_path):
+                    continue
+                zf.write(full_path, rel_path)
+    _prune_old_paths(
+        [os.path.join(backup_dir, name) for name in os.listdir(backup_dir) if name.startswith("app_backup_") and name.endswith(".zip")],
+        _software_update_keep_backups(),
+    )
+    return backup_path
+
+
+def _restore_software_backup(app_root: str, backup_path: str, created_files: List[str]) -> None:
+    for rel_path in created_files:
+        target = os.path.abspath(os.path.join(app_root, rel_path))
+        if os.path.commonpath([app_root, target]) != app_root:
+            continue
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(target)
+    with zipfile.ZipFile(backup_path) as zf:
+        for info in zf.infolist():
+            rel_path = (info.filename or "").replace("\\", "/").strip("/")
+            if not rel_path or info.is_dir() or _is_dangerous_zip_path(rel_path) or _is_protected_software_path(rel_path):
+                continue
+            target = os.path.abspath(os.path.join(app_root, rel_path))
+            if os.path.commonpath([app_root, target]) != app_root:
+                continue
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with zf.open(info) as src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+
+
+def _software_restart_config() -> tuple[str, str, str]:
+    current_os = platform.system()
+    default_mode = "systemd" if current_os == "Linux" else ("windows_script" if current_os == "Windows" else "manual")
+    with SessionLocal() as db:
+        mode = (get_setting(db, "software_restart_mode", default_mode) or default_mode).strip().lower()
+        service_name = (get_setting(db, "software_update_systemd_service", "agv-app") or "agv-app").strip()
+        script_name = (get_setting(db, "software_restart_script", "restart_app.bat") or "restart_app.bat").strip()
+    if mode not in {"systemd", "windows_script", "manual"}:
+        mode = default_mode
+    return mode, service_name, script_name
+
+
+def _validate_systemd_service_name(service_name: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9_.@:-]+", service_name or ""))
+
+
+def _run_systemctl_check(args: List[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["systemctl", *args],
+        text=True,
+        capture_output=True,
+        timeout=8,
+    )
+
+
+def _resolve_restart_script(script_name: str) -> str:
+    app_root = os.path.abspath(".")
+    script_path = os.path.abspath(script_name if os.path.isabs(script_name) else os.path.join(app_root, script_name))
+    if os.path.commonpath([app_root, script_path]) != app_root:
+        raise ValueError("script fuera del directorio de la app")
+    if not script_path.lower().endswith((".bat", ".cmd")):
+        raise ValueError("software_restart_script debe ser .bat o .cmd")
+    if not os.path.exists(script_path):
+        raise FileNotFoundError(f"script no encontrado: {script_path}")
+    return script_path
+
+
+@app.post("/api/admin/software-update/validate", response_model=SoftwareUpdateValidationOut)
+async def admin_validate_software_update(file: UploadFile = File(...), x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    _cleanup_software_update_staging()
+    max_size_mb = _software_update_max_size_mb()
+    max_uncompressed_mb = _software_update_max_uncompressed_mb()
+    max_size_bytes = max_size_mb * 1024 * 1024
+    max_uncompressed_bytes = max_uncompressed_mb * 1024 * 1024
+    filename = os.path.basename(file.filename or "")
+    detected_files: List[str] = []
+    blocked_files: List[str] = []
+    errors: List[str] = []
+    warnings: List[str] = []
+    staging_dir = ""
+    tmp_path = ""
+
+    if not filename.lower().endswith(".zip"):
+        errors.append("El archivo debe tener extension .zip.")
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
+            tmp_path = tmp.name
+            total = 0
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_size_bytes:
+                    errors.append(f"El ZIP supera el tamano maximo permitido de {max_size_mb} MB.")
+                    break
+                tmp.write(chunk)
+    except Exception as exc:
+        errors.append(f"No se pudo recibir el archivo: {exc}")
+
+    if errors:
+        if tmp_path:
+            with contextlib.suppress(Exception):
+                os.remove(tmp_path)
+        return SoftwareUpdateValidationOut(ok=False, max_size_mb=max_size_mb, detected_files=detected_files, blocked_files=blocked_files, errors=errors, warnings=warnings)
+
+    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+    staging_id = timestamp
+    staging_dir = os.path.abspath(os.path.join("updates", "staging", timestamp))
+    os.makedirs(staging_dir, exist_ok=True)
+
+    try:
+        with zipfile.ZipFile(tmp_path) as zf:
+            has_main = False
+            has_requirements = False
+            has_static = False
+            safe_infos = []
+            root_prefix = ""
+            normalized_entries = []
+
+            for info in zf.infolist():
+                raw_name = info.filename or ""
+                normalized = raw_name.replace("\\", "/").strip("/")
+                if not normalized:
+                    continue
+                normalized_entries.append((info, raw_name, normalized))
+
+            total_uncompressed_size = sum(max(0, int(info.file_size or 0)) for info, _raw_name, _normalized in normalized_entries if not info.is_dir())
+            if total_uncompressed_size > max_uncompressed_bytes:
+                errors.append(f"El ZIP supera el tamano maximo descomprimido permitido de {max_uncompressed_mb} MB.")
+
+            file_entries = [(info, raw_name, normalized) for info, raw_name, normalized in normalized_entries if not info.is_dir()]
+            first_segments = {normalized.split("/", 1)[0] for _info, _raw_name, normalized in file_entries if "/" in normalized}
+            if file_entries and len(first_segments) == 1 and all(normalized.startswith(f"{next(iter(first_segments))}/") for _info, _raw_name, normalized in file_entries):
+                root_prefix = next(iter(first_segments))
+                logger.info("[software-update] detected root folder: %s", root_prefix)
+
+            for info, raw_name, normalized in normalized_entries:
+                if _is_dangerous_zip_path(raw_name):
+                    blocked_files.append(raw_name)
+                    errors.append(f"Ruta peligrosa bloqueada: {raw_name}")
+                    continue
+                special_reason = _zip_entry_is_symlink_or_special(info)
+                if special_reason:
+                    blocked_files.append(normalized)
+                    errors.append(f"Archivo bloqueado ({special_reason}): {normalized}")
+                    continue
+                relative_name = normalized
+                if root_prefix and (normalized == root_prefix or normalized.startswith(f"{root_prefix}/")):
+                    relative_name = normalized[len(root_prefix):].strip("/")
+                    if not relative_name:
+                        continue
+                if info.is_dir():
+                    if relative_name == "static" or relative_name.startswith("static/"):
+                        has_static = True
+                    continue
+                detected_files.append(relative_name)
+                if relative_name == "main.py":
+                    has_main = True
+                if relative_name == "requirements.txt":
+                    has_requirements = True
+                if relative_name.startswith("static/"):
+                    has_static = True
+                blocked_reason = _is_blocked_update_path(relative_name)
+                if blocked_reason:
+                    blocked_files.append(relative_name)
+                    errors.append(f"Archivo bloqueado ({blocked_reason}): {relative_name}")
+                    continue
+                safe_infos.append((info, relative_name))
+
+            if not has_main:
+                errors.append("El ZIP debe contener main.py.")
+            if not has_requirements:
+                errors.append("El ZIP debe contener requirements.txt.")
+            if not has_static:
+                errors.append("El ZIP debe contener static/.")
+
+            if not errors:
+                for info, normalized in safe_infos:
+                    target = os.path.abspath(os.path.join(staging_dir, normalized))
+                    if os.path.commonpath([staging_dir, target]) != staging_dir:
+                        blocked_files.append(normalized)
+                        errors.append(f"Ruta fuera del staging bloqueada: {normalized}")
+                        continue
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with zf.open(info) as src, open(target, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+    except zipfile.BadZipFile:
+        errors.append("El archivo no es un ZIP valido.")
+    except Exception as exc:
+        errors.append(f"Error validando ZIP: {exc}")
+    finally:
+        if tmp_path:
+            with contextlib.suppress(Exception):
+                os.remove(tmp_path)
+
+    compile_targets = [name for name in ("main.py", "models.py", "monitor_service.py", "fifo_service.py") if os.path.exists(os.path.join(staging_dir, name))]
+    if not errors and compile_targets:
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "py_compile", *compile_targets],
+                cwd=staging_dir,
+                text=True,
+                capture_output=True,
+                timeout=60,
+            )
+            if proc.returncode != 0:
+                errors.append("py_compile fallo.")
+                if proc.stderr:
+                    errors.append(proc.stderr.strip()[:4000])
+        except subprocess.TimeoutExpired:
+            errors.append("py_compile excedio el tiempo maximo de validacion.")
+        except Exception as exc:
+            errors.append(f"No se pudo ejecutar py_compile: {exc}")
+    elif not errors:
+        warnings.append("No se encontraron archivos Python para compilar en el staging.")
+
+    ok = not errors
+    if ok:
+        _write_software_update_validation_metadata(staging_dir, {
+            "ok": True,
+            "staging_id": staging_id,
+            "staging_dir": staging_dir,
+            "filename": filename,
+            "validated_at": datetime.utcnow().isoformat(),
+            "detected_files": detected_files,
+            "blocked_files": blocked_files,
+            "warnings": warnings,
+            "errors": errors,
+        })
+        _cleanup_software_update_staging()
+    else:
+        _remove_path_quietly(staging_dir)
+    logger.info("[SOFTWARE UPDATE VALIDATE] ok=%s file=%s staging_dir=%s detected=%s blocked=%s", ok, filename, staging_dir, len(detected_files), len(blocked_files))
+    return SoftwareUpdateValidationOut(
+        ok=ok,
+        staging_id=staging_id if ok else "",
+        staging_dir=staging_dir,
+        max_size_mb=max_size_mb,
+        detected_files=detected_files,
+        blocked_files=blocked_files,
+        errors=errors,
+        warnings=warnings,
+    )
+
+
+@app.post("/api/admin/software-update/apply", response_model=SoftwareUpdateApplyOut)
+def admin_apply_software_update(body: Optional[SoftwareUpdateApplyIn] = None, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    if not SOFTWARE_UPDATE_LOCK.acquire(blocking=False):
+        return SoftwareUpdateApplyOut(ok=False, errors=["Ya hay una operacion de actualizacion en curso."])
+    body = body or SoftwareUpdateApplyIn()
+    try:
+        app_root = os.path.abspath(".")
+        applied_files: List[str] = []
+        skipped_files: List[str] = []
+        warnings: List[str] = []
+        errors: List[str] = []
+        rollback = False
+        backup_path = ""
+        staging_dir = ""
+
+        try:
+            staging_dir, metadata = _resolve_validated_software_staging(body.staging_id)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"no se pudo resolver staging validado: {exc}")
+
+        required_errors = []
+        if not os.path.exists(os.path.join(staging_dir, "main.py")):
+            required_errors.append("staging no contiene main.py")
+        if not os.path.exists(os.path.join(staging_dir, "requirements.txt")):
+            required_errors.append("staging no contiene requirements.txt")
+        if not os.path.isdir(os.path.join(staging_dir, "static")):
+            required_errors.append("staging no contiene static/")
+        if required_errors:
+            logger.info("[SOFTWARE UPDATE] source=admin_upload staging_dir=%s backup=%s result=fail", staging_dir, backup_path)
+            return SoftwareUpdateApplyOut(ok=False, errors=required_errors, warnings=warnings)
+
+        timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+        old_requirements = None
+        current_requirements_path = os.path.join(app_root, "requirements.txt")
+        staging_requirements_path = os.path.join(staging_dir, "requirements.txt")
+        if os.path.exists(current_requirements_path) and os.path.exists(staging_requirements_path):
+            with contextlib.suppress(Exception):
+                with open(current_requirements_path, "rb") as f:
+                    old_requirements = f.read()
+
+        try:
+            backup_path = _create_software_backup(app_root, timestamp)
+        except Exception as exc:
+            errors.append(f"No se pudo crear backup obligatorio: {exc}")
+            logger.info("[SOFTWARE UPDATE] source=admin_upload staging_dir=%s backup=%s result=fail", staging_dir, backup_path)
+            return SoftwareUpdateApplyOut(ok=False, backup_path=backup_path, errors=errors, warnings=warnings)
+
+        existed_before: dict[str, bool] = {}
+        created_files: List[str] = []
+
+        try:
+            for root, dirs, files in os.walk(staging_dir):
+                rel_root = os.path.relpath(root, staging_dir)
+                rel_root = "" if rel_root == "." else rel_root.replace("\\", "/")
+                dirs[:] = [d for d in dirs if not _is_protected_software_path(f"{rel_root}/{d}".strip("/"))]
+                for filename in files:
+                    source_path = os.path.join(root, filename)
+                    rel_path = os.path.relpath(source_path, staging_dir).replace("\\", "/")
+                    if rel_path == "validation.json":
+                        skipped_files.append(rel_path)
+                        continue
+                    blocked_reason = _is_protected_software_path(rel_path)
+                    if blocked_reason:
+                        skipped_files.append(f"{rel_path} ({blocked_reason})")
+                        continue
+                    target_path = os.path.abspath(os.path.join(app_root, rel_path))
+                    if os.path.commonpath([app_root, target_path]) != app_root:
+                        skipped_files.append(f"{rel_path} (fuera de app)")
+                        continue
+                    existed = os.path.exists(target_path)
+                    existed_before[rel_path] = existed
+                    if not existed:
+                        created_files.append(rel_path)
+                    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                    shutil.copy2(source_path, target_path)
+                    applied_files.append(rel_path)
+
+            if old_requirements is not None and os.path.exists(current_requirements_path):
+                with contextlib.suppress(Exception):
+                    with open(current_requirements_path, "rb") as f:
+                        if f.read() != old_requirements:
+                            warnings.append("requirements.txt cambio; instalacion manual o fase posterior requerida.")
+
+            compile_ok, compile_warnings, compile_errors = _run_app_py_compile(app_root)
+            warnings.extend(compile_warnings)
+            if not compile_ok:
+                errors.extend(compile_errors)
+                rollback = True
+                _restore_software_backup(app_root, backup_path, [path for path in created_files if not existed_before.get(path)])
+                logger.info("[SOFTWARE UPDATE] source=admin_upload staging_dir=%s backup=%s result=rollback", staging_dir, backup_path)
+                return SoftwareUpdateApplyOut(
+                    ok=False,
+                    applied_files=applied_files,
+                    skipped_files=skipped_files,
+                    backup_path=backup_path,
+                    rollback=True,
+                    warnings=warnings,
+                    errors=errors,
+                )
+        except Exception as exc:
+            errors.append(f"Error aplicando update: {exc}")
+            rollback = True
+            with contextlib.suppress(Exception):
+                _restore_software_backup(app_root, backup_path, [path for path in created_files if not existed_before.get(path)])
+            logger.info("[SOFTWARE UPDATE] source=admin_upload staging_dir=%s backup=%s result=rollback", staging_dir, backup_path)
+            return SoftwareUpdateApplyOut(
+                ok=False,
+                applied_files=applied_files,
+                skipped_files=skipped_files,
+                backup_path=backup_path,
+                rollback=True,
+                warnings=warnings,
+                errors=errors,
+            )
+
+        logger.info("[SOFTWARE UPDATE] source=admin_upload staging_dir=%s backup=%s result=success", staging_dir, backup_path)
+        return SoftwareUpdateApplyOut(
+            ok=True,
+            applied_files=applied_files,
+            skipped_files=skipped_files,
+            backup_path=backup_path,
+            rollback=rollback,
+            warnings=warnings,
+            errors=errors,
+        )
+    finally:
+        SOFTWARE_UPDATE_LOCK.release()
+
+
+@app.post("/api/admin/software-update/restart", response_model=SoftwareUpdateRestartOut)
+def admin_restart_after_software_update(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    current_os = platform.system()
+    mode, service_name, script_name = _software_restart_config()
+    service_command = f"systemctl restart {service_name} --no-block"
+
+    if mode == "manual":
+        message = "Actualizacion aplicada. Reinicie manualmente la aplicacion."
+        logger.info("[SOFTWARE UPDATE RESTART] os=%s mode=%s result=manual", current_os, mode)
+        return SoftwareUpdateRestartOut(ok=True, mode=mode, os=current_os, service=service_name, command="", message=message)
+
+    try:
+        if current_os == "Linux":
+            if mode != "systemd":
+                return SoftwareUpdateRestartOut(ok=False, mode=mode, os=current_os, service=service_name, command=service_command, errors=["En Linux configure software_restart_mode=systemd o manual."])
+            if not _validate_systemd_service_name(service_name):
+                return SoftwareUpdateRestartOut(ok=False, mode=mode, os=current_os, service=service_name, command=service_command, errors=["Nombre de servicio systemd invalido."])
+
+            status_proc = _run_systemctl_check(["status", service_name, "--no-pager"])
+            active_proc = _run_systemctl_check(["is-active", service_name])
+            if status_proc.returncode == 4 or "could not be found" in (status_proc.stderr or "").lower() or "not-found" in (status_proc.stdout or "").lower():
+                return SoftwareUpdateRestartOut(
+                    ok=False,
+                    mode=mode,
+                    os=current_os,
+                    service=service_name,
+                    command=service_command,
+                    errors=[f"El servicio systemd {service_name} no existe o no esta disponible."],
+                )
+            if active_proc.returncode not in (0, 3):
+                detail = (active_proc.stderr or active_proc.stdout or status_proc.stderr or status_proc.stdout or "").strip()
+                return SoftwareUpdateRestartOut(
+                    ok=False,
+                    mode=mode,
+                    os=current_os,
+                    service=service_name,
+                    command=service_command,
+                    errors=[f"El servicio systemd {service_name} no existe o no esta disponible. {detail}".strip()],
+                )
+
+            proc = subprocess.run(["systemctl", "restart", service_name, "--no-block"], text=True, capture_output=True, timeout=8)
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout or "").strip()
+                return SoftwareUpdateRestartOut(
+                    ok=False,
+                    mode=mode,
+                    os=current_os,
+                    service=service_name,
+                    command=service_command,
+                    errors=[f"No se pudo reiniciar. Configure permisos del servicio o use modo manual. {detail}".strip()],
+                )
+            logger.info("[SOFTWARE UPDATE RESTART] os=%s mode=systemd service=%s result=scheduled", current_os, service_name)
+            return SoftwareUpdateRestartOut(ok=True, mode=mode, os=current_os, service=service_name, command=service_command, message=f"Reinicio solicitado via systemd: {service_name}")
+
+        if current_os == "Windows":
+            if mode != "windows_script":
+                return SoftwareUpdateRestartOut(ok=False, mode=mode, os=current_os, command=script_name, errors=["En Windows configure software_restart_mode=windows_script o manual."])
+            script_path = _resolve_restart_script(script_name)
+            subprocess.Popen(
+                ["cmd", "/c", "start", "", script_path, str(os.getpid())],
+                cwd=os.path.abspath("."),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
+            logger.info("[SOFTWARE UPDATE RESTART] os=%s mode=windows_script script=%s result=scheduled", current_os, script_path)
+            return SoftwareUpdateRestartOut(ok=True, mode=mode, os=current_os, command=script_path, message=f"Reinicio solicitado via script: {script_path}")
+
+        return SoftwareUpdateRestartOut(ok=False, mode=mode, os=current_os, errors=["Sistema operativo no soportado. Use modo manual."])
+    except Exception as exc:
+        logger.exception("[SOFTWARE UPDATE RESTART] os=%s mode=%s result=fail", current_os, mode)
+        return SoftwareUpdateRestartOut(
+            ok=False,
+            mode=mode,
+            os=current_os,
+            service=service_name,
+            command=service_command if current_os == "Linux" else script_name,
+            errors=[f"No se pudo reiniciar. Configure permisos del servicio o use modo manual. Detalle: {exc}"],
+        )
+
+
+@app.get("/api/health")
+def health_check():
+    return {"ok": True, "status": "ok", "time": datetime.utcnow().isoformat()}
 
 
 @app.get("/api/admin/client-ip", response_model=ClientIPOut)

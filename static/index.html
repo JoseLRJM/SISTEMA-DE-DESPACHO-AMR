@@ -755,6 +755,19 @@ reqCode automático · reqTime automático · mapShortName configurable y habili
 <button class="btn" id="cleanupDiagnosisBtn" type="button">Diagn&oacute;stico y limpieza</button>
 <div class="pill cleanup-warning hidden" id="cleanupHealthBadge">Hay racks reservados inconsistentes</div>
 </div>
+<div class="admin-update-box">
+<h4>Actualizaci&oacute;n de software</h4>
+<div class="row">
+<input accept=".zip,application/zip" id="softwareUpdateZip" type="file"/>
+<button class="btn" id="btnValidateSoftwareUpdate" type="button">Validar paquete</button>
+<button class="btn danger hidden" id="btnApplySoftwareUpdate" type="button" style="display:none">Aplicar actualizaci&oacute;n validada</button>
+<button class="btn warn hidden" id="btnRestartSoftwareUpdate" type="button" style="display:none">Reiniciar aplicaci&oacute;n</button>
+</div>
+<div class="small">Solo valida el ZIP. No reemplaza archivos, no toca DB y no reinicia la app.</div>
+<div class="list-box software-update-result">
+<pre class="json-pre" id="softwareUpdateResult">Resultado de validaci&oacute;n</pre>
+</div>
+</div>
 <div class="small" id="adminMsg"></div>
 </div>
 </div>

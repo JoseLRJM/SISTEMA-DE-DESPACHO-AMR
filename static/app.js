@@ -37,6 +37,10 @@ const API = {
   adminCleanupResolveInconsistentRacks: "/api/admin/cleanup-resolve-inconsistent-racks",
   adminForceReleaseOldActiveRacks: "/api/admin/force-release-old-active-racks",
   adminCreateOldActiveOrderTest: "/api/admin/test/create-old-active-order",
+  adminSoftwareUpdateValidate: "/api/admin/software-update/validate",
+  adminSoftwareUpdateApply: "/api/admin/software-update/apply",
+  adminSoftwareUpdateRestart: "/api/admin/software-update/restart",
+  health: "/api/health",
   fifoValidate: "/api/fifo/validate",
   fifoExecute: "/api/fifo/execute",
   directMoveExecute: "/api/direct-move/execute",
@@ -138,6 +142,12 @@ const diagnosisInconsistentLocations = $("diagnosisInconsistentLocations");
 const diagnosisIntegrityCheck = $("diagnosisIntegrityCheck");
 const btnForceReleaseOldActiveRacks = $("btnForceReleaseOldActiveRacks");
 const createOldActiveOrderTestBtn = $("createOldActiveOrderTestBtn");
+const softwareUpdateZip = $("softwareUpdateZip");
+const btnValidateSoftwareUpdate = $("btnValidateSoftwareUpdate");
+const btnApplySoftwareUpdate = $("btnApplySoftwareUpdate");
+const btnRestartSoftwareUpdate = $("btnRestartSoftwareUpdate");
+const softwareUpdateResult = $("softwareUpdateResult");
+let lastSoftwareUpdateValidation = null;
 
 const dispRows = $("dispRows");
 const dispCols = $("dispCols");
@@ -1058,26 +1068,254 @@ const ACTION_CARD_ORDER = [
   "card-admin-login",
 ];
 const PUBLIC_CARD_IDS = new Set(["card-workstation", "card-history", "card-admin-login"]);
+const ACTION_TAB_STORAGE_KEY = "agv_side_panel_active_tab_v1";
+const ACTION_CARD_TABS = [
+  {
+    key: "operation",
+    label: "Operaci\u00f3n",
+    cards: ["card-workstation", "card-history"],
+  },
+  {
+    key: "configuration",
+    label: "Configuraci\u00f3n",
+    cards: ["card-cell", "card-areas", "card-materials", "card-racks", "card-operator-windows"],
+  },
+  {
+    key: "advanced",
+    label: "Configuraci\u00f3n avanzada",
+    cards: ["card-general", "card-direct-move", "card-fifo", "card-client-bg", "card-debug-rcs", "card-config-rcs", "card-admin-password", "card-admin-login"],
+  },
+];
+let activeActionTabId = safeStorageGet(ACTION_TAB_STORAGE_KEY) || "operation";
 
 function reorderActionCards() {
   const sidePanel = document.querySelector('.side-panel');
   if (!(sidePanel instanceof HTMLElement)) return;
   const title = sidePanel.querySelector('.panel-title');
-  const cards = new Map(Array.from(sidePanel.querySelectorAll(':scope > .card')).map((card) => [card.id, card]));
-  ACTION_CARD_ORDER.forEach((cardId) => {
-    const card = cards.get(cardId);
-    if (card) sidePanel.appendChild(card);
+  let tabsRoot = sidePanel.querySelector(':scope > .action-tabs-root');
+  if (!tabsRoot) {
+    tabsRoot = document.createElement('div');
+    tabsRoot.className = 'action-tabs-root';
+
+    const tabsHeader = document.createElement('div');
+    tabsHeader.className = 'action-tabs-header';
+    tabsHeader.setAttribute('role', 'tablist');
+    tabsHeader.addEventListener('click', function (event) {
+      const button = event.target.closest('.action-tab-button');
+      if (!button) return;
+      event.preventDefault();
+      event.stopPropagation();
+      setActiveActionTab(button.dataset.tab);
+    });
+
+    const panels = document.createElement('div');
+    panels.className = 'action-tab-panels';
+
+    ACTION_CARD_TABS.forEach((tab) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'action-tab-button';
+      button.dataset.tab = tab.key;
+      button.setAttribute('role', 'tab');
+      button.textContent = tab.label;
+      button.addEventListener("click", function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        setActiveActionTab(tab.key);
+      });
+      tabsHeader.appendChild(button);
+
+      const panel = document.createElement('div');
+      panel.className = 'action-tab-panel';
+      panel.dataset.tab = tab.key;
+      panel.hidden = true;
+      panel.setAttribute('role', 'tabpanel');
+      panels.appendChild(panel);
+    });
+
+    tabsRoot.appendChild(tabsHeader);
+    tabsRoot.appendChild(panels);
+  }
+
+  const cards = new Map(Array.from(sidePanel.querySelectorAll('.card')).map((card) => [card.id, card]));
+  ACTION_CARD_TABS.forEach((tab) => {
+    const panel = tabsRoot.querySelector(`.action-tab-panel[data-tab="${tab.key}"]`);
+    if (!(panel instanceof HTMLElement)) return;
+    tab.cards.forEach((cardId) => {
+      const card = cards.get(cardId);
+      if (card) panel.appendChild(card);
+    });
   });
-  if (title) sidePanel.insertBefore(title, sidePanel.firstChild);
+
+  const assignedCardIds = new Set(ACTION_CARD_TABS.flatMap((tab) => tab.cards));
+  ACTION_CARD_ORDER.forEach((cardId) => {
+    if (assignedCardIds.has(cardId)) return;
+    const card = cards.get(cardId);
+    const fallbackPanel = tabsRoot.querySelector('.action-tab-panel[data-tab="advanced"]');
+    if (card && fallbackPanel) fallbackPanel.appendChild(card);
+  });
+
+  if (title) {
+    sidePanel.insertBefore(title, sidePanel.firstChild);
+    if (tabsRoot.parentNode !== sidePanel) sidePanel.appendChild(tabsRoot);
+    if (title.nextSibling !== tabsRoot) sidePanel.insertBefore(tabsRoot, title.nextSibling);
+  } else if (tabsRoot.parentNode !== sidePanel) {
+    sidePanel.prepend(tabsRoot);
+  }
+  updateActionTabsVisibility();
+  const tabsHeader = tabsRoot.querySelector(".action-tabs-header");
+  const firstVisibleButton = tabsHeader?.querySelector(".action-tab-button:not([hidden])");
+  if (firstVisibleButton) {
+    setActiveActionTab(firstVisibleButton.dataset.tab);
+  }
 }
 
 function updateCardVisibility(isAdminEnabled) {
-  document.querySelectorAll('.side-panel > .card').forEach((card) => {
+  document.querySelectorAll('.side-panel .card').forEach((card) => {
     if (!(card instanceof HTMLElement)) return;
     const shouldShow = isAdminEnabled || PUBLIC_CARD_IDS.has(card.id);
     card.style.display = shouldShow ? '' : 'none';
   });
+  ensureActionTabsLayout();
+  forceShowActionTabsHeader();
+  refreshActionTabsAfterVisibilityChange();
   scheduleCanvasResize();
+}
+
+function ensureActionTabsLayout() {
+  const sidePanel = document.querySelector(".side-panel");
+  if (!sidePanel) return;
+
+  let tabsRoot = sidePanel.querySelector(".action-tabs-root");
+  let tabsHeader = sidePanel.querySelector(".action-tabs-header");
+
+  if (!tabsRoot || !tabsHeader) {
+    reorderActionCards();
+    return;
+  }
+
+  tabsRoot.hidden = false;
+  tabsRoot.style.display = "";
+  tabsHeader.hidden = false;
+  tabsHeader.style.display = "";
+}
+
+function refreshActionTabsAfterVisibilityChange() {
+  const root = document.querySelector(".action-tabs-root");
+  if (!root) return;
+
+  const buttons = root.querySelectorAll(".action-tab-button");
+  buttons.forEach((button) => {
+    button.hidden = false;
+    button.style.display = "";
+    button.disabled = false;
+  });
+
+  const activeButton = root.querySelector(".action-tab-button.active");
+  const firstButton = root.querySelector(".action-tab-button");
+
+  if (!activeButton && firstButton) {
+    setActiveActionTab(firstButton.dataset.tab);
+    return;
+  }
+
+  if (activeButton) {
+    setActiveActionTab(activeButton.dataset.tab);
+  }
+}
+
+function forceShowActionTabsHeader() {
+  const root = document.querySelector(".action-tabs-root");
+  const header = document.querySelector(".action-tabs-header");
+  if (!root || !header) return;
+
+  root.hidden = false;
+  root.style.display = "flex";
+
+  header.hidden = false;
+  header.style.display = "flex";
+  header.style.visibility = "visible";
+  header.style.opacity = "1";
+  header.style.pointerEvents = "auto";
+
+  header.querySelectorAll(".action-tab-button").forEach((button) => {
+    button.hidden = false;
+    button.disabled = false;
+    button.style.display = "";
+    button.style.visibility = "visible";
+    button.style.opacity = "1";
+    button.style.pointerEvents = "auto";
+  });
+}
+
+function repairActionTabsLayout() {
+  const root = document.querySelector(".action-tabs-root");
+  const header = document.querySelector(".action-tabs-header");
+  if (!root || !header) return;
+
+  root.hidden = false;
+  root.style.display = "flex";
+
+  header.hidden = false;
+  header.style.display = "flex";
+  header.style.visibility = "visible";
+  header.style.opacity = "1";
+  header.style.pointerEvents = "auto";
+
+  document.querySelectorAll(".action-tab-button").forEach((button) => {
+    button.hidden = false;
+    button.disabled = false;
+    button.style.pointerEvents = "auto";
+  });
+}
+
+function setActiveActionTab(tabId) {
+  const tabsRoot = document.querySelector(".action-tabs-root");
+  if (!tabsRoot) return;
+
+  activeActionTabId = tabId || "";
+  if (activeActionTabId) safeStorageSet(ACTION_TAB_STORAGE_KEY, activeActionTabId);
+
+  const buttons = tabsRoot.querySelectorAll(".action-tab-button");
+  const panels = tabsRoot.querySelectorAll(".action-tab-panel");
+
+  buttons.forEach((btn) => {
+    const isActive = btn.dataset.tab === activeActionTabId;
+    btn.classList.toggle("active", isActive);
+    btn.setAttribute("aria-selected", isActive ? "true" : "false");
+  });
+
+  panels.forEach((panel) => {
+    const isActive = panel.dataset.tab === activeActionTabId;
+    panel.classList.toggle("active", isActive);
+    panel.hidden = !isActive;
+  });
+
+  scheduleCanvasResize();
+}
+
+function cardIsVisibleInPanel(card) {
+  return card instanceof HTMLElement && card.style.display !== 'none';
+}
+
+function updateActionTabsVisibility() {
+  const tabsRoot = document.querySelector('.side-panel .action-tabs-root');
+  if (!(tabsRoot instanceof HTMLElement)) return;
+  const tabKeys = ACTION_CARD_TABS.map((tab) => tab.key);
+
+  ACTION_CARD_TABS.forEach((tab) => {
+    const button = tabsRoot.querySelector(`.action-tab-button[data-tab="${tab.key}"]`);
+    const panel = tabsRoot.querySelector(`.action-tab-panel[data-tab="${tab.key}"]`);
+    if (!(button instanceof HTMLElement) || !(panel instanceof HTMLElement)) return;
+    button.hidden = false;
+  });
+
+  if (!tabKeys.includes(activeActionTabId)) {
+    activeActionTabId = tabKeys[0] || "";
+    if (activeActionTabId) safeStorageSet(ACTION_TAB_STORAGE_KEY, activeActionTabId);
+  }
+
+  setActiveActionTab(activeActionTabId);
 }
 
 function safeStorageGet(key) {
@@ -1156,6 +1394,7 @@ function initActionCardsLayout() {
 
     toggle.addEventListener('click', () => {
       applyState(!card.classList.contains('collapsed'));
+      repairActionTabsLayout();
       scheduleCanvasResize();
     });
 
@@ -2217,6 +2456,12 @@ function setAdminUI(enabled) {
   ]);
 
   document.querySelectorAll("input, textarea, select, button").forEach((el) => {
+    if (
+      el.closest?.(".action-tabs-header") ||
+      el.classList?.contains("action-tab-button")
+    ) {
+      return;
+    }
     if (!el.id) return;
     if (alwaysEnabledIds.has(el.id)) {
       el.disabled = false;
@@ -2228,6 +2473,10 @@ function setAdminUI(enabled) {
     }
     el.disabled = !enabled;
   });
+  ensureActionTabsLayout();
+  forceShowActionTabsHeader();
+  refreshActionTabsAfterVisibilityChange();
+  repairActionTabsLayout();
 }
 function applyAgvOverlayConfigFromGrid(cfg = {}) {
   agvOverlayConfig.scale_x = Number(cfg.agv_overlay_scale_x ?? 1) || 1;
@@ -4124,6 +4373,7 @@ btnAdminLogin?.addEventListener("click", async () => {
     await loadCleanupHealth();
     await loadAdminOperatorWindows();
     fillCellForm(locations[idx(selected.x, selected.y)]);
+    repairActionTabsLayout();
   } catch (err) { adminMsg.textContent = `Error: ${String(err)}`; }
 });
 btnAdminLock?.addEventListener("click", () => { adminToken = null; setAdminUI(false); clearAdminOperatorWindowForm(); if (cleanupHealthBadge) cleanupHealthBadge.classList.add("hidden"); adminMsg.textContent = "Admin bloqueado."; });
@@ -4463,4 +4713,205 @@ document.addEventListener("click", function (event) {
   console.log("[cleanup] click detectado");
 
   openCleanupDiagnosisModal();
+});
+
+async function validateSoftwareUpdatePackage() {
+  const fileInput = document.getElementById("softwareUpdateZip");
+  const resultBox = document.getElementById("softwareUpdateResult");
+  const applyBtn = document.getElementById("btnApplySoftwareUpdate");
+  const restartBtn = document.getElementById("btnRestartSoftwareUpdate");
+
+  console.log("[software-update] validateSoftwareUpdatePackage ejecutada");
+
+  lastSoftwareUpdateValidation = null;
+  if (applyBtn) {
+    applyBtn.classList.add("hidden");
+    applyBtn.style.display = "none";
+  }
+  if (restartBtn) {
+    restartBtn.classList.add("hidden");
+    restartBtn.style.display = "none";
+  }
+
+  if (!fileInput || !fileInput.files || !fileInput.files.length) {
+    if (resultBox) resultBox.textContent = "Selecciona un archivo ZIP.";
+    return;
+  }
+
+  const formData = new FormData();
+  formData.append("file", fileInput.files[0]);
+
+  if (resultBox) resultBox.textContent = "Validando paquete...";
+
+  try {
+    const response = await fetch("/api/admin/software-update/validate", {
+      method: "POST",
+      headers: adminToken ? { "X-Admin-Token": adminToken } : {},
+      body: formData
+    });
+
+    const data = await response.json();
+
+    console.log("[software-update] respuesta", data);
+
+    lastSoftwareUpdateValidation = data;
+    if (applyBtn && data?.ok === true) {
+      applyBtn.classList.remove("hidden");
+      applyBtn.style.display = "";
+    }
+
+    if (resultBox) {
+      resultBox.textContent = JSON.stringify(data, null, 2);
+    }
+  } catch (err) {
+    console.error("[software-update] error", err);
+    if (resultBox) resultBox.textContent = String(err);
+  }
+}
+
+window.validateSoftwareUpdatePackage = validateSoftwareUpdatePackage;
+
+async function applyValidatedSoftwareUpdate() {
+  const resultBox = document.getElementById("softwareUpdateResult");
+  const applyBtn = document.getElementById("btnApplySoftwareUpdate");
+  const restartBtn = document.getElementById("btnRestartSoftwareUpdate");
+
+  if (!lastSoftwareUpdateValidation || lastSoftwareUpdateValidation.ok !== true) {
+    if (resultBox) resultBox.textContent = "Primero valida correctamente un paquete ZIP.";
+    return;
+  }
+
+  const confirmed = window.confirm("Esto reemplazará archivos del software actual usando el paquete validado. Se creará backup y no se reiniciará la app. ¿Continuar?");
+  if (!confirmed) return;
+
+  if (resultBox) resultBox.textContent = "Aplicando actualización validada...";
+  if (applyBtn) applyBtn.disabled = true;
+
+  try {
+    const response = await fetch("/api/admin/software-update/apply", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(adminToken ? { "X-Admin-Token": adminToken } : {})
+      },
+      body: JSON.stringify({ staging_id: lastSoftwareUpdateValidation.staging_id || null })
+    });
+    const data = await response.json();
+    console.log("[software-update] apply respuesta", data);
+    if (resultBox) resultBox.textContent = JSON.stringify(data, null, 2);
+    if (applyBtn && data?.ok === true) {
+      applyBtn.classList.add("hidden");
+      applyBtn.style.display = "none";
+    }
+    if (restartBtn && data?.ok === true) {
+      restartBtn.classList.remove("hidden");
+      restartBtn.style.display = "";
+    }
+  } catch (err) {
+    console.error("[software-update] apply error", err);
+    if (resultBox) resultBox.textContent = String(err);
+  } finally {
+    if (applyBtn) applyBtn.disabled = false;
+  }
+}
+
+window.applyValidatedSoftwareUpdate = applyValidatedSoftwareUpdate;
+
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function waitForSoftwareReconnect() {
+  const resultBox = document.getElementById("softwareUpdateResult");
+  let attempts = 0;
+  await wait(2000);
+  while (attempts < 120) {
+    attempts += 1;
+    try {
+      const response = await fetch("/api/health", { cache: "no-store" });
+      if (response.ok) {
+        const data = await response.json().catch(() => ({}));
+        if (resultBox) {
+          resultBox.textContent += `\n\nAplicación reconectada.\n${JSON.stringify(data, null, 2)}`;
+        }
+        return true;
+      }
+    } catch (_err) {
+      // La app puede estar reiniciando; se reintenta abajo.
+    }
+    if (resultBox) resultBox.textContent = "Esperando reconexión...";
+    await wait(2000);
+  }
+  if (resultBox) resultBox.textContent += "\n\nNo se pudo confirmar reconexión por /api/health.";
+  return false;
+}
+
+async function restartSoftwareUpdateApp() {
+  const resultBox = document.getElementById("softwareUpdateResult");
+  const restartBtn = document.getElementById("btnRestartSoftwareUpdate");
+
+  if (!window.confirm("La aplicación intentará reiniciarse ahora. No se aplicarán cambios adicionales. ¿Continuar?")) return;
+
+  if (resultBox) resultBox.textContent = "Solicitando reinicio...";
+  if (restartBtn) restartBtn.disabled = true;
+
+  try {
+    const response = await fetch("/api/admin/software-update/restart", {
+      method: "POST",
+      headers: adminToken ? { "X-Admin-Token": adminToken } : {}
+    });
+    const data = await response.json();
+    console.log("[software-update] restart respuesta", data);
+    if (resultBox) resultBox.textContent = JSON.stringify(data, null, 2);
+    if (!data?.ok) return;
+    if (data?.mode === "manual") {
+      if (resultBox) resultBox.textContent = data.message || "Actualización aplicada. Reinicie manualmente la aplicación.";
+      return;
+    }
+    if (resultBox) resultBox.textContent = "Esperando reconexión...";
+    await waitForSoftwareReconnect();
+  } catch (err) {
+    console.error("[software-update] restart error", err);
+    if (resultBox) resultBox.textContent = String(err);
+  } finally {
+    if (restartBtn) restartBtn.disabled = false;
+  }
+}
+
+window.restartSoftwareUpdateApp = restartSoftwareUpdateApp;
+
+document.addEventListener("click", async function (event) {
+  const btn = event.target.closest("#btnValidateSoftwareUpdate");
+  if (!btn) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+
+  console.log("[software-update] validar paquete click delegado");
+
+  await window.validateSoftwareUpdatePackage();
+});
+
+document.addEventListener("click", async function (event) {
+  const btn = event.target.closest("#btnApplySoftwareUpdate");
+  if (!btn) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+
+  console.log("[software-update] aplicar update click delegado");
+
+  await window.applyValidatedSoftwareUpdate();
+});
+
+document.addEventListener("click", async function (event) {
+  const btn = event.target.closest("#btnRestartSoftwareUpdate");
+  if (!btn) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+
+  console.log("[software-update] reiniciar app click delegado");
+
+  await window.restartSoftwareUpdateApp();
 });
