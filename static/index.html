@@ -768,11 +768,55 @@ reqCode automático · reqTime automático · mapShortName configurable y habili
 <pre class="json-pre" id="softwareUpdateResult">Resultado de validaci&oacute;n</pre>
 </div>
 </div>
+<div class="row admin-backups-row">
+<button class="btn" id="btnOpenDbBackupsModal" type="button">Respaldos</button>
+</div>
 <div class="small" id="adminMsg"></div>
 </div>
 </div>
 </aside>
 </main>
+<div class="modal hidden" id="dbBackupsModal">
+<div class="modal-card db-backups-modal-card">
+<div class="modal-header">
+<h3>Base de datos y respaldos</h3>
+</div>
+<div class="modal-body db-backups-modal-body">
+<button class="btn" disabled="" id="btnDownloadDb" type="button">Descargar DB</button>
+<button class="btn" disabled="" id="btnDownloadFullBackup" type="button">Descargar backup completo</button>
+<input accept=".zip,application/zip" class="hidden" id="backupZipFile" type="file"/>
+<button class="btn" disabled="" id="btnChooseBackupFile" type="button">Elegir archivo</button>
+<button class="btn" disabled="" id="btnValidateBackup" type="button">Validar backup</button>
+<button class="btn danger" disabled="" id="btnRestoreBackup" type="button">Restaurar backup</button>
+<div class="pill hidden" id="backupRestartPendingBadge">Estado: Reinicio pendiente</div>
+<button class="btn hidden" id="btnMarkBackupRestarted" type="button" style="display:none;">Marcar como reiniciado</button>
+<div class="small" id="backupSelectedFileName">Sin archivo seleccionado.</div>
+<div class="small" id="dbBackupsMsg"></div>
+<section class="backup-history-section">
+<h4>Backups previos</h4>
+<div class="backup-history-list" id="preRestoreBackupsList">No hay backups previos.</div>
+</section>
+</div>
+<div class="row">
+<button class="btn ghost" id="btnCloseDbBackupsModal" type="button">Cerrar</button>
+</div>
+</div>
+</div>
+<div class="modal hidden" id="backupRestoreConfirmModal">
+<div class="modal-card cleanup-confirm-card">
+<div class="modal-header">
+<h3>Confirmar restauraci&oacute;n</h3>
+</div>
+<div class="modal-body">
+<div class="small">La restauraci&oacute;n reemplazar&aacute;:<br/><br/>- base de datos actual<br/>- uploads/mapas/fondos actuales<br/><br/>La aplicaci&oacute;n deber&aacute; reiniciarse manualmente.<br/><br/>&iquest;Deseas continuar?</div>
+<div class="small" id="backupRestoreConfirmMsg"></div>
+</div>
+<div class="row">
+<button class="btn ghost" id="btnCancelBackupRestore" type="button">Cancelar</button>
+<button class="btn danger" id="btnConfirmBackupRestore" type="button">Restaurar</button>
+</div>
+</div>
+</div>
 <div class="modal hidden" id="cleanupDiagnosisModal">
 <div class="modal-card diagnosis-modal-card">
 <div class="modal-header">

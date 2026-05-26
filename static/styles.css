@@ -223,6 +223,7 @@ input[disabled]{opacity:.6}
   .btn.primary{background:#1b2b46}
   .btn.warn{background:#7c2d12;border-color:#f97316;color:#fff}
   .btn.danger{background:#2a1220}
+  .btn:disabled{opacity:.55;cursor:not-allowed}
 
 .btn.ghost{
   padding:7px 10px;
@@ -460,6 +461,14 @@ textarea[disabled], select[disabled]{opacity:.6}
 }
 .admin-update-box{display:grid;gap:8px;margin-top:12px;padding-top:12px;border-top:1px solid var(--border)}
 .admin-update-box h4{margin:0;color:var(--text);font-size:14px}
+.admin-backups-row{margin-top:10px}
+.admin-backups-row .btn{padding:7px 10px}
+.backup-history-section{display:grid;gap:8px;border-top:1px solid var(--border);padding-top:10px;margin-top:4px}
+.backup-history-section h4{margin:0;color:var(--text);font-size:14px}
+.backup-history-list{display:grid;gap:6px}
+.backup-history-row{display:grid;grid-template-columns:minmax(0,1.4fr) auto auto auto;gap:8px;align-items:center;font-size:12px}
+.backup-history-row .backup-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.backup-history-row .btn{padding:6px 8px}
 .software-update-result{max-height:260px}
 
 .json-editor{

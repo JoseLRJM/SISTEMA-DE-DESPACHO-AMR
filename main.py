@@ -12,6 +12,7 @@ import hashlib
 import os
 import platform
 import secrets
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -42,6 +43,7 @@ from models import (
     Area,
     BG_BASENAME,
     Base,
+    DB_URL,
     DB_GRID_H,
     DB_GRID_W,
     DebugConsoleEvent,
@@ -348,6 +350,8 @@ class SoftwareUpdateApplyOut(BaseModel):
 class SoftwareUpdateRestartOut(BaseModel):
     ok: bool
     mode: str = ""
+    configured_mode: str = ""
+    detected_mode: str = ""
     os: str = ""
     service: str = ""
     command: str = ""
@@ -895,11 +899,13 @@ def ensure_default_settings():
             "runtime_reconnect_seconds": "3.0",
             "cleanup_min_age_minutes": "30",
             "force_release_min_age_minutes": "20",
-            "software_restart_mode": "systemd" if platform.system() == "Linux" else ("windows_script" if platform.system() == "Windows" else "manual"),
+            "software_restart_mode": "auto",
+            "software_restart_service_name": "agv-app",
             "software_update_systemd_service": "agv-app",
             "software_restart_script": "restart_app.bat",
             "software_update_keep_backups": "5",
             "software_update_max_uncompressed_mb": "500",
+            "pre_restore_backup_keep": "10",
         }
         for k, v in defaults.items():
             if not get_setting(db, k, ""):
@@ -1979,6 +1985,7 @@ def _rcs_create_task_accepted(response: RcsTaskResponse) -> bool:
 
 def _dispatch_movement_order(db, row: MovementOrder) -> MovementOrderDispatchOut:
     logger.info("Dispatching movement order id=%s order_code=%s", row.id, row.order_code)
+    previous_status = row.status or ""
     generated_payload = _movement_order_json_payload(db, row)
     payload, _payload_source = _current_movement_order_payload(row, generated_payload)
     client = _get_rcs_client_from_settings(db)
@@ -2012,10 +2019,14 @@ def _dispatch_movement_order(db, row: MovementOrder) -> MovementOrderDispatchOut
         db.commit()
         db.refresh(row)
         logger.info(
-            "Movement order dispatched id=%s order_code=%s remote_task_code=%s status=%s",
+            "Task sent to RCS | task_id=%s | order_code=%s | remote_task_code=%s | rack_id=%s | agv=%s | from=%s | to=%s | dispatch_status=%s",
             row.id,
             row.order_code,
             row.remote_task_code,
+            row.rack_id,
+            row.agv_code or "-",
+            previous_status,
+            row.status,
             row.dispatch_status,
         )
         return _movement_order_dispatch_out(row)
@@ -2032,7 +2043,7 @@ def _dispatch_movement_order(db, row: MovementOrder) -> MovementOrderDispatchOut
         db.add(row)
         db.commit()
         db.refresh(row)
-        logger.error("Dispatch failed for movement order id=%s order_code=%s error=%s", row.id, row.order_code, exc)
+        logger.exception("Task dispatch failed | task_id=%s | order_code=%s | rack_id=%s | agv=%s | error=%s", row.id, row.order_code, row.rack_id, row.agv_code or "-", exc)
         return _movement_order_dispatch_out(row)
 
 
@@ -2126,10 +2137,35 @@ def root():
 @app.get("/api/logs/download")
 def download_logs():
     log_path = ensure_log_file()
-    content = log_path.read_bytes()
-    logger.info("Log download requested path=%s", log_path)
-    headers = {"Content-Disposition": 'attachment; filename="app.log"'}
-    return StreamingResponse(iter([content]), media_type="text/plain", headers=headers)
+    log_dir = os.path.dirname(str(log_path))
+    log_names = ("app.log", "error.log", "rcs.log", "programming.log", "io.log")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    tmp_path = tmp.name
+    tmp.close()
+    included_logs = []
+    with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+        for log_name in log_names:
+            candidate = os.path.join(log_dir, log_name)
+            if not os.path.isfile(candidate):
+                continue
+            zf.write(candidate, arcname=log_name)
+            included_logs.append(log_name)
+    logger.info("Log download requested files=%s", ",".join(included_logs))
+
+    def _iter_zip_file():
+        try:
+            with open(tmp_path, "rb") as fh:
+                while True:
+                    chunk = fh.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(tmp_path)
+
+    headers = {"Content-Disposition": 'attachment; filename="logs.zip"'}
+    return StreamingResponse(_iter_zip_file(), media_type="application/zip", headers=headers)
 
 
 @app.get("/api/grid-config", response_model=GridDisplayConfig)
@@ -2503,14 +2539,61 @@ def _restore_software_backup(app_root: str, backup_path: str, created_files: Lis
 
 def _software_restart_config() -> tuple[str, str, str]:
     current_os = platform.system()
-    default_mode = "systemd" if current_os == "Linux" else ("windows_script" if current_os == "Windows" else "manual")
     with SessionLocal() as db:
-        mode = (get_setting(db, "software_restart_mode", default_mode) or default_mode).strip().lower()
-        service_name = (get_setting(db, "software_update_systemd_service", "agv-app") or "agv-app").strip()
+        mode = (get_setting(db, "software_restart_mode", "auto") or "auto").strip().lower()
+        service_name = (
+            get_setting(db, "software_restart_service_name", "")
+            or get_setting(db, "software_update_systemd_service", "agv-app")
+            or "agv-app"
+        ).strip()
         script_name = (get_setting(db, "software_restart_script", "restart_app.bat") or "restart_app.bat").strip()
-    if mode not in {"systemd", "windows_script", "manual"}:
-        mode = default_mode
+    if mode not in {"auto", "disabled", "systemd", "windows_script"}:
+        mode = "auto"
     return mode, service_name, script_name
+
+
+def _is_windows_development_runtime() -> bool:
+    argv = " ".join(str(arg).lower() for arg in sys.argv)
+    if "uvicorn" in argv:
+        return True
+    if getattr(sys, "frozen", False):
+        return False
+    dev_env_names = (
+        "TERM_PROGRAM",
+        "VSCODE_PID",
+        "VSCODE_CWD",
+        "VSCODE_IPC_HOOK_CLI",
+        "WT_SESSION",
+    )
+    if any(os.getenv(name) for name in dev_env_names):
+        return True
+    return sys.stdin.isatty() or sys.stdout.isatty()
+
+
+def _detect_software_restart_mode(configured_mode: str, current_os: str, service_name: str, script_name: str) -> tuple[str, str]:
+    if configured_mode != "auto":
+        return configured_mode, ""
+    if current_os == "Windows":
+        if _is_windows_development_runtime():
+            return "disabled", "Entorno de desarrollo detectado. Reinicia manualmente la aplicación."
+        try:
+            _resolve_restart_script(script_name)
+            return "windows_script", ""
+        except Exception:
+            return "disabled", "No se encontró script de reinicio válido. Reinicia manualmente la aplicación."
+    if current_os == "Linux":
+        if not _validate_systemd_service_name(service_name):
+            return "disabled", "Servicio systemd inválido. Reinicia manualmente la aplicación."
+        try:
+            status_proc = _run_systemctl_check(["status", service_name, "--no-pager"])
+            active_proc = _run_systemctl_check(["is-active", service_name])
+            missing = status_proc.returncode == 4 or "could not be found" in (status_proc.stderr or "").lower() or "not-found" in (status_proc.stdout or "").lower()
+            if not missing and active_proc.returncode in (0, 3):
+                return "systemd", ""
+        except Exception:
+            pass
+        return "disabled", "No se detectó servicio systemd disponible. Reinicia manualmente la aplicación."
+    return "disabled", "Sistema operativo no soportado. Reinicia manualmente la aplicación."
 
 
 def _validate_systemd_service_name(service_name: str) -> bool:
@@ -2851,24 +2934,23 @@ def admin_apply_software_update(body: Optional[SoftwareUpdateApplyIn] = None, x_
         SOFTWARE_UPDATE_LOCK.release()
 
 
-@app.post("/api/admin/software-update/restart", response_model=SoftwareUpdateRestartOut)
-def admin_restart_after_software_update(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
-    require_admin(x_admin_token)
+def _schedule_software_restart() -> SoftwareUpdateRestartOut:
     current_os = platform.system()
-    mode, service_name, script_name = _software_restart_config()
+    configured_mode, service_name, script_name = _software_restart_config()
+    mode, detected_message = _detect_software_restart_mode(configured_mode, current_os, service_name, script_name)
     service_command = f"systemctl restart {service_name} --no-block"
 
-    if mode == "manual":
-        message = "Actualizacion aplicada. Reinicie manualmente la aplicacion."
-        logger.info("[SOFTWARE UPDATE RESTART] os=%s mode=%s result=manual", current_os, mode)
-        return SoftwareUpdateRestartOut(ok=True, mode=mode, os=current_os, service=service_name, command="", message=message)
+    if mode == "disabled":
+        message = detected_message or "Reinicio automático deshabilitado. Reinicia manualmente la aplicación."
+        logger.info("[SOFTWARE UPDATE RESTART] os=%s configured_mode=%s detected_mode=%s result=disabled", current_os, configured_mode, mode)
+        return SoftwareUpdateRestartOut(ok=True, mode=mode, configured_mode=configured_mode, detected_mode=mode, os=current_os, service=service_name, command="", message=message)
 
     try:
         if current_os == "Linux":
             if mode != "systemd":
-                return SoftwareUpdateRestartOut(ok=False, mode=mode, os=current_os, service=service_name, command=service_command, errors=["En Linux configure software_restart_mode=systemd o manual."])
+                return SoftwareUpdateRestartOut(ok=False, mode=mode, configured_mode=configured_mode, detected_mode=mode, os=current_os, service=service_name, command=service_command, errors=["En Linux configure software_restart_mode=systemd, auto o disabled."])
             if not _validate_systemd_service_name(service_name):
-                return SoftwareUpdateRestartOut(ok=False, mode=mode, os=current_os, service=service_name, command=service_command, errors=["Nombre de servicio systemd invalido."])
+                return SoftwareUpdateRestartOut(ok=False, mode=mode, configured_mode=configured_mode, detected_mode=mode, os=current_os, service=service_name, command=service_command, errors=["Nombre de servicio systemd invalido."])
 
             status_proc = _run_systemctl_check(["status", service_name, "--no-pager"])
             active_proc = _run_systemctl_check(["is-active", service_name])
@@ -2876,6 +2958,8 @@ def admin_restart_after_software_update(x_admin_token: Optional[str] = Header(de
                 return SoftwareUpdateRestartOut(
                     ok=False,
                     mode=mode,
+                    configured_mode=configured_mode,
+                    detected_mode=mode,
                     os=current_os,
                     service=service_name,
                     command=service_command,
@@ -2886,6 +2970,8 @@ def admin_restart_after_software_update(x_admin_token: Optional[str] = Header(de
                 return SoftwareUpdateRestartOut(
                     ok=False,
                     mode=mode,
+                    configured_mode=configured_mode,
+                    detected_mode=mode,
                     os=current_os,
                     service=service_name,
                     command=service_command,
@@ -2898,17 +2984,19 @@ def admin_restart_after_software_update(x_admin_token: Optional[str] = Header(de
                 return SoftwareUpdateRestartOut(
                     ok=False,
                     mode=mode,
+                    configured_mode=configured_mode,
+                    detected_mode=mode,
                     os=current_os,
                     service=service_name,
                     command=service_command,
-                    errors=[f"No se pudo reiniciar. Configure permisos del servicio o use modo manual. {detail}".strip()],
+                    errors=[f"No se pudo reiniciar. Configure permisos del servicio o use modo disabled. {detail}".strip()],
                 )
             logger.info("[SOFTWARE UPDATE RESTART] os=%s mode=systemd service=%s result=scheduled", current_os, service_name)
-            return SoftwareUpdateRestartOut(ok=True, mode=mode, os=current_os, service=service_name, command=service_command, message=f"Reinicio solicitado via systemd: {service_name}")
+            return SoftwareUpdateRestartOut(ok=True, mode=mode, configured_mode=configured_mode, detected_mode=mode, os=current_os, service=service_name, command=service_command, message="Se solicitó reinicio por systemd.")
 
         if current_os == "Windows":
             if mode != "windows_script":
-                return SoftwareUpdateRestartOut(ok=False, mode=mode, os=current_os, command=script_name, errors=["En Windows configure software_restart_mode=windows_script o manual."])
+                return SoftwareUpdateRestartOut(ok=False, mode=mode, configured_mode=configured_mode, detected_mode=mode, os=current_os, command=script_name, errors=["En Windows configure software_restart_mode=windows_script, auto o disabled."])
             script_path = _resolve_restart_script(script_name)
             subprocess.Popen(
                 ["cmd", "/c", "start", "", script_path, str(os.getpid())],
@@ -2918,19 +3006,27 @@ def admin_restart_after_software_update(x_admin_token: Optional[str] = Header(de
                 close_fds=True,
             )
             logger.info("[SOFTWARE UPDATE RESTART] os=%s mode=windows_script script=%s result=scheduled", current_os, script_path)
-            return SoftwareUpdateRestartOut(ok=True, mode=mode, os=current_os, command=script_path, message=f"Reinicio solicitado via script: {script_path}")
+            return SoftwareUpdateRestartOut(ok=True, mode=mode, configured_mode=configured_mode, detected_mode=mode, os=current_os, command=script_path, message="La aplicación se reiniciará automáticamente.")
 
-        return SoftwareUpdateRestartOut(ok=False, mode=mode, os=current_os, errors=["Sistema operativo no soportado. Use modo manual."])
+        return SoftwareUpdateRestartOut(ok=False, mode=mode, configured_mode=configured_mode, detected_mode=mode, os=current_os, errors=["Sistema operativo no soportado. Use modo disabled."])
     except Exception as exc:
         logger.exception("[SOFTWARE UPDATE RESTART] os=%s mode=%s result=fail", current_os, mode)
         return SoftwareUpdateRestartOut(
             ok=False,
             mode=mode,
+            configured_mode=configured_mode,
+            detected_mode=mode,
             os=current_os,
             service=service_name,
             command=service_command if current_os == "Linux" else script_name,
-            errors=[f"No se pudo reiniciar. Configure permisos del servicio o use modo manual. Detalle: {exc}"],
+            errors=[f"No se pudo reiniciar. Configure permisos del servicio o use modo disabled. Detalle: {exc}"],
         )
+
+
+@app.post("/api/admin/software-update/restart", response_model=SoftwareUpdateRestartOut)
+def admin_restart_after_software_update(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    return _schedule_software_restart()
 
 
 @app.get("/api/health")
@@ -3322,10 +3418,13 @@ def admin_hide_configured_range(x_admin_token: Optional[str] = Header(default=No
     with SessionLocal() as db:
         rows = int(get_setting(db, "display_rows", str(DB_GRID_H)))
         cols = int(get_setting(db, "display_cols", str(DB_GRID_W)))
+        changed = 0
         for loc in db.execute(select(Location).where(Location.x < cols, Location.y < rows)).scalars().all():
             loc.is_visible = 0
             loc.updated_at = datetime.utcnow()
+            changed += 1
         db.commit()
+    logger.info("Visible fields updated | action=hide | rows=%s | cols=%s | locations=%s", rows, cols, changed)
     return {"ok": True}
 
 
@@ -3335,10 +3434,13 @@ def admin_show_configured_range(x_admin_token: Optional[str] = Header(default=No
     with SessionLocal() as db:
         rows = int(get_setting(db, "display_rows", str(DB_GRID_H)))
         cols = int(get_setting(db, "display_cols", str(DB_GRID_W)))
+        changed = 0
         for loc in db.execute(select(Location).where(Location.x < cols, Location.y < rows)).scalars().all():
             loc.is_visible = 1
             loc.updated_at = datetime.utcnow()
+            changed += 1
         db.commit()
+    logger.info("Visible fields updated | action=show | rows=%s | cols=%s | locations=%s", rows, cols, changed)
     return {"ok": True}
 
 
@@ -3528,7 +3630,7 @@ def admin_login(body: AdminLogin):
             raise HTTPException(status_code=401, detail="Contraseña incorrecta")
     token = secrets.token_hex(16)
     ADMIN_TOKENS[token] = datetime.utcnow() + timedelta(hours=8)
-    logger.info("Admin login successful")
+    logger.info("Admin login successful token_prefix=%s", token[:6])
     return {"token": token, "expires_hours": 8}
 
 
@@ -3542,6 +3644,639 @@ def admin_change_password(body: AdminChangePassword, x_admin_token: Optional[str
         set_setting(db, "admin_password_hash", _sha256(body.new_password))
     logger.info("Admin changed password")
     return {"ok": True}
+
+
+@app.get("/api/admin/database/download")
+def admin_download_database(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    try:
+        require_admin(x_admin_token)
+        logger.info("Database download requested")
+        db_path = engine.url.database or DB_URL.replace("sqlite:///", "", 1)
+        db_abs_path = os.path.abspath(db_path)
+        if not os.path.isfile(db_abs_path):
+            raise HTTPException(status_code=404, detail="Base de datos no encontrada")
+        with engine.begin() as conn:
+            conn.exec_driver_sql("PRAGMA wal_checkpoint(FULL);")
+        filename = f"agv_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+        return FileResponse(
+            db_abs_path,
+            media_type="application/octet-stream",
+            filename=filename,
+        )
+    except HTTPException:
+        logger.warning("Database download failed")
+        raise
+    except Exception:
+        logger.exception("Database download failed")
+        raise HTTPException(status_code=500, detail="No se pudo descargar la base de datos")
+
+
+@app.get("/api/admin/backup/full")
+def admin_download_full_backup(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    tmp_path = None
+    try:
+        require_admin(x_admin_token)
+        logger.info("Full backup requested")
+        db_path = engine.url.database or DB_URL.replace("sqlite:///", "", 1)
+        db_abs_path = os.path.abspath(db_path)
+        uploads_abs_path = os.path.abspath(UPLOAD_DIR)
+        if not os.path.isfile(db_abs_path):
+            raise HTTPException(status_code=404, detail="Base de datos no encontrada")
+
+        with engine.begin() as conn:
+            conn.exec_driver_sql("PRAGMA wal_checkpoint(FULL);")
+
+        included_files = []
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+        tmp_path = tmp.name
+        tmp.close()
+
+        manifest = {
+            "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "app_name": "AGV Orders App",
+            "database_size_bytes": os.path.getsize(db_abs_path),
+            "files": [],
+        }
+
+        with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+            db_arcname = os.path.basename(db_abs_path)
+            zf.write(db_abs_path, arcname=db_arcname)
+            included_files.append(db_arcname)
+
+            if os.path.isdir(uploads_abs_path) and not os.path.islink(uploads_abs_path):
+                for root, dirs, files in os.walk(uploads_abs_path, followlinks=False):
+                    dirs[:] = [
+                        d for d in dirs
+                        if not d.startswith(".")
+                        and d != "__pycache__"
+                        and not os.path.islink(os.path.join(root, d))
+                    ]
+                    for name in files:
+                        if name.startswith(".") or name == "__pycache__":
+                            continue
+                        file_abs_path = os.path.join(root, name)
+                        if os.path.islink(file_abs_path) or not os.path.isfile(file_abs_path):
+                            continue
+                        rel_path = os.path.relpath(file_abs_path, uploads_abs_path)
+                        arcname = os.path.join("static", "uploads", rel_path).replace(os.sep, "/")
+                        zf.write(file_abs_path, arcname=arcname)
+                        included_files.append(arcname)
+
+            manifest["files"] = included_files + ["backup_manifest.json"]
+            zf.writestr("backup_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+
+        logger.info("Full backup generated")
+
+        def _iter_backup_zip():
+            try:
+                with open(tmp_path, "rb") as fh:
+                    while True:
+                        chunk = fh.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        yield chunk
+            finally:
+                with contextlib.suppress(OSError):
+                    os.remove(tmp_path)
+
+        filename = f"agv_full_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+        return StreamingResponse(_iter_backup_zip(), media_type="application/zip", headers=headers)
+    except HTTPException:
+        logger.warning("Full backup failed")
+        if tmp_path:
+            with contextlib.suppress(OSError):
+                os.remove(tmp_path)
+        raise
+    except Exception:
+        logger.exception("Full backup failed")
+        if tmp_path:
+            with contextlib.suppress(OSError):
+                os.remove(tmp_path)
+        raise HTTPException(status_code=500, detail="No se pudo descargar el backup completo")
+
+
+def _backup_validation_failure(message: str) -> dict:
+    logger.warning("Backup validation failed")
+    return {"ok": False, "message": f"Backup inválido: {message}"}
+
+
+def _is_blocked_backup_entry(name: str) -> Optional[str]:
+    normalized = (name or "").replace("\\", "/").strip("/")
+    parts = [p for p in normalized.split("/") if p]
+    lower_parts = [p.lower() for p in parts]
+    if not parts:
+        return "ruta vacía"
+    if any(part.startswith(".") for part in parts):
+        return "archivo oculto protegido"
+    if any(part in {".env", ".git", ".venv", "venv", "logs", "backups", "__pycache__"} for part in lower_parts):
+        return "ruta protegida"
+    if len(lower_parts) >= 2 and lower_parts[0] == "updates" and lower_parts[1] == "staging":
+        return "ruta protegida"
+    if normalized in {"agv.db", "backup_manifest.json", "static", "static/uploads"}:
+        return None
+    if normalized.startswith("static/uploads/"):
+        return None
+    return "ruta no permitida"
+
+
+def _active_database_abs_path() -> str:
+    db_path = engine.url.database or DB_URL.replace("sqlite:///", "", 1)
+    return os.path.abspath(db_path)
+
+
+def _write_current_state_backup(dest_zip_path: str) -> None:
+    db_abs_path = _active_database_abs_path()
+    uploads_abs_path = os.path.abspath(UPLOAD_DIR)
+    with engine.begin() as conn:
+        conn.exec_driver_sql("PRAGMA wal_checkpoint(FULL);")
+    with zipfile.ZipFile(dest_zip_path, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+        if os.path.isfile(db_abs_path):
+            zf.write(db_abs_path, arcname=os.path.basename(db_abs_path))
+        if os.path.isdir(uploads_abs_path) and not os.path.islink(uploads_abs_path):
+            for root, dirs, files in os.walk(uploads_abs_path, followlinks=False):
+                dirs[:] = [
+                    d for d in dirs
+                    if not d.startswith(".")
+                    and d != "__pycache__"
+                    and not os.path.islink(os.path.join(root, d))
+                ]
+                for name in files:
+                    if name.startswith(".") or name == "__pycache__":
+                        continue
+                    file_abs_path = os.path.join(root, name)
+                    if os.path.islink(file_abs_path) or not os.path.isfile(file_abs_path):
+                        continue
+                    rel_path = os.path.relpath(file_abs_path, uploads_abs_path)
+                    arcname = os.path.join("static", "uploads", rel_path).replace(os.sep, "/")
+                    zf.write(file_abs_path, arcname=arcname)
+
+
+def _create_pre_restore_backup() -> str:
+    backup_dir = os.path.abspath(os.path.join("backups", "pre_restore"))
+    os.makedirs(backup_dir, exist_ok=True)
+    backup_path = os.path.join(backup_dir, f"pre_restore_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip")
+    _write_current_state_backup(backup_path)
+    logger.info("Pre-restore backup created")
+    cleanup_pre_restore_backups()
+    return backup_path
+
+
+def _pre_restore_backup_dir() -> str:
+    return os.path.abspath(os.path.join("backups", "pre_restore"))
+
+
+def _safe_pre_restore_backup_path(filename: str) -> str:
+    name = (filename or "").strip()
+    if (
+        not name
+        or "/" in name
+        or "\\" in name
+        or ".." in name
+        or not name.lower().endswith(".zip")
+        or os.path.isabs(name)
+    ):
+        raise HTTPException(status_code=400, detail="Nombre de backup inválido")
+    backup_dir = _pre_restore_backup_dir()
+    candidate = os.path.abspath(os.path.join(backup_dir, name))
+    if os.path.commonpath([backup_dir, candidate]) != backup_dir:
+        raise HTTPException(status_code=400, detail="Nombre de backup inválido")
+    return candidate
+
+
+def _pre_restore_backup_keep() -> int:
+    with SessionLocal() as db:
+        try:
+            raw = get_setting(db, "pre_restore_backup_keep", "10")
+            return max(1, min(1000, int(float(raw or 10))))
+        except Exception:
+            return 10
+
+
+def _is_safe_pre_restore_zip_name(filename: str) -> bool:
+    name = (filename or "").strip()
+    return (
+        bool(name)
+        and "/" not in name
+        and "\\" not in name
+        and ".." not in name
+        and not os.path.isabs(name)
+        and name.lower().endswith(".zip")
+    )
+
+
+def cleanup_pre_restore_backups() -> None:
+    logger.info("Pre-restore backup cleanup started")
+    try:
+        backup_dir = _pre_restore_backup_dir()
+        keep = _pre_restore_backup_keep()
+        if not os.path.isdir(backup_dir):
+            logger.info("Pre-restore backup cleanup finished")
+            return
+        candidates = []
+        for entry in os.scandir(backup_dir):
+            if (
+                not entry.is_file(follow_symlinks=False)
+                or not _is_safe_pre_restore_zip_name(entry.name)
+            ):
+                continue
+            candidates.append((entry.name, entry.stat(follow_symlinks=False).st_mtime))
+        candidates.sort(key=lambda item: item[1], reverse=True)
+        for name, _mtime in candidates[keep:]:
+            target = _safe_pre_restore_backup_path(name)
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(target)
+                logger.info("Pre-restore backup cleanup deleted old backup name=%s", name)
+        logger.info("Pre-restore backup cleanup finished")
+    except Exception:
+        logger.exception("Pre-restore backup cleanup failed")
+
+
+def _set_restore_pending_restart(value: bool) -> None:
+    with SessionLocal() as db:
+        set_setting(db, "restore_pending_restart", "1" if value else "0")
+        if value:
+            set_setting(db, "last_restore_at", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+
+
+def _restore_pending_restart_status() -> dict:
+    with SessionLocal() as db:
+        pending = get_setting(db, "restore_pending_restart", "0") == "1"
+        last_restore_at = get_setting(db, "last_restore_at", "")
+    return {
+        "restore_pending_restart": pending,
+        "last_restore_at": last_restore_at or None,
+        "message": "Reinicio pendiente después de restauración." if pending else "",
+    }
+
+
+def _validate_backup_zip_to_staging(zip_path: str, staging_dir: str) -> dict:
+    manifest = {}
+    uploads_count = 0
+    files_count = 0
+    db_staging_path = os.path.join(staging_dir, "agv.db")
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            bad_entry = zf.testzip()
+            if bad_entry:
+                return {"ok": False, "message": "Backup inválido: ZIP corrupto."}
+            names = set()
+            db_info = None
+            for info in zf.infolist():
+                raw_name = info.filename or ""
+                normalized = raw_name.replace("\\", "/").strip("/")
+                if not normalized:
+                    continue
+                if _is_dangerous_zip_path(raw_name):
+                    return {"ok": False, "message": "Backup inválido: contiene rutas peligrosas."}
+                special_reason = _zip_entry_is_symlink_or_special(info)
+                if special_reason:
+                    return {"ok": False, "message": "Backup inválido: contiene symlinks o archivos especiales."}
+                blocked_reason = _is_blocked_backup_entry(normalized)
+                if blocked_reason:
+                    return {"ok": False, "message": f"Backup inválido: contiene archivo no permitido: {normalized}."}
+                names.add(normalized)
+                if info.is_dir():
+                    continue
+                files_count += 1
+                if normalized.startswith("static/uploads/"):
+                    uploads_count += 1
+                if normalized == "agv.db":
+                    db_info = info
+
+            if "agv.db" not in names or db_info is None:
+                return {"ok": False, "message": "Backup inválido: falta agv.db."}
+            if "backup_manifest.json" not in names:
+                return {"ok": False, "message": "Backup inválido: falta backup_manifest.json."}
+            try:
+                manifest = json.loads(zf.read("backup_manifest.json").decode("utf-8"))
+            except Exception:
+                return {"ok": False, "message": "Backup inválido: manifest inválido."}
+
+            for info in zf.infolist():
+                normalized = (info.filename or "").replace("\\", "/").strip("/")
+                if not normalized or info.is_dir() or normalized == "backup_manifest.json":
+                    continue
+                if normalized == "agv.db":
+                    target = db_staging_path
+                elif normalized.startswith("static/uploads/"):
+                    target = os.path.abspath(os.path.join(staging_dir, normalized))
+                else:
+                    continue
+                if os.path.commonpath([staging_dir, os.path.abspath(target)]) != staging_dir:
+                    return {"ok": False, "message": "Backup inválido: ruta fuera de staging."}
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with zf.open(info) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+    except zipfile.BadZipFile:
+        return {"ok": False, "message": "Backup inválido: no es un ZIP válido."}
+
+    try:
+        con = sqlite3.connect(db_staging_path)
+        try:
+            integrity = con.execute("PRAGMA integrity_check").fetchone()
+        finally:
+            con.close()
+    except Exception:
+        return {"ok": False, "message": "Backup inválido: agv.db no es SQLite válido."}
+    if not integrity or str(integrity[0]).lower() != "ok":
+        return {"ok": False, "message": "Backup inválido: integrity_check falló."}
+    return {
+        "ok": True,
+        "message": "Backup válido.",
+        "db_ok": True,
+        "uploads_count": uploads_count,
+        "files_count": files_count,
+        "manifest": manifest,
+        "db_path": db_staging_path,
+        "uploads_path": os.path.join(staging_dir, "static", "uploads"),
+    }
+
+
+@app.post("/api/admin/backup/validate")
+async def admin_validate_backup(file: UploadFile = File(...), x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    tmp_path = None
+    temp_dir = None
+    try:
+        require_admin(x_admin_token)
+        logger.info("Backup validation requested")
+        filename = (file.filename or "").strip()
+        if not filename.lower().endswith(".zip"):
+            return _backup_validation_failure("el archivo debe ser .zip.")
+
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+        tmp_path = tmp.name
+        try:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+        finally:
+            tmp.close()
+
+        manifest = {}
+        uploads_count = 0
+        files_count = 0
+        db_info = None
+
+        try:
+            with zipfile.ZipFile(tmp_path) as zf:
+                bad_entry = zf.testzip()
+                if bad_entry:
+                    return _backup_validation_failure("ZIP corrupto.")
+
+                names = set()
+                for info in zf.infolist():
+                    raw_name = info.filename or ""
+                    normalized = raw_name.replace("\\", "/").strip("/")
+                    if not normalized:
+                        continue
+                    if _is_dangerous_zip_path(raw_name):
+                        return _backup_validation_failure("contiene rutas peligrosas.")
+                    special_reason = _zip_entry_is_symlink_or_special(info)
+                    if special_reason:
+                        return _backup_validation_failure("contiene symlinks o archivos especiales.")
+                    blocked_reason = _is_blocked_backup_entry(normalized)
+                    if blocked_reason:
+                        return _backup_validation_failure(f"contiene archivo no permitido: {normalized}.")
+                    names.add(normalized)
+                    if not info.is_dir():
+                        files_count += 1
+                        if normalized.startswith("static/uploads/"):
+                            uploads_count += 1
+                        if normalized == "agv.db":
+                            db_info = info
+
+                if "agv.db" not in names or db_info is None:
+                    return _backup_validation_failure("falta agv.db.")
+                if "backup_manifest.json" not in names:
+                    return _backup_validation_failure("falta backup_manifest.json.")
+
+                try:
+                    manifest = json.loads(zf.read("backup_manifest.json").decode("utf-8"))
+                except Exception:
+                    return _backup_validation_failure("manifest inválido.")
+
+                temp_dir = tempfile.mkdtemp(prefix="agv_backup_validate_")
+                db_tmp_path = os.path.join(temp_dir, "agv.db")
+                with zf.open(db_info) as src, open(db_tmp_path, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+
+            try:
+                con = sqlite3.connect(db_tmp_path)
+                try:
+                    integrity = con.execute("PRAGMA integrity_check").fetchone()
+                finally:
+                    con.close()
+            except Exception:
+                return _backup_validation_failure("agv.db no es SQLite válido.")
+
+            if not integrity or str(integrity[0]).lower() != "ok":
+                return _backup_validation_failure("integrity_check falló.")
+
+        except zipfile.BadZipFile:
+            return _backup_validation_failure("no es un ZIP válido.")
+
+        logger.info("Backup validation passed")
+        return {
+            "ok": True,
+            "message": "Backup válido.",
+            "db_ok": True,
+            "uploads_count": uploads_count,
+            "files_count": files_count,
+            "manifest": manifest,
+        }
+    except HTTPException:
+        logger.warning("Backup validation failed")
+        raise
+    except Exception:
+        logger.exception("Backup validation failed")
+        return {"ok": False, "message": "Backup inválido: no se pudo validar."}
+    finally:
+        if tmp_path:
+            with contextlib.suppress(OSError):
+                os.remove(tmp_path)
+        if temp_dir:
+            with contextlib.suppress(OSError):
+                shutil.rmtree(temp_dir)
+
+
+@app.post("/api/admin/backup/restore")
+async def admin_restore_backup(file: UploadFile = File(...), x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    tmp_path = None
+    staging_dir = None
+    uploads_old_path = None
+    uploads_new_path = None
+    db_restore_tmp_path = None
+    try:
+        require_admin(x_admin_token)
+        logger.info("Backup restore requested")
+        filename = (file.filename or "").strip()
+        if not filename.lower().endswith(".zip"):
+            logger.warning("Backup restore failed")
+            return {"ok": False, "message": "Backup inválido: el archivo debe ser .zip."}
+
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+        tmp_path = tmp.name
+        try:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+        finally:
+            tmp.close()
+
+        staging_dir = tempfile.mkdtemp(prefix="agv_backup_restore_")
+        validation = _validate_backup_zip_to_staging(tmp_path, staging_dir)
+        if not validation.get("ok"):
+            logger.warning("Backup restore failed")
+            return {"ok": False, "message": validation.get("message") or "Backup inválido."}
+
+        pre_restore_path = _create_pre_restore_backup()
+
+        db_abs_path = _active_database_abs_path()
+        uploads_abs_path = os.path.abspath(UPLOAD_DIR)
+        static_abs_path = os.path.abspath("static")
+        if os.path.commonpath([static_abs_path, uploads_abs_path]) != static_abs_path:
+            raise RuntimeError("uploads fuera de static")
+
+        db_dir = os.path.dirname(db_abs_path)
+        db_restore_tmp_path = os.path.join(db_dir, f".agv_restore_{datetime.now().strftime('%Y%m%d%H%M%S%f')}.db")
+        shutil.copy2(validation["db_path"], db_restore_tmp_path)
+
+        uploads_parent = os.path.dirname(uploads_abs_path)
+        uploads_new_path = os.path.join(uploads_parent, f".uploads_restore_{datetime.now().strftime('%Y%m%d%H%M%S%f')}")
+        staged_uploads_path = validation.get("uploads_path")
+        if staged_uploads_path and os.path.isdir(staged_uploads_path):
+            shutil.copytree(staged_uploads_path, uploads_new_path, symlinks=False)
+        else:
+            os.makedirs(uploads_new_path, exist_ok=True)
+
+        with contextlib.suppress(Exception):
+            with engine.begin() as conn:
+                conn.exec_driver_sql("PRAGMA wal_checkpoint(FULL);")
+        engine.dispose()
+
+        for suffix in ("-wal", "-shm"):
+            with contextlib.suppress(OSError):
+                os.remove(db_abs_path + suffix)
+        os.replace(db_restore_tmp_path, db_abs_path)
+        for suffix in ("-wal", "-shm"):
+            with contextlib.suppress(OSError):
+                os.remove(db_abs_path + suffix)
+
+        if os.path.exists(uploads_abs_path):
+            uploads_old_path = os.path.join(uploads_parent, f".uploads_before_restore_{datetime.now().strftime('%Y%m%d%H%M%S%f')}")
+            os.replace(uploads_abs_path, uploads_old_path)
+        os.replace(uploads_new_path, uploads_abs_path)
+        if uploads_old_path:
+            with contextlib.suppress(OSError):
+                shutil.rmtree(uploads_old_path)
+
+        _set_restore_pending_restart(True)
+        logger.info("Restore pending restart set")
+        logger.info("Backup restore restart requested")
+        restart_result = _schedule_software_restart()
+        restart_mode = restart_result.detected_mode or restart_result.mode
+        restart_scheduled = restart_result.ok and restart_mode in {"windows_script", "systemd"}
+        if restart_scheduled:
+            logger.info("Backup restore restart scheduled")
+        elif not restart_result.ok:
+            logger.warning("Backup restore restart failed")
+        if restart_mode == "disabled":
+            restore_message = f"Backup restaurado correctamente.\n{restart_result.message}"
+        elif restart_mode == "systemd" and restart_scheduled:
+            restore_message = "Backup restaurado correctamente.\nSe solicitó reinicio por systemd."
+        elif restart_scheduled:
+            restore_message = "Backup restaurado correctamente. La aplicación se reiniciará automáticamente."
+        else:
+            restore_message = "Backup restaurado correctamente.\nReinicio pendiente: reinicia la aplicación manualmente para aplicar completamente los cambios."
+        logger.info("Backup restore applied")
+        return {
+            "ok": True,
+            "message": restore_message,
+            "pre_restore_backup": os.path.basename(pre_restore_path),
+            "restore_pending_restart": True,
+            "restart_scheduled": restart_scheduled,
+            "restart": restart_result.model_dump(),
+        }
+    except HTTPException:
+        logger.warning("Backup restore failed")
+        raise
+    except Exception:
+        logger.exception("Backup restore failed")
+        return {"ok": False, "message": "No se pudo restaurar el backup."}
+    finally:
+        if db_restore_tmp_path:
+            with contextlib.suppress(OSError):
+                os.remove(db_restore_tmp_path)
+        if uploads_new_path:
+            with contextlib.suppress(OSError):
+                shutil.rmtree(uploads_new_path)
+        if tmp_path:
+            with contextlib.suppress(OSError):
+                os.remove(tmp_path)
+        if staging_dir:
+            with contextlib.suppress(OSError):
+                shutil.rmtree(staging_dir)
+
+
+@app.get("/api/admin/backup/status")
+def admin_backup_status(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    logger.info("Restore pending restart status requested")
+    return _restore_pending_restart_status()
+
+
+@app.post("/api/admin/backup/mark-restarted")
+def admin_backup_mark_restarted(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    _set_restore_pending_restart(False)
+    logger.info("Restore marked as restarted manually")
+    return _restore_pending_restart_status()
+
+
+@app.get("/api/admin/backup/pre-restore/list")
+def admin_list_pre_restore_backups(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    logger.info("Pre-restore backup list requested")
+    backup_dir = _pre_restore_backup_dir()
+    backups = []
+    if os.path.isdir(backup_dir):
+        for entry in os.scandir(backup_dir):
+            if not entry.is_file(follow_symlinks=False) or not entry.name.lower().endswith(".zip"):
+                continue
+            stat_result = entry.stat(follow_symlinks=False)
+            backups.append({
+                "name": entry.name,
+                "size": stat_result.st_size,
+                "modified_at": datetime.fromtimestamp(stat_result.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+            })
+    backups.sort(key=lambda item: item["modified_at"], reverse=True)
+    return {"ok": True, "backups": backups}
+
+
+@app.get("/api/admin/backup/pre-restore/download/{filename}")
+def admin_download_pre_restore_backup(filename: str, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    try:
+        require_admin(x_admin_token)
+        logger.info("Pre-restore backup download requested")
+        backup_path = _safe_pre_restore_backup_path(filename)
+        if not os.path.isfile(backup_path):
+            raise HTTPException(status_code=404, detail="Backup no encontrado")
+        return FileResponse(
+            backup_path,
+            media_type="application/zip",
+            filename=os.path.basename(backup_path),
+        )
+    except HTTPException:
+        logger.warning("Pre-restore backup download failed")
+        raise
+    except Exception:
+        logger.exception("Pre-restore backup download failed")
+        raise HTTPException(status_code=500, detail="No se pudo descargar el backup previo")
 
 
 @app.get("/api/catalog", response_model=CatalogOut)
@@ -3576,6 +4311,7 @@ def create_fifo_movement(body: FifoRequestIn):
             body.agv_code,
             body.task_typ,
         )
+        logger.info("Task created | task_id=%s | order_code=%s | source=fifo | rack_id=%s | agv=%s | status=%s", order.id, order.order_code, order.rack_id, order.agv_code or "-", order.status)
         rack = db.execute(select(Rack).where(Rack.id == order.rack_id)).scalar_one_or_none()
         if rack:
             _audit_rack_reservation_change(db, rack=rack, previous_status="available", new_status=rack.status, source="local_ui", related_order_id=order.id, reason="create_fifo_order", actor=body.created_by or "operador", auto_commit=False)
@@ -3605,6 +4341,7 @@ def create_direct_move_movement(body: DirectMoveRequestIn):
             body.agv_code,
             body.task_typ,
         )
+        logger.info("Task created | task_id=%s | order_code=%s | source=direct_move | rack_id=%s | agv=%s | status=%s", order.id, order.order_code, order.rack_id, order.agv_code or "-", order.status)
         rack = db.execute(select(Rack).where(Rack.id == order.rack_id)).scalar_one_or_none()
         if rack:
             _audit_rack_reservation_change(db, rack=rack, previous_status="available", new_status=rack.status, source="local_ui", related_order_id=order.id, reason="create_direct_move_order", actor=body.created_by or "operador", auto_commit=False)
@@ -3644,6 +4381,7 @@ def save_movement_order_json(order_id: int, body: MovementOrderJsonIn):
         if not row:
             raise HTTPException(status_code=404, detail="Orden no encontrada")
         row = _save_movement_order_payload_override(db, row, body.payload)
+        logger.info("Task JSON updated | task_id=%s | order_code=%s | status=%s | rack_id=%s", row.id, row.order_code, row.status, row.rack_id)
         return MovementOrderJsonOut(order_id=row.id, order_code=row.order_code, payload=body.payload, source="edited")
 
 
@@ -3655,6 +4393,7 @@ def reset_movement_order_json(order_id: int):
             raise HTTPException(status_code=404, detail="Orden no encontrada")
         row = _reset_movement_order_payload_override(db, row)
         payload = _movement_order_json_payload(db, row)
+        logger.info("Task JSON reset | task_id=%s | order_code=%s | status=%s | rack_id=%s", row.id, row.order_code, row.status, row.rack_id)
         return MovementOrderJsonOut(order_id=row.id, order_code=row.order_code, payload=payload, source="generated")
 
 
@@ -3813,6 +4552,7 @@ def simulate_complete_movement_order(order_id: int):
         before_rack = db.execute(select(Rack).where(Rack.id == before_rack_id)).scalar_one_or_none() if before_rack_id else None
         old_rack_status = before_rack.status if before_rack else None
         row = simulate_order_completed(db, order_id)
+        logger.info("Task completed | task_id=%s | order_code=%s | rack_id=%s | status=%s | source=simulate_complete", row.id, row.order_code, row.rack_id, row.status)
         if before_rack_id and old_rack_status and not rack_status_is_available(old_rack_status):
             rack = db.execute(select(Rack).where(Rack.id == before_rack_id)).scalar_one_or_none()
             if rack and rack_status_is_available(rack.status):
@@ -4799,6 +5539,8 @@ def update_rack(rack_id: int, body: RackIn, x_admin_token: Optional[str] = Heade
         row = db.execute(select(Rack).where(Rack.id == rack_id)).scalar_one_or_none()
         if not row:
             raise HTTPException(status_code=404, detail="Rack no encontrado")
+        previous_code = row.code
+        previous_status = row.status or ""
         dup = db.execute(select(Rack).where(Rack.code == body.code.strip(), Rack.id != rack_id)).scalar_one_or_none()
         if dup:
             raise HTTPException(status_code=400, detail="Ya existe un rack con ese código")
@@ -4827,7 +5569,7 @@ def update_rack(rack_id: int, body: RackIn, x_admin_token: Optional[str] = Heade
         db.add(row)
         db.commit()
         db.refresh(row)
-        logger.info("Rack updated rack_id=%s code=%s status=%s", row.id, row.code, row.status)
+        logger.info("Rack updated | rack_id=%s | from_code=%s | to_code=%s | from_status=%s | to_status=%s | material_group_id=%s", row.id, previous_code, row.code, previous_status, row.status, row.material_group_id)
         return _rack_out(db, row)
 
 
@@ -4842,6 +5584,7 @@ def update_rack_reservation(rack_id: int, body: RackReservationIn, x_admin_token
         should_reserve = int(body.reserved or 0) == 1
         old_status = row.status or ""
         apply_rack_reservation_status(row, should_reserve, updated_at=now)
+        cancelled_orders = 0
         if not should_reserve:
             active_orders = db.execute(
                 select(MovementOrder).where(
@@ -4854,11 +5597,12 @@ def update_rack_reservation(rack_id: int, body: RackReservationIn, x_admin_token
                 order.updated_at = now
                 order.release_source = "local_ui"
                 db.add(order)
+                cancelled_orders += 1
         db.add(row)
         _audit_rack_reservation_change(db, rack=row, previous_status=old_status, new_status=row.status, source="local_ui", reason="admin_rack_reservation_toggle", actor="admin", at=now, auto_commit=False)
         db.commit()
         db.refresh(row)
-        logger.info("Rack reservation changed rack_id=%s code=%s reserved=%s", row.id, row.code, should_reserve)
+        logger.info("Rack reservation changed | rack_id=%s | rack_code=%s | reserved=%s | from=%s | to=%s | cancelled_orders=%s", row.id, row.code, should_reserve, old_status, row.status, cancelled_orders)
         return _rack_out(db, row)
 
 
@@ -5260,6 +6004,7 @@ def _execute_cancel_for_order(db, row: MovementOrder, force_cancel: str, matter_
             row.rcs_message = cancel_response.message or row.rcs_message
             _append_status_query_log(db, row, kind='cancel_task', request_payload=cancel_payload, response_payload=cancel_response.raw, message=cancel_response.message or '', arrived_at=now)
         except Exception as exc:
+            logger.exception("Cancel task failed | task_id=%s | order_code=%s | remote_task_code=%s | source=%s | actor=%s", row.id, row.order_code, remote_task_code or "-", source, actor)
             _append_debug_console_event(db, direction="received", module="cancel_task", base_url=debug_base_url, endpoint=debug_endpoint, payload={"error": str(exc)}, message=str(exc))
             now = datetime.utcnow()
             error_payload = {'error': str(exc)}
@@ -5676,6 +6421,7 @@ def operator_execute_window_button(window_id: int, button_index: int, body: Oper
         order = _execute_window_button(db, row, button_row, body)
         if order is None:
             raise HTTPException(status_code=400, detail='No se pudo generar la orden')
+        logger.info("Task created | task_id=%s | order_code=%s | source=operator_window | window_id=%s | button_index=%s | rack_id=%s | agv=%s | status=%s", order.id, order.order_code, window_id, button_index, order.rack_id, order.agv_code or "-", order.status)
         rack = db.execute(select(Rack).where(Rack.id == order.rack_id)).scalar_one_or_none()
         if rack:
             _audit_rack_reservation_change(db, rack=rack, previous_status="available", new_status=rack.status, source="operator_window", related_order_id=order.id, reason=f"operator_window:{button_row.action_mode}", actor=f"operator_window:{row.name}", auto_commit=False)

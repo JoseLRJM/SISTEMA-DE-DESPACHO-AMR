@@ -3,6 +3,7 @@ import os
 import sys
 import threading
 import traceback
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,13 @@ from sqlalchemy import event, inspect
 BASE_DIR = Path(__file__).resolve().parent
 LOG_DIR = BASE_DIR / "logs"
 LOG_FILE = LOG_DIR / "app.log"
+ERROR_LOG_FILE = LOG_DIR / "error.log"
+RCS_LOG_FILE = LOG_DIR / "rcs.log"
+PROGRAMMING_LOG_FILE = LOG_DIR / "programming.log"
+IO_LOG_FILE = LOG_DIR / "io.log"
+LOG_FILES = (LOG_FILE, ERROR_LOG_FILE, RCS_LOG_FILE, PROGRAMMING_LOG_FILE, IO_LOG_FILE)
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUP_COUNT = 5
 
 _CONFIGURED = False
 _DB_LOGGING_CONFIGURED = False
@@ -20,8 +28,9 @@ _SENSITIVE_KEYWORDS = ("password", "token", "secret", "auth", "key")
 
 def ensure_log_file() -> Path:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    if not LOG_FILE.exists():
-        LOG_FILE.touch()
+    for log_file in LOG_FILES:
+        if not log_file.exists():
+            log_file.touch()
     return LOG_FILE
 
 
@@ -32,6 +41,44 @@ def _build_formatter() -> logging.Formatter:
     )
 
 
+class _LoggerNameFilter(logging.Filter):
+    def __init__(self, *prefixes: str):
+        super().__init__()
+        self.prefixes = prefixes
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return any(record.name == prefix or record.name.startswith(prefix + ".") for prefix in self.prefixes)
+
+
+def _has_handler(logger: logging.Logger, log_path: Path) -> bool:
+    path = str(log_path)
+    return any(
+        isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", None) == path
+        for h in logger.handlers
+    )
+
+
+def _make_rotating_handler(log_path: Path, level: int, formatter: logging.Formatter) -> RotatingFileHandler:
+    handler = RotatingFileHandler(
+        log_path,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
+    handler.setLevel(level)
+    handler.setFormatter(formatter)
+    return handler
+
+
+def _add_rotating_handler(logger: logging.Logger, log_path: Path, level: int, formatter: logging.Formatter, *filters: logging.Filter) -> None:
+    if _has_handler(logger, log_path):
+        return
+    handler = _make_rotating_handler(log_path, level, formatter)
+    for log_filter in filters:
+        handler.addFilter(log_filter)
+    logger.addHandler(handler)
+
+
 def configure_logging() -> Path:
     global _CONFIGURED
     with _LOCK:
@@ -40,20 +87,22 @@ def configure_logging() -> Path:
 
         log_path = ensure_log_file()
         formatter = _build_formatter()
-        handler = logging.FileHandler(log_path, encoding="utf-8")
-        handler.setLevel(logging.INFO)
-        handler.setFormatter(formatter)
 
         root_logger = logging.getLogger()
         root_logger.setLevel(logging.INFO)
-        if not any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", None) == str(log_path) for h in root_logger.handlers):
-            root_logger.addHandler(handler)
+        _add_rotating_handler(root_logger, log_path, logging.INFO, formatter)
+        _add_rotating_handler(root_logger, ERROR_LOG_FILE, logging.WARNING, formatter)
 
         for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access", "fastapi"):
             logger = logging.getLogger(logger_name)
             logger.setLevel(logging.INFO)
-            if not any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", None) == str(log_path) for h in logger.handlers):
-                logger.addHandler(handler)
+
+        rcs_filter = _LoggerNameFilter("app.rcs_client", "app.rcs")
+        programming_filter = _LoggerNameFilter("app.programming", "app.simulator", "app.simulation")
+        io_filter = _LoggerNameFilter("app.io")
+        _add_rotating_handler(root_logger, RCS_LOG_FILE, logging.INFO, formatter, rcs_filter)
+        _add_rotating_handler(root_logger, PROGRAMMING_LOG_FILE, logging.INFO, formatter, programming_filter)
+        _add_rotating_handler(root_logger, IO_LOG_FILE, logging.INFO, formatter, io_filter)
 
         def _log_unhandled_exception(exc_type, exc_value, exc_tb):
             if issubclass(exc_type, KeyboardInterrupt):

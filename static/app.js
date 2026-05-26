@@ -40,6 +40,14 @@ const API = {
   adminSoftwareUpdateValidate: "/api/admin/software-update/validate",
   adminSoftwareUpdateApply: "/api/admin/software-update/apply",
   adminSoftwareUpdateRestart: "/api/admin/software-update/restart",
+  adminDatabaseDownload: "/api/admin/database/download",
+  adminFullBackupDownload: "/api/admin/backup/full",
+  adminBackupValidate: "/api/admin/backup/validate",
+  adminBackupRestore: "/api/admin/backup/restore",
+  adminBackupStatus: "/api/admin/backup/status",
+  adminBackupMarkRestarted: "/api/admin/backup/mark-restarted",
+  adminPreRestoreBackups: "/api/admin/backup/pre-restore/list",
+  adminPreRestoreBackupDownload: (filename) => `/api/admin/backup/pre-restore/download/${encodeURIComponent(filename)}`,
   health: "/api/health",
   fifoValidate: "/api/fifo/validate",
   fifoExecute: "/api/fifo/execute",
@@ -147,6 +155,27 @@ const btnValidateSoftwareUpdate = $("btnValidateSoftwareUpdate");
 const btnApplySoftwareUpdate = $("btnApplySoftwareUpdate");
 const btnRestartSoftwareUpdate = $("btnRestartSoftwareUpdate");
 const softwareUpdateResult = $("softwareUpdateResult");
+const btnOpenDbBackupsModal = $("btnOpenDbBackupsModal");
+const dbBackupsModal = $("dbBackupsModal");
+const btnCloseDbBackupsModal = $("btnCloseDbBackupsModal");
+const btnDownloadDb = $("btnDownloadDb");
+const btnDownloadFullBackup = $("btnDownloadFullBackup");
+const backupZipFile = $("backupZipFile");
+const btnChooseBackupFile = $("btnChooseBackupFile");
+const btnValidateBackup = $("btnValidateBackup");
+const btnRestoreBackup = $("btnRestoreBackup");
+const backupRestartPendingBadge = $("backupRestartPendingBadge");
+const btnMarkBackupRestarted = $("btnMarkBackupRestarted");
+const backupSelectedFileName = $("backupSelectedFileName");
+const dbBackupsMsg = $("dbBackupsMsg");
+const preRestoreBackupsList = $("preRestoreBackupsList");
+const backupRestoreConfirmModal = $("backupRestoreConfirmModal");
+const btnCancelBackupRestore = $("btnCancelBackupRestore");
+const btnConfirmBackupRestore = $("btnConfirmBackupRestore");
+const backupRestoreConfirmMsg = $("backupRestoreConfirmMsg");
+let selectedBackupFile = null;
+let lastBackupValidationOk = false;
+let restorePendingRestart = false;
 let lastSoftwareUpdateValidation = null;
 
 const dispRows = $("dispRows");
@@ -2431,6 +2460,270 @@ function closeCleanupDiagnosisModal() {
   modal.style.display = "";
 }
 
+function openDbBackupsModal() {
+  if (!dbBackupsModal) return;
+  updateBackupControls();
+  if (dbBackupsMsg) dbBackupsMsg.textContent = "";
+  dbBackupsModal.classList.remove("hidden");
+  dbBackupsModal.style.display = "flex";
+  loadBackupStatus().catch(err => {
+    console.warn("[backup-status] failed", err);
+  });
+  loadPreRestoreBackups().catch(err => {
+    console.warn("[pre-restore-backups] failed", err);
+  });
+}
+
+function closeDbBackupsModal() {
+  if (!dbBackupsModal) return;
+  dbBackupsModal.classList.add("hidden");
+  dbBackupsModal.style.display = "";
+}
+
+function filenameFromContentDisposition(value) {
+  const match = String(value || "").match(/filename\*?=(?:UTF-8''|")?([^";]+)/i);
+  return match ? decodeURIComponent(match[1].replace(/"/g, "")) : "";
+}
+
+function updateBackupControls() {
+  const enabled = !!adminToken;
+  if (btnDownloadDb) btnDownloadDb.disabled = !enabled;
+  if (btnDownloadFullBackup) btnDownloadFullBackup.disabled = !enabled;
+  if (btnChooseBackupFile) btnChooseBackupFile.disabled = !enabled || restorePendingRestart;
+  if (btnValidateBackup) btnValidateBackup.disabled = !enabled || restorePendingRestart || !selectedBackupFile;
+  if (btnRestoreBackup) btnRestoreBackup.disabled = !enabled || restorePendingRestart || !selectedBackupFile || !lastBackupValidationOk;
+  if (backupRestartPendingBadge) {
+    backupRestartPendingBadge.classList.toggle("hidden", !restorePendingRestart);
+  }
+  if (btnMarkBackupRestarted) {
+    btnMarkBackupRestarted.classList.toggle("hidden", !restorePendingRestart);
+    btnMarkBackupRestarted.style.display = restorePendingRestart ? "inline-block" : "none";
+    btnMarkBackupRestarted.disabled = !enabled || !restorePendingRestart;
+  }
+}
+
+function applyBackupStatus(data = {}) {
+  restorePendingRestart = data?.restore_pending_restart === true;
+  if (restorePendingRestart) {
+    lastBackupValidationOk = false;
+    if (dbBackupsMsg && data.message) dbBackupsMsg.textContent = data.message;
+  }
+  updateBackupControls();
+}
+
+async function loadBackupStatus() {
+  if (!adminToken) {
+    restorePendingRestart = false;
+    updateBackupControls();
+    return;
+  }
+  const data = await fetchJson(API.adminBackupStatus, { headers: fetchHeaders() });
+  applyBackupStatus(data);
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (value >= 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+  if (value >= 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${value} B`;
+}
+
+function renderPreRestoreBackups(backups = []) {
+  if (!preRestoreBackupsList) return;
+  const rows = (backups || []).slice(0, 10);
+  if (!rows.length) {
+    preRestoreBackupsList.textContent = "No hay backups previos.";
+    return;
+  }
+  preRestoreBackupsList.innerHTML = rows.map((item) => `
+    <div class="backup-history-row">
+      <span class="backup-name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</span>
+      <span>${escapeHtml(formatBytes(item.size))}</span>
+      <span>${escapeHtml(item.modified_at || "")}</span>
+      <button class="btn" type="button" data-pre-restore-download="${escapeHtml(item.name)}">Descargar</button>
+    </div>
+  `).join("");
+  preRestoreBackupsList.querySelectorAll("[data-pre-restore-download]").forEach((btn) => {
+    btn.addEventListener("click", () => downloadPreRestoreBackup(btn.dataset.preRestoreDownload, btn));
+  });
+}
+
+async function loadPreRestoreBackups() {
+  if (!adminToken) {
+    renderPreRestoreBackups([]);
+    return;
+  }
+  const data = await fetchJson(API.adminPreRestoreBackups, { headers: fetchHeaders() });
+  renderPreRestoreBackups(data?.backups || []);
+}
+
+function chooseBackupFile() {
+  if (!adminToken || restorePendingRestart || !backupZipFile) return;
+  backupZipFile.click();
+}
+
+function handleBackupFileSelected() {
+  selectedBackupFile = backupZipFile?.files?.[0] || null;
+  lastBackupValidationOk = false;
+  if (backupSelectedFileName) {
+    backupSelectedFileName.textContent = selectedBackupFile ? selectedBackupFile.name : "Sin archivo seleccionado.";
+  }
+  if (dbBackupsMsg) dbBackupsMsg.textContent = "";
+  updateBackupControls();
+}
+
+async function downloadDatabaseBackup() {
+  if (!adminToken) {
+    if (dbBackupsMsg) dbBackupsMsg.textContent = "No se pudo descargar la base de datos.";
+    return;
+  }
+  await downloadAdminFile(API.adminDatabaseDownload, btnDownloadDb, "agv_backup.db", "No se pudo descargar la base de datos.");
+}
+
+async function downloadFullBackup() {
+  if (!adminToken) {
+    if (dbBackupsMsg) dbBackupsMsg.textContent = "No se pudo descargar el backup completo.";
+    return;
+  }
+  await downloadAdminFile(API.adminFullBackupDownload, btnDownloadFullBackup, "agv_full_backup.zip", "No se pudo descargar el backup completo.");
+}
+
+async function downloadPreRestoreBackup(filename, button) {
+  if (!adminToken || !filename) return;
+  await downloadAdminFile(
+    API.adminPreRestoreBackupDownload(filename),
+    button,
+    filename,
+    "No se pudo descargar el backup previo."
+  );
+}
+
+async function validateSelectedBackup() {
+  if (!adminToken || restorePendingRestart || !selectedBackupFile) return;
+  if (dbBackupsMsg) dbBackupsMsg.textContent = "Validando backup...";
+  if (btnValidateBackup) btnValidateBackup.disabled = true;
+  try {
+    const formData = new FormData();
+    formData.append("file", selectedBackupFile);
+    const response = await fetch(API.adminBackupValidate, {
+      method: "POST",
+      headers: fetchHeaders(),
+      body: formData,
+    });
+    const data = await response.json();
+    const details = data?.ok
+      ? `DB: ${data.db_ok ? "ok" : "error"} | uploads: ${data.uploads_count ?? 0} | archivos: ${data.files_count ?? 0}`
+      : "";
+    lastBackupValidationOk = data?.ok === true;
+    if (dbBackupsMsg) dbBackupsMsg.textContent = [data?.message || "No se pudo validar el backup.", details].filter(Boolean).join(" ");
+  } catch (err) {
+    lastBackupValidationOk = false;
+    console.warn("[backup-validate] failed", err);
+    if (dbBackupsMsg) dbBackupsMsg.textContent = "No se pudo validar el backup.";
+  } finally {
+    updateBackupControls();
+  }
+}
+
+function openBackupRestoreConfirmModal() {
+  if (restorePendingRestart) return;
+  if (!backupRestoreConfirmModal || !lastBackupValidationOk || !selectedBackupFile) return;
+  if (backupRestoreConfirmMsg) backupRestoreConfirmMsg.textContent = "";
+  backupRestoreConfirmModal.classList.remove("hidden");
+  backupRestoreConfirmModal.style.display = "flex";
+}
+
+function closeBackupRestoreConfirmModal() {
+  if (!backupRestoreConfirmModal) return;
+  backupRestoreConfirmModal.classList.add("hidden");
+  backupRestoreConfirmModal.style.display = "";
+}
+
+async function restoreSelectedBackup() {
+  if (!adminToken || restorePendingRestart || !selectedBackupFile || !lastBackupValidationOk) return;
+  if (backupRestoreConfirmMsg) backupRestoreConfirmMsg.textContent = "Restaurando backup...";
+  if (btnConfirmBackupRestore) btnConfirmBackupRestore.disabled = true;
+  if (btnRestoreBackup) btnRestoreBackup.disabled = true;
+  try {
+    const formData = new FormData();
+    formData.append("file", selectedBackupFile);
+    const response = await fetch(API.adminBackupRestore, {
+      method: "POST",
+      headers: fetchHeaders(),
+      body: formData,
+    });
+    const data = await response.json();
+    if (!response.ok || data?.ok !== true) {
+      throw new Error(data?.message || `HTTP ${response.status}`);
+    }
+    closeBackupRestoreConfirmModal();
+    if (dbBackupsMsg) {
+      dbBackupsMsg.textContent = data?.restart_scheduled
+        ? "Backup restaurado correctamente.\nLa aplicación se reiniciará automáticamente.\nEspera unos segundos y vuelve a abrir la página si no recarga sola."
+        : (data.message || data?.restart?.message || "Backup restaurado correctamente.\nReinicia la aplicación manualmente para aplicar completamente los cambios.");
+    }
+    restorePendingRestart = data?.restore_pending_restart === true;
+    lastBackupValidationOk = false;
+    await loadPreRestoreBackups();
+    if (data?.restart_scheduled) {
+      await waitForSoftwareReconnect(dbBackupsMsg);
+    }
+  } catch (err) {
+    console.warn("[backup-restore] failed", err);
+    if (backupRestoreConfirmMsg) backupRestoreConfirmMsg.textContent = "No se pudo restaurar el backup.";
+  } finally {
+    if (btnConfirmBackupRestore) btnConfirmBackupRestore.disabled = false;
+    updateBackupControls();
+  }
+}
+
+async function markBackupRestarted() {
+  if (!adminToken || !restorePendingRestart) return;
+  if (dbBackupsMsg) dbBackupsMsg.textContent = "Marcando como reiniciado...";
+  if (btnMarkBackupRestarted) btnMarkBackupRestarted.disabled = true;
+  try {
+    const data = await fetchJson(API.adminBackupMarkRestarted, {
+      method: "POST",
+      headers: fetchHeaders(),
+    });
+    applyBackupStatus(data);
+    if (dbBackupsMsg) dbBackupsMsg.textContent = "Estado de reinicio limpiado.";
+  } catch (err) {
+    console.warn("[backup-mark-restarted] failed", err);
+    if (dbBackupsMsg) dbBackupsMsg.textContent = "No se pudo marcar como reiniciado.";
+  } finally {
+    updateBackupControls();
+  }
+}
+
+async function downloadAdminFile(downloadUrl, button, fallbackName, failureMessage) {
+  if (dbBackupsMsg) dbBackupsMsg.textContent = "";
+  if (button) button.disabled = true;
+  try {
+    const response = await fetch(downloadUrl, {
+      method: "GET",
+      headers: fetchHeaders(),
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const blob = await response.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = filenameFromContentDisposition(response.headers.get("Content-Disposition")) || fallbackName;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+  } catch (err) {
+    console.warn("[admin-file-download] failed", err);
+    if (dbBackupsMsg) dbBackupsMsg.textContent = failureMessage;
+  } finally {
+    if (button) button.disabled = !adminToken;
+  }
+}
+
 function setAdminUI(enabled) {
   if (adminState) adminState.textContent = enabled ? "Activo" : "Bloqueado";
   if (adminActions) adminActions.style.display = enabled ? "block" : "none";
@@ -2455,6 +2748,9 @@ function setAdminUI(enabled) {
     "operatorButtonIndex", "operatorButtonActive", "operatorButtonLabel", "operatorButtonColor", "operatorButtonMode", "operatorButtonPriority", "operatorButtonSourceArea", "operatorButtonDestinationArea", "operatorButtonPointDestinationArea", "operatorButtonMaterial", "operatorButtonSourceCell", "operatorButtonDestinationCell", "btnOperatorButtonPickSource", "btnOperatorButtonPickDestination", "operatorButtonAgv", "operatorButtonTaskTyp", "operatorButtonComment", "btnSaveOperatorButton", "btnAddOperatorPointField"
   ]);
 
+  const disabledPlaceholderIds = new Set([
+  ]);
+
   document.querySelectorAll("input, textarea, select, button").forEach((el) => {
     if (
       el.closest?.(".action-tabs-header") ||
@@ -2463,6 +2759,10 @@ function setAdminUI(enabled) {
       return;
     }
     if (!el.id) return;
+    if (disabledPlaceholderIds.has(el.id)) {
+      el.disabled = true;
+      return;
+    }
     if (alwaysEnabledIds.has(el.id)) {
       el.disabled = false;
       return;
@@ -2477,6 +2777,7 @@ function setAdminUI(enabled) {
   forceShowActionTabsHeader();
   refreshActionTabsAfterVisibilityChange();
   repairActionTabsLayout();
+  updateBackupControls();
 }
 function applyAgvOverlayConfigFromGrid(cfg = {}) {
   agvOverlayConfig.scale_x = Number(cfg.agv_overlay_scale_x ?? 1) || 1;
@@ -4372,11 +4673,23 @@ btnAdminLogin?.addEventListener("click", async () => {
     await loadCatalog();
     await loadCleanupHealth();
     await loadAdminOperatorWindows();
+    await loadBackupStatus();
     fillCellForm(locations[idx(selected.x, selected.y)]);
     repairActionTabsLayout();
   } catch (err) { adminMsg.textContent = `Error: ${String(err)}`; }
 });
-btnAdminLock?.addEventListener("click", () => { adminToken = null; setAdminUI(false); clearAdminOperatorWindowForm(); if (cleanupHealthBadge) cleanupHealthBadge.classList.add("hidden"); adminMsg.textContent = "Admin bloqueado."; });
+btnAdminLock?.addEventListener("click", () => { adminToken = null; restorePendingRestart = false; setAdminUI(false); clearAdminOperatorWindowForm(); if (cleanupHealthBadge) cleanupHealthBadge.classList.add("hidden"); adminMsg.textContent = "Admin bloqueado."; });
+btnOpenDbBackupsModal?.addEventListener("click", () => openDbBackupsModal());
+btnCloseDbBackupsModal?.addEventListener("click", () => closeDbBackupsModal());
+btnDownloadDb?.addEventListener("click", () => downloadDatabaseBackup());
+btnDownloadFullBackup?.addEventListener("click", () => downloadFullBackup());
+btnChooseBackupFile?.addEventListener("click", () => chooseBackupFile());
+backupZipFile?.addEventListener("change", () => handleBackupFileSelected());
+btnValidateBackup?.addEventListener("click", () => validateSelectedBackup());
+btnRestoreBackup?.addEventListener("click", () => openBackupRestoreConfirmModal());
+btnCancelBackupRestore?.addEventListener("click", () => closeBackupRestoreConfirmModal());
+btnConfirmBackupRestore?.addEventListener("click", () => restoreSelectedBackup());
+btnMarkBackupRestarted?.addEventListener("click", () => markBackupRestarted());
 console.log("[cleanup] registrando botón diagnóstico");
 if (!document.getElementById("cleanupDiagnosisModal")) {
   console.warn("[cleanup-diagnosis] No se encontró el modal #cleanupDiagnosisModal.");
@@ -4405,10 +4718,24 @@ btnConfirmCleanupClose?.addEventListener("click", () => executeSelectedCleanup()
 cleanupDiagnosisModal?.addEventListener("click", (ev) => {
   if (ev.target === cleanupDiagnosisModal) closeCleanupDiagnosisModal();
 });
+dbBackupsModal?.addEventListener("click", (ev) => {
+  if (ev.target === dbBackupsModal) closeDbBackupsModal();
+});
+backupRestoreConfirmModal?.addEventListener("click", (ev) => {
+  if (ev.target === backupRestoreConfirmModal) closeBackupRestoreConfirmModal();
+});
 cleanupConfirmModal?.addEventListener("click", (ev) => {
   if (ev.target === cleanupConfirmModal) closeCleanupConfirmModal();
 });
 document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape" && backupRestoreConfirmModal && !backupRestoreConfirmModal.classList.contains("hidden")) {
+    closeBackupRestoreConfirmModal();
+    return;
+  }
+  if (ev.key === "Escape" && dbBackupsModal && !dbBackupsModal.classList.contains("hidden")) {
+    closeDbBackupsModal();
+    return;
+  }
   if (ev.key === "Escape" && cleanupConfirmModal && !cleanupConfirmModal.classList.contains("hidden")) {
     closeCleanupConfirmModal();
     return;
@@ -4821,8 +5148,7 @@ function wait(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function waitForSoftwareReconnect() {
-  const resultBox = document.getElementById("softwareUpdateResult");
+async function waitForSoftwareReconnect(resultBox = document.getElementById("softwareUpdateResult")) {
   let attempts = 0;
   await wait(2000);
   while (attempts < 120) {
