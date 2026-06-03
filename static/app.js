@@ -63,6 +63,7 @@ const API = {
   movementOrderMonitorRun: '/api/movement-orders/monitor/run',
   movementOrderStatusQueryTemplate: (id) => `/api/movement-orders/${id}/status-query-template`,
   movementOrderStatusQuery: (id) => `/api/movement-orders/${id}/status-query`,
+  podPositionQuery: "/api/rcs/pod-position",
   rcsDebugLog: '/api/rcs/debug-log',
   rcsDebugSend: '/api/rcs/debug-send',
   robotStatusMonitor: '/api/robot-status-monitor',
@@ -230,6 +231,7 @@ const rcsCancelEndpoint = $("rcsCancelEndpoint");
 const rcsStopEndpoint = $("rcsStopEndpoint");
 const rcsResumeEndpoint = $("rcsResumeEndpoint");
 const rcsAgvStatusEndpoint = $("rcsAgvStatusEndpoint");
+const rcsPodPositionEndpoint = $("rcsPodPositionEndpoint");
 const rcsTaskMonitorInterval = $("rcsTaskMonitorInterval");
 const rcsAgvMonitorInterval = $("rcsAgvMonitorInterval");
 const cleanupMinAgeMinutes = $("cleanupMinAgeMinutes");
@@ -246,6 +248,10 @@ const btnSaveRcsConfig = $("btnSaveRcsConfig");
 const btnTestRcsConfig = $("btnTestRcsConfig");
 const rcsResolvedInfo = $("rcsResolvedInfo");
 const rcsConfigMsg = $("rcsConfigMsg");
+const podPositionRack = $("podPositionRack");
+const btnQueryPodPosition = $("btnQueryPodPosition");
+const podPositionResult = $("podPositionResult");
+const podPositionMsg = $("podPositionMsg");
 const oldPwd = $("oldPwd");
 const newPwd = $("newPwd");
 const btnChangePwd = $("btnChangePwd");
@@ -273,6 +279,7 @@ const areaType = $("areaType");
 const areaColor = $("areaColor");
 const areaPriority = $("areaPriority");
 const areaActive = $("areaActive");
+const areaMatterArea = $("areaMatterArea");
 const areaDescription = $("areaDescription");
 const btnSaveArea = $("btnSaveArea");
 const btnNewArea = $("btnNewArea");
@@ -435,6 +442,12 @@ const operatorActionModal = $("operatorActionModal");
 const operatorActionModalTitle = $("operatorActionModalTitle");
 const operatorActionPreview = $("operatorActionPreview");
 const operatorActionModalMsg = $("operatorActionModalMsg");
+const operatorCancelModeRow = $("operatorCancelModeRow");
+const operatorCancelMode = $("operatorCancelMode");
+const operatorCancelModeHint = $("operatorCancelModeHint");
+const operatorCancelReturnAreaRow = $("operatorCancelReturnAreaRow");
+const operatorCancelReturnArea = $("operatorCancelReturnArea");
+const operatorCancelReturnAreaHint = $("operatorCancelReturnAreaHint");
 const btnOperatorActionCancel = $("btnOperatorActionCancel");
 const btnOperatorActionConfirm = $("btnOperatorActionConfirm");
 const operatorActionDynamicFields = $("operatorActionDynamicFields");
@@ -462,6 +475,7 @@ const CARD_ORDER = [
   "card-fifo",
   "card-client-bg",
   "card-debug-rcs",
+  "card-pod-position",
   "card-config-rcs",
   "card-admin-password",
   "card-admin-login",
@@ -1092,6 +1106,7 @@ const ACTION_CARD_ORDER = [
   "card-fifo",
   "card-client-bg",
   "card-debug-rcs",
+  "card-pod-position",
   "card-config-rcs",
   "card-admin-password",
   "card-admin-login",
@@ -1112,7 +1127,7 @@ const ACTION_CARD_TABS = [
   {
     key: "advanced",
     label: "Configuraci\u00f3n avanzada",
-    cards: ["card-general", "card-direct-move", "card-fifo", "card-client-bg", "card-debug-rcs", "card-config-rcs", "card-admin-password", "card-admin-login"],
+    cards: ["card-general", "card-direct-move", "card-fifo", "card-client-bg", "card-debug-rcs", "card-pod-position", "card-config-rcs", "card-admin-password", "card-admin-login"],
   },
 ];
 let activeActionTabId = safeStorageGet(ACTION_TAB_STORAGE_KEY) || "operation";
@@ -2740,11 +2755,12 @@ function setAdminUI(enabled) {
     "btnDirectPickSource", "btnDirectPickDestination", "btnDirectClearSelection", "directPriority", "directAgvCode", "directTaskTyp", "directComment", "btnExecuteDirectMove",
     "operatorWindowSelect", "operatorWindowPassword",
     "btnOperatorActionCancel", "btnOperatorActionConfirm", "btnOperatorActionPreview", "btnOperatorActionPanelClear", "btnOperatorActionPickSource", "btnOperatorActionPickDestination",
-    "operatorActionAreaSelect", "operatorActionMaterial", "operatorActionAgv", "operatorActionTaskTyp"
+    "operatorActionAreaSelect", "operatorActionMaterial", "operatorActionAgv", "operatorActionTaskTyp", "operatorCancelMode", "operatorCancelReturnArea"
   ]);
 
   const adminOnlyIds = new Set([
     "operatorWindowId", "operatorWindowName", "operatorWindowActive", "operatorWindowBgColor", "operatorWindowButtonCount", "operatorWindowPasswordAdmin", "btnSaveOperatorWindow", "btnNewOperatorWindow", "adminWindowSelect",
+    "podPositionRack", "btnQueryPodPosition", "rcsPodPositionEndpoint",
     "operatorButtonIndex", "operatorButtonActive", "operatorButtonLabel", "operatorButtonColor", "operatorButtonMode", "operatorButtonPriority", "operatorButtonSourceArea", "operatorButtonDestinationArea", "operatorButtonPointDestinationArea", "operatorButtonMaterial", "operatorButtonSourceCell", "operatorButtonDestinationCell", "btnOperatorButtonPickSource", "btnOperatorButtonPickDestination", "operatorButtonAgv", "operatorButtonTaskTyp", "operatorButtonComment", "btnSaveOperatorButton", "btnAddOperatorPointField"
   ]);
 
@@ -2834,6 +2850,7 @@ async function loadCatalog() {
   renderAreaOptions();
   renderMaterialOptions();
   renderRackOptions();
+  renderPodPositionRackOptions();
   renderAreaList();
   renderMaterialList();
   renderRackList();
@@ -2941,8 +2958,18 @@ function renderRackOptions() {
   cellRack.innerHTML = `<option value="">Sin rack</option>` + racks.map(r => `<option value="${r.id}">${r.code}${r.material_group_name ? ` - ${r.material_group_name}` : ""}</option>`).join("");
   if ([...cellRack.options].some(o => o.value === current)) cellRack.value = current;
 }
+function renderPodPositionRackOptions() {
+  if (!podPositionRack) return;
+  const current = podPositionRack.value;
+  const racks = (catalog.racks || []).filter(r => (r.code || '').trim());
+  podPositionRack.innerHTML = `<option value="">Selecciona rack</option>` + racks.map(r => {
+    const loc = r.location_x != null ? ` · local (${r.location_x},${r.location_y})` : ' · sin celda local';
+    return `<option value="${r.id}">${escapeHtml(r.code || '')}${r.name ? ` - ${escapeHtml(r.name)}` : ''}${loc}</option>`;
+  }).join("");
+  if ([...podPositionRack.options].some(o => o.value === current)) podPositionRack.value = current;
+}
 function renderAreaList() {
-  areasList.innerHTML = catalog.areas.map(a => `<button type="button" class="list-item" data-kind="area" data-id="${a.id}"><span class="swatch" style="background:${a.color}"></span><b>${a.code}</b> ${a.name}<small>${a.area_type} · prioridad ${a.priority}</small></button>`).join("") || `<div class="small">Sin áreas capturadas.</div>`;
+  areasList.innerHTML = catalog.areas.map(a => `<button type="button" class="list-item" data-kind="area" data-id="${a.id}"><span class="swatch" style="background:${a.color}"></span><b>${a.code}</b> ${a.name}<small>${a.area_type} · prioridad ${a.priority} · Matter Area: ${escapeHtml(a.matter_area || '-')}</small></button>`).join("") || `<div class="small">Sin áreas capturadas.</div>`;
   areasList.querySelectorAll("[data-kind='area']").forEach(btn => btn.addEventListener("click", () => loadAreaForm(Number(btn.dataset.id))));
 }
 function renderMaterialList() {
@@ -2959,12 +2986,12 @@ function renderRackList() {
   racksList.querySelectorAll("[data-kind='rack']").forEach(btn => btn.addEventListener("click", () => loadRackForm(Number(btn.dataset.id))));
 }
 function clearAreaForm() {
-  areaId.value = ""; areaCode.value = ""; areaName.value = ""; areaType.value = "almacen"; areaColor.value = "#4f46e5"; areaPriority.value = 0; areaActive.value = 1; areaDescription.value = "";
+  areaId.value = ""; areaCode.value = ""; areaName.value = ""; areaType.value = "almacen"; areaColor.value = "#4f46e5"; areaPriority.value = 0; areaActive.value = 1; if (areaMatterArea) areaMatterArea.value = ""; areaDescription.value = "";
 }
 function loadAreaForm(id) {
   const item = catalog.areas.find(a => Number(a.id) === Number(id));
   if (!item) return;
-  areaId.value = item.id; areaCode.value = item.code; areaName.value = item.name; areaType.value = item.area_type; areaColor.value = item.color || "#4f46e5"; areaPriority.value = item.priority ?? 0; areaActive.value = String(item.is_active ?? 1); areaDescription.value = item.description || "";
+  areaId.value = item.id; areaCode.value = item.code; areaName.value = item.name; areaType.value = item.area_type; areaColor.value = item.color || "#4f46e5"; areaPriority.value = item.priority ?? 0; areaActive.value = String(item.is_active ?? 1); if (areaMatterArea) areaMatterArea.value = item.matter_area || ""; areaDescription.value = item.description || "";
 }
 function clearMaterialForm() {
   materialId.value = ""; materialCode.value = ""; materialName.value = ""; materialColor.value = randomMaterialColor(); materialActive.value = 1; materialDescription.value = "";
@@ -3082,6 +3109,7 @@ function renderRcsResolvedInfo(data) {
     `Endpoint stop robot: ${data.stop_robot_endpoint || '/rcms/services/rest/hikRpcService/stopRobot'}`,
     `Endpoint resume robot: ${data.resume_robot_endpoint || '/rcms/services/rest/hikRpcService/resumeRobot'}`,
     `Endpoint estado AMR: ${data.agv_status_endpoint || '/rcms-dps/rest/queryAgvStatus'}`,
+    `Endpoint posicion rack/pod: ${data.pod_position_endpoint || '/rcms/services/rest/hikRpcService/queryPodPosition'}`,
     `Frecuencia monitoreo tarea: ${Number(data.task_monitor_interval_seconds ?? 3).toFixed(1)} s`,
     `Frecuencia monitoreo AGV: ${Number(data.agv_monitor_interval_seconds ?? 5).toFixed(1)} s`,
     `Habilitar mapShortName: ${Number(data.enable_map_short_name ?? 1) === 1 ? 'Sí' : 'No'}`,
@@ -3115,6 +3143,7 @@ async function adminLoadRcsConfig() {
   if (rcsStopEndpoint) rcsStopEndpoint.value = data.stop_robot_endpoint || '/rcms/services/rest/hikRpcService/stopRobot';
   if (rcsResumeEndpoint) rcsResumeEndpoint.value = data.resume_robot_endpoint || '/rcms/services/rest/hikRpcService/resumeRobot';
   if (rcsAgvStatusEndpoint) rcsAgvStatusEndpoint.value = data.agv_status_endpoint || '/rcms-dps/rest/queryAgvStatus';
+  if (rcsPodPositionEndpoint) rcsPodPositionEndpoint.value = data.pod_position_endpoint || '/rcms/services/rest/hikRpcService/queryPodPosition';
   if (rcsTaskMonitorInterval) rcsTaskMonitorInterval.value = String(Number(data.task_monitor_interval_seconds ?? 3));
   if (rcsAgvMonitorInterval) rcsAgvMonitorInterval.value = String(Number(data.agv_monitor_interval_seconds ?? 5));
   if (cleanupMinAgeMinutes) cleanupMinAgeMinutes.value = String(Number(data.cleanup_min_age_minutes ?? 30));
@@ -3142,6 +3171,7 @@ async function adminSaveRcsConfig() {
     stop_robot_endpoint: (rcsStopEndpoint?.value || '').trim() || '/rcms/services/rest/hikRpcService/stopRobot',
     resume_robot_endpoint: (rcsResumeEndpoint?.value || '').trim() || '/rcms/services/rest/hikRpcService/resumeRobot',
     agv_status_endpoint: (rcsAgvStatusEndpoint?.value || '').trim() || '/rcms-dps/rest/queryAgvStatus',
+    pod_position_endpoint: (rcsPodPositionEndpoint?.value || '').trim() || '/rcms/services/rest/hikRpcService/queryPodPosition',
     task_monitor_interval_seconds: safeNumberInput(rcsTaskMonitorInterval, 3),
     agv_monitor_interval_seconds: safeNumberInput(rcsAgvMonitorInterval, 5),
     cleanup_min_age_minutes: Math.max(1, Math.round(safeNumberInput(cleanupMinAgeMinutes, 30))),
@@ -3167,6 +3197,44 @@ async function adminTestRcsConfig() {
   const data = await fetchJson(API.adminRcsConfigTest, { method: 'POST', headers: fetchHeaders() });
   rcsConfigMsg.textContent = data.message || (data.ok ? 'Configuración válida.' : 'Configuración incompleta.');
 }
+function renderPodPositionResult(data) {
+  if (!podPositionResult) return;
+  if (!data) {
+    podPositionResult.textContent = 'Selecciona un rack y consulta su posicion en el RCS.';
+    return;
+  }
+  const localCell = data.local_cell;
+  const localRackCell = data.local_rack_cell;
+  const lines = [
+    `Rack / pod: ${data.rack_code || '-'}`,
+    `Endpoint: ${data.endpoint || '-'}`,
+    `Posicion RCS: ${data.rcs_position_code || 'No encontrada'}`,
+    `Celda local por posicion RCS: ${localCell ? `${localCell.code || '-'} (${localCell.x}, ${localCell.y})` : 'Sin coincidencia'}`,
+    `Celda local donde el sistema tiene asignado el rack: ${localRackCell ? `${localRackCell.code || '-'} (${localRackCell.x}, ${localRackCell.y})` : 'Sin asignacion local'}`,
+    '',
+    'Request:',
+    JSON.stringify(data.request_payload || {}, null, 2),
+    '',
+    'Response:',
+    JSON.stringify(data.response_payload || {}, null, 2),
+  ];
+  podPositionResult.textContent = lines.join('\n');
+}
+
+async function queryPodPosition() {
+  const rackId = Number(podPositionRack?.value || 0);
+  if (!rackId) throw new Error('Selecciona un rack.');
+  if (podPositionMsg) podPositionMsg.textContent = 'Consultando posicion en RCS...';
+  if (btnQueryPodPosition) btnQueryPodPosition.disabled = true;
+  try {
+    const data = await fetchJson(API.podPositionQuery, { method: 'POST', headers: { 'Content-Type': 'application/json', ...fetchHeaders() }, body: JSON.stringify({ rack_id: rackId }) });
+    renderPodPositionResult(data);
+    if (podPositionMsg) podPositionMsg.textContent = data.message || 'Consulta terminada.';
+  } finally {
+    if (btnQueryPodPosition) btnQueryPodPosition.disabled = !adminToken;
+  }
+}
+
 async function adminHideConfiguredRange() {
   await fetchJson(API.adminHideConfiguredRange, { method: "POST", headers: fetchHeaders() });
   await loadLocations();
@@ -3312,7 +3380,7 @@ async function saveSelectedCell() {
   cellMsg.textContent = `Celda (${selected.x}, ${selected.y}) guardada.`;
 }
 async function saveArea() {
-  const payload = { code: areaCode.value.trim(), name: areaName.value.trim(), description: areaDescription.value.trim() || null, color: areaColor.value || "#4f46e5", area_type: areaType.value.trim() || "almacen", is_active: Number(areaActive.value || 1), priority: Number(areaPriority.value || 0) };
+  const payload = { code: areaCode.value.trim(), name: areaName.value.trim(), description: areaDescription.value.trim() || null, matter_area: areaMatterArea?.value?.trim() || null, color: areaColor.value || "#4f46e5", area_type: areaType.value.trim() || "almacen", is_active: Number(areaActive.value || 1), priority: Number(areaPriority.value || 0) };
   const url = areaId.value ? API.adminArea(Number(areaId.value)) : API.adminAreas;
   const method = areaId.value ? "PUT" : "POST";
   await fetchJson(url, { method, headers: { "Content-Type": "application/json", ...fetchHeaders() }, body: JSON.stringify(payload) });
@@ -3429,19 +3497,38 @@ function renderOrdersList() {
     const active = order.order_id === selectedOrderId ? ' style="border-color:#60a5fa;background:rgba(96,165,250,.12);"' : '';
     const areaText = `${order.source_area_name || order.source_area_id} → ${order.destination_area_name || order.destination_area_id}`;
     const auditText = order.cancel_source ? `${order.status} · ${order.cancel_source}` : order.status;
-    return `<button type="button" class="list-item" data-order-id="${order.order_id}"${active}>
-      <div><b>${order.order_code}</b></div>
-      <div class="small">${auditText} · ${order.rack_code}</div>
-      <div class="small">Orden: ${order.order_type || '-'} · AGV: ${order.agv_code || '-'} · Tipo tarea: ${order.task_typ || '-'}</div>
-      <div class="small">${areaText}</div>
-      <div class="small">${new Date(order.created_at).toLocaleString()}</div>
-    </button>`;
+    const cancelTitle = order.can_undo ? 'Cancelar tarea' : historyOrderUnavailableReason(order);
+    const cancelDisabled = order.can_undo ? '' : ' disabled';
+    return `<div class="order-history-row">
+      <button type="button" class="list-item order-list-main" data-order-id="${order.order_id}"${active}>
+        <div><b>${order.order_code}</b></div>
+        <div class="small">${auditText} · ${order.rack_code}</div>
+        <div class="small">Orden: ${order.order_type || '-'} · AGV: ${order.agv_code || '-'} · Tipo tarea: ${order.task_typ || '-'}</div>
+        <div class="small">${areaText}</div>
+        <div class="small">${new Date(order.created_at).toLocaleString()}</div>
+      </button>
+      <button type="button" class="btn danger order-cancel-btn" data-cancel-order-id="${order.order_id}" title="${escapeHtml(cancelTitle || '')}"${cancelDisabled}>Cancelar</button>
+    </div>`;
   }).join('');
   ordersList.querySelectorAll('[data-order-id]').forEach(btn => {
     btn.addEventListener('click', () => {
       selectedOrderId = Number(btn.dataset.orderId);
       renderOrdersList();
       renderSelectedOrderDetail(movementOrders.find(x => x.order_id === selectedOrderId) || null);
+    });
+  });
+  ordersList.querySelectorAll('[data-cancel-order-id]').forEach(btn => {
+    btn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      selectedOrderId = Number(btn.dataset.cancelOrderId);
+      const order = movementOrders.find(x => x.order_id === selectedOrderId) || null;
+      renderOrdersList();
+      renderSelectedOrderDetail(order);
+      try {
+        openHistoryUndoModal(order);
+      } catch (err) {
+        orderMsg.textContent = `Error: ${String(err)}`;
+      }
     });
   });
   renderSelectedOrderDetail(movementOrders.find(x => x.order_id === selectedOrderId) || null);
@@ -3735,10 +3822,11 @@ async function simulateSelectedOrderComplete() {
   draw();
 }
 
-async function undoSelectedOrder() {
+async function undoSelectedOrder(returnAreaId = null, matterArea = '') {
   if (!selectedOrderId) throw new Error('Selecciona una tarea.');
-  const result = await fetchJson(API.movementOrderUndo(selectedOrderId), { method: 'POST' });
-  orderMsg.textContent = `Orden ${result.order_code} cancelada desde historial con cancelTask forceCancel=0 y reversa local del almacén. Nuevo estado: ${result.status}.`;
+  const body = returnAreaId ? { return_to_area: true, return_area_id: Number(returnAreaId), matter_area: matterArea || '' } : { return_to_area: true };
+  const result = await fetchJson(API.movementOrderUndo(selectedOrderId), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  orderMsg.textContent = `Orden ${result.order_code} cancelada desde historial con cancelTask forceCancel=1 y reversa local del almacén. Nuevo estado: ${result.status}.`;
   await loadLocations();
   await loadCatalog();
   await loadMovementOrders(result.order_id);
@@ -4462,10 +4550,20 @@ function closeOperatorActionModal() {
   operatorActionPickMode = null;
   actionModalContext = { mode: null, orderId: null };
   operatorActionModal?.classList.add('hidden');
+  hideHistoryCancelModalControls();
   if (operatorActionPreview) operatorActionPreview.textContent = 'Sin datos.';
   if (operatorActionModalMsg) operatorActionModalMsg.textContent = '';
   if (operatorActionModalTitle) operatorActionModalTitle.textContent = 'Confirmar solicitud';
   if (btnOperatorActionConfirm) btnOperatorActionConfirm.textContent = 'Enviar';
+}
+
+function hideHistoryCancelModalControls() {
+  if (operatorCancelModeRow) operatorCancelModeRow.classList.add('hidden');
+  if (operatorCancelMode) operatorCancelMode.value = 'return_area';
+  if (operatorCancelModeHint) operatorCancelModeHint.textContent = '';
+  if (operatorCancelReturnAreaRow) operatorCancelReturnAreaRow.classList.add('hidden');
+  if (operatorCancelReturnArea) operatorCancelReturnArea.value = '';
+  if (operatorCancelReturnAreaHint) operatorCancelReturnAreaHint.textContent = '';
 }
 
 function clearOperatorActionPanel() {
@@ -4506,6 +4604,7 @@ function renderOperatorPreviewText(preview) {
 }
 
 async function validateOperatorActionModal() {
+  hideHistoryCancelModalControls();
   if (!activeOperatorWindow?.id || !operatorActionState.button) throw new Error('No hay acción seleccionada.');
   const preview = await fetchJson(API.operatorWindowPreview(activeOperatorWindow.id, operatorActionState.button.button_index), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(operatorActionRequestBody()) });
   operatorActionState.preview = preview;
@@ -4517,9 +4616,15 @@ async function confirmOperatorActionModal() {
   if (actionModalContext.mode === 'history_undo') {
     const orderId = actionModalContext.orderId || selectedOrderId;
     if (!orderId) throw new Error('Selecciona una tarea.');
-    const result = await fetchJson(API.movementOrderUndo(orderId), { method: 'POST' });
+    const returnToArea = operatorCancelMode?.value === 'return_area';
+    const returnAreaId = returnToArea && operatorCancelReturnArea?.value ? Number(operatorCancelReturnArea.value) : null;
+    if (returnToArea && !returnAreaId) throw new Error('Selecciona el area de devolucion.');
+    const matterArea = returnToArea ? selectedCancelReturnMatterArea() : '';
+    const result = await fetchJson(API.movementOrderUndo(orderId), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ return_to_area: returnToArea, return_area_id: returnAreaId, matter_area: matterArea }) });
     closeOperatorActionModal();
-    orderMsg.textContent = `Orden ${result.order_code} cancelada desde historial con cancelTask forceCancel=0 y reversa local del almacén. Nuevo estado: ${result.status}.`;
+    orderMsg.textContent = returnToArea
+      ? `Orden ${result.order_code} cancelada desde historial con cancelTask forceCancel=1 y reversa local del almacén. Nuevo estado: ${result.status}.`
+      : `Orden ${result.order_code} cancelada desde historial con cancelTask forceCancel=0. Nuevo estado: ${result.status}.`;
     await loadLocations();
     await loadCatalog();
     await loadMovementOrders(result.order_id);
@@ -4545,50 +4650,98 @@ async function confirmOperatorActionModal() {
   draw();
 }
 
+function getAreaByIdForCancel(id) {
+  return id ? (catalog.areas || []).find(a => Number(a.id) === Number(id)) : null;
+}
+
+function isHistoryCancelReturnMode() {
+  return operatorCancelMode?.value === 'return_area';
+}
+
+function selectedCancelReturnMatterArea() {
+  const area = getAreaByIdForCancel(operatorCancelReturnArea?.value);
+  return String(area?.matter_area || '').trim();
+}
+
+function fillCancelReturnAreaSelect(order) {
+  if (!operatorCancelReturnArea) return;
+  const activeAreas = (catalog.areas || []).filter(a => Number(a.is_active ?? 1) === 1);
+  operatorCancelReturnArea.innerHTML = `<option value="">Selecciona area</option>` + activeAreas.map(a => `<option value="${a.id}">${escapeHtml(a.name || a.code)}${a.code ? ` (${escapeHtml(a.code)})` : ''}</option>`).join('');
+  const preferredId = order?.source_cell?.area_id ? String(order.source_cell.area_id) : (order?.source_area_id ? String(order.source_area_id) : '');
+  if (preferredId && [...operatorCancelReturnArea.options].some(o => o.value === preferredId)) {
+    operatorCancelReturnArea.value = preferredId;
+  }
+}
+
+function updateCancelReturnAreaHint(order) {
+  const returnMode = isHistoryCancelReturnMode();
+  if (operatorCancelReturnAreaRow) operatorCancelReturnAreaRow.classList.toggle('hidden', !returnMode);
+  if (operatorCancelModeHint) operatorCancelModeHint.textContent = returnMode
+    ? 'Se cancelara y se devolvera el contenedor al area seleccionada.'
+    : 'Se enviara cancelTask normal sin matterArea y sin devolucion local.';
+  const area = getAreaByIdForCancel(operatorCancelReturnArea?.value);
+  const matterArea = returnMode ? selectedCancelReturnMatterArea() : '';
+  if (operatorCancelReturnAreaHint) operatorCancelReturnAreaHint.textContent = area ? `Se enviara matterArea: ${matterArea || '(vacio)'}` : 'Selecciona el area a la que se devuelve el contenedor.';
+  if (operatorActionPreview) operatorActionPreview.textContent = renderHistoryUndoPreviewText(order);
+}
+
 function renderHistoryUndoPreviewText(order) {
   if (!order) return 'Sin orden seleccionada.';
+  const returnMode = isHistoryCancelReturnMode();
   const remoteActive = !!(order.remote_task_code && ['pending_dispatch', 'dispatched', 'in_progress'].includes(String(order.status || '')));
   const currentCell = order.current_cell ? (order.current_cell.code || `(${order.current_cell.x}, ${order.current_cell.y})`) : 'Sin ubicación';
   const sourceCell = order.source_cell ? (order.source_cell.code || `(${order.source_cell.x}, ${order.source_cell.y})`) : 'Sin origen';
   const destinationCell = order.destination_cell ? (order.destination_cell.code || `(${order.destination_cell.x}, ${order.destination_cell.y})`) : 'Sin destino';
+  const returnArea = returnMode ? getAreaByIdForCancel(operatorCancelReturnArea?.value) : null;
+  const matterArea = returnMode ? selectedCancelReturnMatterArea() : '';
+  const forceCancel = returnMode ? '1' : '0';
   const payload = {
-    accion: 'cancelar_deshacer_desde_historial',
+    accion: returnMode ? 'cancelar_y_devolver_a_area_desde_historial' : 'cancelar_desde_historial',
     order_id: order.order_id,
     order_code: order.order_code,
-    forceCancel: '0',
-    matterArea: order.source_cell?.code || '',
+    forceCancel,
+    return_to_area: returnMode,
+    return_area_id: returnArea?.id || null,
+    return_area: returnArea ? (returnArea.name || returnArea.code || '') : '',
+    matterArea,
     remote_task_code: order.remote_task_code || '',
     remote_cancel: remoteActive,
-    deshacer_movimiento_local: true,
+    deshacer_movimiento_local: returnMode,
   };
   return [
-    'Acción: Cancelar / deshacer desde historial',
+    `Acción: ${returnMode ? 'Cancelar y devolver a área' : 'Cancelar'}`,
     `Orden: ${order.order_code || ''}`,
     `Estado actual: ${order.status || ''}`,
     `Rack: ${order.rack_code || ''}`,
     `Origen: ${sourceCell}`,
     `Destino: ${destinationCell}`,
+    `Area de devolucion: ${returnMode ? (returnArea ? `${returnArea.name || returnArea.code}${returnArea.code ? ` (${returnArea.code})` : ''}` : 'Sin seleccionar') : 'No aplica'}`,
+    `Matter Area / matterArea: ${returnMode ? (matterArea || '(vacio)') : '(vacio)'}`,
     `Ubicación actual rack: ${currentCell}`,
-    `Cancelación remota en RCS: ${remoteActive ? 'Sí' : 'No (solo deshacer local)'}`,
+    `Cancelación remota en RCS: ${remoteActive ? 'Sí' : (returnMode ? 'No (solo deshacer local)' : 'No disponible para cancelación normal')}`,
     '',
     'JSON / parámetros de la acción:',
     JSON.stringify(payload, null, 2),
   ].join('\n');
 }
 
-function openHistoryUndoModal() {
-  const order = movementOrders.find(x => x.order_id === selectedOrderId) || null;
+function openHistoryUndoModal(orderArg = null) {
+  const order = orderArg || movementOrders.find(x => x.order_id === selectedOrderId) || null;
   if (!order) throw new Error('Selecciona una tarea.');
-  if (btnUndoOrder?.disabled) throw new Error(historyOrderUnavailableReason(order) || 'La tarea seleccionada no permite cancelar o deshacer.');
+  if (!order.can_undo) throw new Error(historyOrderUnavailableReason(order) || 'La tarea seleccionada no permite cancelar o deshacer.');
   actionModalContext = { mode: 'history_undo', orderId: order.order_id };
   if (operatorActionModalTitle) operatorActionModalTitle.textContent = 'Confirmar cancelación / deshacer';
   if (btnOperatorActionConfirm) btnOperatorActionConfirm.textContent = 'Enviar';
-  if (operatorActionPreview) operatorActionPreview.textContent = renderHistoryUndoPreviewText(order);
+  if (operatorCancelModeRow) operatorCancelModeRow.classList.remove('hidden');
+  if (operatorCancelMode) operatorCancelMode.value = 'return_area';
+  fillCancelReturnAreaSelect(order);
+  updateCancelReturnAreaHint(order);
   if (operatorActionModalMsg) operatorActionModalMsg.textContent = 'Revisa la previsualización y confirma para enviar la cancelación o el deshacer.';
   operatorActionModal?.classList.remove('hidden');
 }
 
 async function openOperatorActionModal(button) {
+  hideHistoryCancelModalControls();
   operatorActionState = { button, preview: null, source_cell_id: button?.source_cell_id || null, destination_cell_id: button?.destination_cell_id || null, destination_area_id: button?.destination_area_id || null, material_group_id: null, lot: '', quantity: null, manufacturer_code: '', comment: '' };
   operatorActionPickMode = null;
   if (operatorActionPanel) operatorActionPanel.classList.remove('hidden');
@@ -4812,6 +4965,10 @@ btnUploadBg?.addEventListener("click", async () => {
 btnSaveClientIp?.addEventListener("click", () => adminSaveClientIp().catch(err => adminMsg.textContent = `Error: ${String(err)}`));
 btnSaveRcsConfig?.addEventListener("click", () => adminSaveRcsConfig().catch(err => rcsConfigMsg.textContent = `Error: ${String(err)}`));
 btnTestRcsConfig?.addEventListener("click", () => adminTestRcsConfig().catch(err => rcsConfigMsg.textContent = `Error: ${String(err)}`));
+btnQueryPodPosition?.addEventListener("click", () => queryPodPosition().catch(err => {
+  if (podPositionMsg) podPositionMsg.textContent = `Error: ${String(err)}`;
+  if (btnQueryPodPosition) btnQueryPodPosition.disabled = !adminToken;
+}));
 btnChangePwd?.addEventListener("click", async () => {
   try {
     await fetchJson(API.adminChangePwd, { method: "POST", headers: { "Content-Type": "application/json", ...fetchHeaders() }, body: JSON.stringify({ old_password: oldPwd.value || "", new_password: newPwd.value || "" }) });
@@ -4906,6 +5063,14 @@ btnUndoOrder?.addEventListener("click", () => {
   } catch (err) {
     orderMsg.textContent = `Error: ${String(err)}`;
   }
+});
+operatorCancelReturnArea?.addEventListener("change", () => {
+  const order = movementOrders.find(x => x.order_id === (actionModalContext.orderId || selectedOrderId)) || null;
+  updateCancelReturnAreaHint(order);
+});
+operatorCancelMode?.addEventListener("change", () => {
+  const order = movementOrders.find(x => x.order_id === (actionModalContext.orderId || selectedOrderId)) || null;
+  updateCancelReturnAreaHint(order);
 });
 btnDeleteOrder?.addEventListener("click", () => deleteSelectedOrder().catch(err => orderMsg.textContent = `Error: ${String(err)}`));
 operatorWindowSelect?.addEventListener("change", () => openOperatorWindow().catch(err => operatorWindowMsg.textContent = `Error: ${String(err)}`));

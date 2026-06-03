@@ -69,6 +69,7 @@ class Area(Base):
     code = Column(String(64), nullable=False, unique=True)
     name = Column(String(128), nullable=False)
     description = Column(String(512), nullable=True)
+    matter_area = Column(String(128), nullable=True)
     color = Column(String(32), nullable=False, default="#4f46e5")
     area_type = Column(String(64), nullable=False, default="almacen")
     is_active = Column(Integer, nullable=False, default=1)

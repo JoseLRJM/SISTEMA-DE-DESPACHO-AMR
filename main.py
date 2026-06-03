@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 import asyncio
 import contextlib
 import shutil
@@ -204,6 +204,7 @@ class RcsConfigIn(BaseModel):
     stop_robot_endpoint: str = Field(default="/rcms/services/rest/hikRpcService/stopRobot", max_length=256)
     resume_robot_endpoint: str = Field(default="/rcms/services/rest/hikRpcService/resumeRobot", max_length=256)
     agv_status_endpoint: str = Field(default="/rcms-dps/rest/queryAgvStatus", max_length=256)
+    pod_position_endpoint: str = Field(default="/rcms/services/rest/hikRpcService/queryPodPosition", max_length=256)
     task_monitor_interval_seconds: float = Field(default=3.0, ge=0.2, le=3600.0)
     agv_monitor_interval_seconds: float = Field(default=5.0, ge=0.2, le=3600.0)
     enable_map_short_name: int = Field(default=1, ge=0, le=1)
@@ -369,6 +370,7 @@ class RcsConfigTestOut(BaseModel):
     resolved_stop_endpoint: str = ""
     resolved_resume_endpoint: str = ""
     resolved_agv_status_endpoint: str = ""
+    resolved_pod_position_endpoint: str = ""
     verify_tls: bool = False
     has_token_code: bool = False
     has_auth_header: bool = False
@@ -455,6 +457,7 @@ class AreaIn(BaseModel):
     code: str = Field(min_length=1, max_length=64)
     name: str = Field(min_length=1, max_length=128)
     description: Optional[str] = Field(default=None, max_length=512)
+    matter_area: Optional[str] = Field(default=None, max_length=128)
     color: str = Field(default="#4f46e5", min_length=4, max_length=32)
     area_type: str = Field(default="almacen", min_length=1, max_length=64)
     is_active: int = Field(default=1, ge=0, le=1)
@@ -464,6 +467,12 @@ class AreaIn(BaseModel):
 class AreaOut(AreaIn):
     id: int
     updated_at: datetime
+
+
+class MovementOrderUndoIn(BaseModel):
+    return_area_id: Optional[int] = None
+    matter_area: Optional[str] = Field(default=None, max_length=128)
+    return_to_area: bool = True
 
 
 class MaterialGroupIn(BaseModel):
@@ -771,6 +780,12 @@ def cleanup_legacy_schema():
 
 
         tables = [r[0] for r in conn.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table';").fetchall()]
+        if "areas" in tables:
+            area_cols = [c[1] for c in conn.exec_driver_sql("PRAGMA table_info(areas);").fetchall()]
+            if "matter_area" not in area_cols:
+                conn.exec_driver_sql("ALTER TABLE areas ADD COLUMN matter_area VARCHAR(128);")
+
+        tables = [r[0] for r in conn.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table';").fetchall()]
         if "movement_orders" in tables:
             mo_cols = [c[1] for c in conn.exec_driver_sql("PRAGMA table_info(movement_orders);").fetchall()]
             movement_missing_sql = {
@@ -931,6 +946,7 @@ def _to_area_out(r: Area) -> AreaOut:
         code=r.code,
         name=r.name,
         description=r.description,
+        matter_area=r.matter_area,
         color=r.color,
         area_type=r.area_type,
         is_active=r.is_active,
@@ -1322,8 +1338,8 @@ def _movement_order_out(
         destination_area_name=destination_area.name if destination_area else None,
         source_cell_id=row.source_cell_id,
         destination_cell_id=row.destination_cell_id,
-        source_cell={"id": source_cell.id, "x": source_cell.x, "y": source_cell.y, "code": source_cell.code},
-        destination_cell={"id": destination_cell.id, "x": destination_cell.x, "y": destination_cell.y, "code": destination_cell.code},
+        source_cell={"id": source_cell.id, "x": source_cell.x, "y": source_cell.y, "code": source_cell.code, "area_id": source_cell.area_id},
+        destination_cell={"id": destination_cell.id, "x": destination_cell.x, "y": destination_cell.y, "code": destination_cell.code, "area_id": destination_cell.area_id},
         current_cell=current_cell,
         dispatch_status=row.dispatch_status or "not_sent",
         remote_task_code=row.remote_task_code,
@@ -1836,6 +1852,7 @@ def _get_rcs_config(db) -> RcsConfigOut:
     stop_robot_endpoint = (get_setting(db, "rcs_stop_robot_endpoint", "/rcms/services/rest/hikRpcService/stopRobot") or "/rcms/services/rest/hikRpcService/stopRobot").strip() or "/rcms/services/rest/hikRpcService/stopRobot"
     resume_robot_endpoint = (get_setting(db, "rcs_resume_robot_endpoint", "/rcms/services/rest/hikRpcService/resumeRobot") or "/rcms/services/rest/hikRpcService/resumeRobot").strip() or "/rcms/services/rest/hikRpcService/resumeRobot"
     agv_status_endpoint = (get_setting(db, "rcs_agv_status_endpoint", "/rcms-dps/rest/queryAgvStatus") or "/rcms-dps/rest/queryAgvStatus").strip() or "/rcms-dps/rest/queryAgvStatus"
+    pod_position_endpoint = (get_setting(db, "rcs_pod_position_endpoint", "/rcms/services/rest/hikRpcService/queryPodPosition") or "/rcms/services/rest/hikRpcService/queryPodPosition").strip() or "/rcms/services/rest/hikRpcService/queryPodPosition"
     task_monitor_interval_seconds = float(get_setting(db, "rcs_task_monitor_interval_seconds", "3.0") or 3.0)
     agv_monitor_interval_seconds = float(get_setting(db, "rcs_agv_monitor_interval_seconds", "5.0") or 5.0)
     enable_map_short_name_raw = (get_setting(db, "rcs_enable_map_short_name", "1") or "1").strip().lower()
@@ -1867,6 +1884,7 @@ def _get_rcs_config(db) -> RcsConfigOut:
         stop_robot_endpoint=stop_robot_endpoint,
         resume_robot_endpoint=resume_robot_endpoint,
         agv_status_endpoint=agv_status_endpoint,
+        pod_position_endpoint=pod_position_endpoint,
         task_monitor_interval_seconds=task_monitor_interval_seconds,
         agv_monitor_interval_seconds=agv_monitor_interval_seconds,
         enable_map_short_name=1 if enable_map_short_name_raw in {"1", "true", "yes", "si", "sí"} else 0,
@@ -1892,6 +1910,7 @@ def _save_rcs_config(db, payload: RcsConfigIn) -> RcsConfigOut:
     stop_robot_endpoint = (payload.stop_robot_endpoint or "/rcms/services/rest/hikRpcService/stopRobot").strip() or "/rcms/services/rest/hikRpcService/stopRobot"
     resume_robot_endpoint = (payload.resume_robot_endpoint or "/rcms/services/rest/hikRpcService/resumeRobot").strip() or "/rcms/services/rest/hikRpcService/resumeRobot"
     agv_status_endpoint = (payload.agv_status_endpoint or "/rcms-dps/rest/queryAgvStatus").strip() or "/rcms-dps/rest/queryAgvStatus"
+    pod_position_endpoint = (payload.pod_position_endpoint or "/rcms/services/rest/hikRpcService/queryPodPosition").strip() or "/rcms/services/rest/hikRpcService/queryPodPosition"
     task_monitor_interval_seconds = float(payload.task_monitor_interval_seconds or 3.0)
     agv_monitor_interval_seconds = float(payload.agv_monitor_interval_seconds or 5.0)
     cleanup_min_age_minutes = max(1, int(payload.cleanup_min_age_minutes or 30))
@@ -1913,6 +1932,8 @@ def _save_rcs_config(db, payload: RcsConfigIn) -> RcsConfigOut:
         resume_robot_endpoint = "/" + resume_robot_endpoint
     if not agv_status_endpoint.startswith("/"):
         agv_status_endpoint = "/" + agv_status_endpoint
+    if not pod_position_endpoint.startswith("/"):
+        pod_position_endpoint = "/" + pod_position_endpoint
     set_setting(db, "rcs_base_url", (payload.base_url or "").strip())
     set_setting(db, "rcs_create_task_endpoint", endpoint)
     set_setting(db, "rcs_query_task_status_endpoint", query_endpoint)
@@ -1920,6 +1941,7 @@ def _save_rcs_config(db, payload: RcsConfigIn) -> RcsConfigOut:
     set_setting(db, "rcs_stop_robot_endpoint", stop_robot_endpoint)
     set_setting(db, "rcs_resume_robot_endpoint", resume_robot_endpoint)
     set_setting(db, "rcs_agv_status_endpoint", agv_status_endpoint)
+    set_setting(db, "rcs_pod_position_endpoint", pod_position_endpoint)
     set_setting(db, "rcs_task_monitor_interval_seconds", str(task_monitor_interval_seconds))
     set_setting(db, "rcs_agv_monitor_interval_seconds", str(agv_monitor_interval_seconds))
     set_setting(db, "rcs_enable_map_short_name", "1" if enable_map_short_name else "0")
@@ -1973,6 +1995,57 @@ def _get_rcs_client_with_overrides(db, *, base_url: Optional[str] = None, query_
     if endpoint_override:
         client.endpoint_query_task_status = endpoint_override if endpoint_override.startswith("/") else f"/{endpoint_override}"
     return client
+
+
+def _maybe_json_dict(value: Any) -> Any:
+    if isinstance(value, str):
+        text_value = value.strip()
+        if text_value.startswith("{") or text_value.startswith("["):
+            try:
+                return json.loads(text_value)
+            except Exception:
+                return value
+    return value
+
+
+def _find_first_nested_value(payload: Any, keys: set[str]) -> str:
+    payload = _maybe_json_dict(payload)
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if str(key).strip() in keys and value not in (None, ""):
+                return str(value).strip()
+        for value in payload.values():
+            found = _find_first_nested_value(value, keys)
+            if found:
+                return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = _find_first_nested_value(item, keys)
+            if found:
+                return found
+    return ""
+
+
+def _extract_pod_position_code(response_payload: dict) -> str:
+    keys = {
+        "positionCode",
+        "currentPositionCode",
+        "currentPos",
+        "currentPosition",
+        "locationCode",
+        "cellCode",
+        "stationCode",
+        "wbCode",
+        "posCode",
+        "position",
+    }
+    return _find_first_nested_value(response_payload, keys)
+
+
+def _cell_payload(cell: Optional[Location]) -> Optional[dict]:
+    if not cell:
+        return None
+    return {"id": cell.id, "x": cell.x, "y": cell.y, "code": cell.code, "area_id": cell.area_id}
 
 
 def _rcs_create_task_accepted(response: RcsTaskResponse) -> bool:
@@ -3074,6 +3147,7 @@ def admin_test_rcs_config(x_admin_token: Optional[str] = Header(default=None, al
         endpoint = (cfg.create_task_endpoint or "/rcs/task/create").strip() or "/rcs/task/create"
         query_endpoint = (cfg.query_task_status_endpoint or "/rcms/services/rest/hikRpcService/queryTaskStatus").strip() or "/rcms/services/rest/hikRpcService/queryTaskStatus"
         agv_status_endpoint = (cfg.agv_status_endpoint or "/rcms-dps/rest/queryAgvStatus").strip() or "/rcms-dps/rest/queryAgvStatus"
+        pod_position_endpoint = (cfg.pod_position_endpoint or "/rcms/services/rest/hikRpcService/queryPodPosition").strip() or "/rcms/services/rest/hikRpcService/queryPodPosition"
         stop_endpoint = (cfg.stop_robot_endpoint or "/rcms/services/rest/hikRpcService/stopRobot").strip() or "/rcms/services/rest/hikRpcService/stopRobot"
         resume_endpoint = (cfg.resume_robot_endpoint or "/rcms/services/rest/hikRpcService/resumeRobot").strip() or "/rcms/services/rest/hikRpcService/resumeRobot"
         verify_tls = bool(int(cfg.verify_tls or 0))
@@ -3088,6 +3162,7 @@ def admin_test_rcs_config(x_admin_token: Optional[str] = Header(default=None, al
                 resolved_stop_endpoint=stop_endpoint,
                 resolved_resume_endpoint=resume_endpoint,
                 resolved_agv_status_endpoint=agv_status_endpoint,
+                resolved_pod_position_endpoint=pod_position_endpoint,
                 verify_tls=verify_tls,
                 has_token_code=bool(cfg.resolved_token_code),
                 has_auth_header=bool(cfg.resolved_auth_header),
@@ -3098,6 +3173,8 @@ def admin_test_rcs_config(x_admin_token: Optional[str] = Header(default=None, al
             query_endpoint = "/" + query_endpoint
         if not agv_status_endpoint.startswith("/"):
             agv_status_endpoint = "/" + agv_status_endpoint
+        if not pod_position_endpoint.startswith("/"):
+            pod_position_endpoint = "/" + pod_position_endpoint
         if not stop_endpoint.startswith("/"):
             stop_endpoint = "/" + stop_endpoint
         if not resume_endpoint.startswith("/"):
@@ -3112,9 +3189,87 @@ def admin_test_rcs_config(x_admin_token: Optional[str] = Header(default=None, al
             resolved_stop_endpoint=stop_endpoint,
             resolved_resume_endpoint=resume_endpoint,
             resolved_agv_status_endpoint=agv_status_endpoint,
+            resolved_pod_position_endpoint=pod_position_endpoint,
             verify_tls=verify_tls,
             has_token_code=bool(cfg.resolved_token_code),
             has_auth_header=bool(cfg.resolved_auth_header),
+        )
+
+
+class PodPositionQueryIn(BaseModel):
+    rack_id: int = Field(gt=0)
+
+
+class PodPositionQueryOut(BaseModel):
+    ok: bool
+    message: str = ""
+    rack_id: int
+    rack_code: str
+    endpoint: str = ""
+    rcs_position_code: str = ""
+    local_cell: Optional[dict] = None
+    local_rack_cell: Optional[dict] = None
+    request_payload: dict = {}
+    response_payload: dict = {}
+
+
+@app.post("/api/rcs/pod-position", response_model=PodPositionQueryOut)
+def query_pod_position(payload: PodPositionQueryIn, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        rack = db.execute(select(Rack).where(Rack.id == payload.rack_id)).scalar_one_or_none()
+        if not rack:
+            raise HTTPException(status_code=404, detail="Rack no encontrado")
+        pod_code = (rack.code or "").strip()
+        if not pod_code:
+            raise HTTPException(status_code=400, detail="El rack seleccionado no tiene codigo para enviar como podCode")
+
+        cfg = _get_rcs_config(db)
+        endpoint = (cfg.pod_position_endpoint or "/rcms/services/rest/hikRpcService/queryPodPosition").strip() or "/rcms/services/rest/hikRpcService/queryPodPosition"
+        if not endpoint.startswith("/") and not endpoint.startswith("http://") and not endpoint.startswith("https://"):
+            endpoint = "/" + endpoint
+        client = _get_rcs_client_from_settings(db)
+        request_payload = {
+            "reqCode": generate_req_code_ms(),
+            "reqTime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "clientCode": "",
+            "tokenCode": getattr(client, "_token_code", "") or "",
+            "podCode": pod_code,
+        }
+        debug_base_url, debug_endpoint = _resolve_rcs_target(db, endpoint=endpoint, mode="query")
+        try:
+            _append_debug_console_event(db, direction="sent", module="query_pod_position", base_url=debug_base_url, endpoint=debug_endpoint, payload=request_payload, message=f"Consulta posicion pod {pod_code}")
+            response_payload = client.post_json_payload(request_payload, endpoint_override=endpoint)
+            _append_debug_console_event(db, direction="received", module="query_pod_position", base_url=debug_base_url, endpoint=debug_endpoint, payload=response_payload, message=f"Respuesta posicion pod {pod_code}")
+        except Exception as exc:
+            logger.exception("Pod position query failed rack_id=%s rack_code=%s endpoint=%s", rack.id, rack.code, endpoint)
+            _append_debug_console_event(db, direction="received", module="query_pod_position", base_url=debug_base_url, endpoint=debug_endpoint, payload={"error": str(exc)}, message=str(exc))
+            raise HTTPException(status_code=502, detail=f"Error consultando posicion del rack en RCS: {exc}")
+
+        position_code = _extract_pod_position_code(response_payload)
+        matched_cell = None
+        if position_code:
+            matched_cell = db.execute(
+                select(Location).where(func.lower(func.trim(func.coalesce(Location.code, ""))) == position_code.strip().lower())
+            ).scalar_one_or_none()
+        local_rack_cell = db.execute(select(Location).where(Location.rack_id == rack.id)).scalar_one_or_none()
+        if position_code and matched_cell:
+            message = f"RCS reporta posicion {position_code}; corresponde a la celda local ({matched_cell.x}, {matched_cell.y})."
+        elif position_code:
+            message = f"RCS reporta posicion {position_code}, pero no existe una celda local con ese codigo."
+        else:
+            message = "El RCS respondio, pero no se encontro un campo de posicion reconocible en la respuesta."
+        return PodPositionQueryOut(
+            ok=bool(position_code),
+            message=message,
+            rack_id=rack.id,
+            rack_code=pod_code,
+            endpoint=endpoint,
+            rcs_position_code=position_code,
+            local_cell=_cell_payload(matched_cell),
+            local_rack_cell=_cell_payload(local_rack_cell),
+            request_payload=request_payload,
+            response_payload=response_payload,
         )
 
 
@@ -3367,6 +3522,7 @@ def get_rcs_config_public():
         return {
             "enable_amr_monitor": int(cfg.enable_amr_monitor or 0),
             "agv_status_endpoint": cfg.agv_status_endpoint or "/rcms-dps/rest/queryAgvStatus",
+            "pod_position_endpoint": cfg.pod_position_endpoint or "/rcms/services/rest/hikRpcService/queryPodPosition",
             "task_monitor_interval_seconds": float(cfg.task_monitor_interval_seconds or 3.0),
             "agv_monitor_interval_seconds": float(cfg.agv_monitor_interval_seconds or 5.0),
             "enable_map_short_name": int(cfg.enable_map_short_name or 0),
@@ -4561,14 +4717,28 @@ def simulate_complete_movement_order(order_id: int):
 
 
 @app.post("/api/movement-orders/{order_id}/undo", response_model=MovementOrderOut)
-def undo_selected_movement_order(order_id: int):
+def undo_selected_movement_order(order_id: int, body: Optional[MovementOrderUndoIn] = None):
     with SessionLocal() as db:
         row = db.execute(select(MovementOrder).where(MovementOrder.id == order_id)).scalar_one_or_none()
         if not row:
             raise HTTPException(status_code=404, detail="Orden no encontrada")
+        return_area = None
+        if body and body.return_area_id:
+            return_area = db.execute(select(Area).where(Area.id == body.return_area_id)).scalar_one_or_none()
+            if not return_area:
+                raise HTTPException(status_code=404, detail="Area de devolucion no encontrada")
         source_cell = db.execute(select(Location).where(Location.id == row.source_cell_id)).scalar_one_or_none()
-        matter_area = (source_cell.code or '').strip() if source_cell else ''
-        row = _execute_cancel_for_order(db, row, '0', matter_area, undo_on_accept=True)
+        return_to_area = bool(body.return_to_area) if body is not None else True
+        if return_to_area and return_area:
+            matter_area = (return_area.matter_area or '').strip()
+        elif return_to_area and body and body.matter_area is not None:
+            matter_area = (body.matter_area or '').strip()
+        else:
+            matter_area = (source_cell.code or '').strip() if source_cell else ''
+        if not return_to_area:
+            matter_area = ''
+        force_cancel = '1' if return_to_area else '0'
+        row = _execute_cancel_for_order(db, row, force_cancel, matter_area, undo_on_accept=return_to_area)
         return _movement_order_out(db, row)
 
 
@@ -4665,7 +4835,7 @@ def create_area(body: AreaIn, x_admin_token: Optional[str] = Header(default=None
         exists = db.execute(select(Area).where(Area.code == body.code.strip())).scalar_one_or_none()
         if exists:
             raise HTTPException(status_code=400, detail="Ya existe un área con ese código")
-        row = Area(code=body.code.strip(), name=body.name.strip(), description=(body.description or "").strip() or None, color=body.color.strip(), area_type=body.area_type.strip(), is_active=body.is_active, priority=body.priority, updated_at=datetime.utcnow())
+        row = Area(code=body.code.strip(), name=body.name.strip(), description=(body.description or "").strip() or None, matter_area=(body.matter_area or "").strip() or None, color=body.color.strip(), area_type=body.area_type.strip(), is_active=body.is_active, priority=body.priority, updated_at=datetime.utcnow())
         db.add(row)
         db.commit()
         db.refresh(row)
@@ -4686,6 +4856,7 @@ def update_area(area_id: int, body: AreaIn, x_admin_token: Optional[str] = Heade
         row.code = body.code.strip()
         row.name = body.name.strip()
         row.description = (body.description or "").strip() or None
+        row.matter_area = (body.matter_area or "").strip() or None
         row.color = body.color.strip()
         row.area_type = body.area_type.strip()
         row.is_active = body.is_active
