@@ -1111,7 +1111,7 @@ const ACTION_CARD_ORDER = [
   "card-admin-password",
   "card-admin-login",
 ];
-const PUBLIC_CARD_IDS = new Set(["card-workstation", "card-history", "card-admin-login"]);
+const PUBLIC_CARD_IDS = new Set(["card-workstation", "operatorActionPanel", "card-history", "card-admin-login"]);
 const ACTION_TAB_STORAGE_KEY = "agv_side_panel_active_tab_v1";
 const ACTION_CARD_TABS = [
   {
@@ -2774,6 +2774,10 @@ function setAdminUI(enabled) {
     ) {
       return;
     }
+    if (el.closest?.("#operatorButtonsBox") || el.closest?.("#operatorActionPanel")) {
+      el.disabled = false;
+      return;
+    }
     if (!el.id) return;
     if (disabledPlaceholderIds.has(el.id)) {
       el.disabled = true;
@@ -4222,10 +4226,10 @@ function addAdminPointCustomFieldRow() {
   renderOperatorPointCustomFieldEditor(rows);
 }
 function operatorActionUsesInlineCells() {
-  return ['direct_move_config', 'point_to_area'].includes(operatorActionState?.button?.action_mode || '');
+  return ['direct_move', 'direct_move_config', 'point_to_area'].includes(operatorActionState?.button?.action_mode || '');
 }
 function operatorActionRequiresImmediatePreview() {
-  return ['fifo', 'direct_move'].includes(operatorActionState?.button?.action_mode || '');
+  return operatorActionState?.button?.action_mode === 'fifo';
 }
 function operatorActionIsPointToArea() {
   return operatorActionState?.button?.action_mode === 'point_to_area';
@@ -4237,7 +4241,7 @@ function operatorActionShowsAgvTask() {
   return !['direct_move_config', 'point_to_area'].includes(operatorActionState?.button?.action_mode || '');
 }
 function operatorActionNeedsDestinationCell() {
-  return operatorActionIsDirectMoveConfig();
+  return ['direct_move', 'direct_move_config'].includes(operatorActionState?.button?.action_mode || '');
 }
 function operatorActionNeedsDynamicCells() {
   return operatorActionUsesInlineCells();
@@ -4744,19 +4748,19 @@ async function openOperatorActionModal(button) {
   hideHistoryCancelModalControls();
   operatorActionState = { button, preview: null, source_cell_id: button?.source_cell_id || null, destination_cell_id: button?.destination_cell_id || null, destination_area_id: button?.destination_area_id || null, material_group_id: null, lot: '', quantity: null, manufacturer_code: '', comment: '' };
   operatorActionPickMode = null;
-  if (operatorActionPanel) operatorActionPanel.classList.remove('hidden');
+  const showParameterPanel = operatorActionUsesInlineCells();
+  if (operatorActionPanel) operatorActionPanel.classList.toggle('hidden', !showParameterPanel);
   if (operatorActionPanelTitle) operatorActionPanelTitle.textContent = button.label || 'Parámetros de la acción';
   if (operatorActionPanelModeLabel) operatorActionPanelModeLabel.textContent = button.action_mode === 'point_to_area' ? '' : `Modo: ${actionModeLabel(button.action_mode)}`;
   if (operatorActionAgv) operatorActionAgv.value = button.agv_code || '';
   if (operatorActionTaskTyp) operatorActionTaskTyp.value = button.task_typ || 'A01';
   renderOperatorActionMaterialOptions();
   renderOperatorActionCellLabels();
-  if (operatorActionPanel) operatorActionPanel.classList.toggle('hidden', !operatorActionUsesInlineCells());
   if (button.action_mode === 'direct_move' && (!operatorActionState.source_cell_id || !operatorActionState.destination_cell_id)) {
     if (operatorWindowMsg) operatorWindowMsg.textContent = 'Este botón de movimiento directo no tiene configuradas la celda origen y la celda destino.';
     return;
   }
-  if (operatorActionUsesInlineCells()) {
+  if (showParameterPanel) {
     if (operatorWindowMsg) operatorWindowMsg.textContent = 'Selecciona los parámetros abajo y luego presiona Vista previa.';
     if (button.action_mode === 'point_to_area') applyOperatorPointDefaultsFromRack();
     draw();
