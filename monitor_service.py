@@ -18,6 +18,18 @@ _MONITOR_RUN_LOCK = threading.Lock()
 logger = get_logger("app.monitor")
 
 
+def _active_orders_for_rack(db, rack_id: int | None, *, exclude_order_id: int | None = None):
+    if not rack_id:
+        return []
+    stmt = select(MovementOrder).where(
+        MovementOrder.rack_id == rack_id,
+        MovementOrder.status.in_(RACK_RESERVATION_ACTIVE_STATUSES),
+    )
+    if exclude_order_id:
+        stmt = stmt.where(MovementOrder.id != exclude_order_id)
+    return db.execute(stmt).scalars().all()
+
+
 def _append_monitor_debug_event(db, *, payload: dict, message: str, created_at: datetime | None = None):
     now = created_at or datetime.utcnow()
     db.add(DebugConsoleEvent(
@@ -32,16 +44,32 @@ def _append_monitor_debug_event(db, *, payload: dict, message: str, created_at: 
 def _ensure_rack_available(db, order: MovementOrder, *, source: str = "monitor_remote"):
     now = datetime.utcnow()
     rack = db.execute(select(Rack).where(Rack.id == order.rack_id)).scalar_one_or_none()
-    active_other = db.execute(
-        select(MovementOrder).where(
-            MovementOrder.rack_id == order.rack_id,
-            MovementOrder.id != order.id,
-            MovementOrder.status.in_(RACK_RESERVATION_ACTIVE_STATUSES),
+    active_other = _active_orders_for_rack(db, order.rack_id, exclude_order_id=order.id)
+    if rack is not None:
+        logger.info(
+            "RACK_RELEASE_ATTEMPT rack_id=%s rack_code=%s order_id=%s dispatch_status=%s source=%s reason=%s",
+            rack.id,
+            rack.code,
+            order.id,
+            order.status,
+            source,
+            "remote_status_terminal",
         )
-    ).scalars().first()
+    if rack is not None and active_other:
+        blocking = active_other[0]
+        logger.warning(
+            "RACK_RELEASE_BLOCKED_ACTIVE_ORDER rack_id=%s rack_code=%s attempted_order_id=%s blocking_order_id=%s blocking_dispatch_status=%s source=%s reason=%s",
+            rack.id,
+            rack.code,
+            order.id,
+            blocking.id,
+            blocking.status,
+            source,
+            "remote_status_terminal",
+        )
     if rack is not None and not active_other and (rack.status or '').strip().lower() != 'available':
         old_status = rack.status or ""
-        apply_rack_reservation_status(rack, False, updated_at=now)
+        apply_rack_reservation_status(rack, False, updated_at=now, order_id=order.id, dispatch_status=order.status, source=source, reason="remote_status_terminal")
         db.add(rack)
         logger.info("[CLEANUP] Rack %s %s -> %s reason=remote_status_terminal order_id=%s", rack.id, old_status, rack.status, order.id)
         logger.info(
@@ -59,6 +87,101 @@ def _ensure_rack_available(db, order: MovementOrder, *, source: str = "monitor_r
             message=f"[RACK RELEASE] rack_id={rack.id} source={source} related_order={order.id}",
             created_at=now,
         )
+        logger.info(
+            "RACK_RELEASE_COMPLETED rack_id=%s rack_code=%s order_id=%s dispatch_status=%s source=%s reason=%s",
+            rack.id,
+            rack.code,
+            order.id,
+            order.status,
+            source,
+            "remote_status_terminal",
+        )
+
+
+def _finalize_cancel_return_undo(db, row: MovementOrder, *, previous_status: str, remote_terminal_status: str, source: str, auto_commit: bool = True) -> MovementOrder:
+    # cancel_return stuck: RCS confirmed a terminal state, so close locally as undone and release only if no other active order uses the rack.
+    rack_id = row.rack_id
+    rack_before = db.execute(select(Rack).where(Rack.id == rack_id)).scalar_one_or_none() if rack_id else None
+    old_rack_status = rack_before.status if rack_before else ""
+    undo_movement_order(db, row.id)
+    row = db.execute(select(MovementOrder).where(MovementOrder.id == row.id)).scalar_one()
+    now = datetime.utcnow()
+    active_other = _active_orders_for_rack(db, rack_id, exclude_order_id=row.id)
+    rack = db.execute(select(Rack).where(Rack.id == rack_id)).scalar_one_or_none() if rack_id else None
+
+    row.status = "undone"
+    row.rcs_status = remote_terminal_status
+    row.cancel_source = source
+    row.cancel_reason = f"remote_status:{remote_terminal_status}"
+    row.closed_by = source
+    row.closed_at = now
+    row.updated_at = now
+    row.release_source = source
+    db.add(row)
+
+    if rack:
+        if active_other:
+            blocking = active_other[0]
+            logger.warning(
+                "RACK_RELEASE_BLOCKED_ACTIVE_ORDER rack_id=%s rack_code=%s attempted_order_id=%s blocking_order_id=%s blocking_dispatch_status=%s source=%s reason=%s",
+                rack.id,
+                rack.code,
+                row.id,
+                blocking.id,
+                blocking.status,
+                source,
+                f"remote_status:{remote_terminal_status}",
+            )
+            apply_rack_reservation_status(rack, True, updated_at=now, order_id=blocking.id, dispatch_status=blocking.status, source=source, reason="active_order_same_rack")
+            db.add(rack)
+            _append_monitor_debug_event(
+                db,
+                payload={"action": "rack_release_skipped", "source": source, "rack_id": rack.id, "rack_code": rack.code, "order_id": row.id, "active_other_order_ids": [o.id for o in active_other], "at": now.isoformat()},
+                message=f"[RACK RELEASE] omitido rack_id={rack.id} tiene otra orden activa",
+                created_at=now,
+            )
+        else:
+            if (rack.status or "").strip().lower() != "available":
+                apply_rack_reservation_status(rack, False, updated_at=now, order_id=row.id, dispatch_status=row.status, source=source, reason=f"remote_status:{remote_terminal_status}")
+                db.add(rack)
+            _append_monitor_debug_event(
+                db,
+                payload={"action": "rack_release", "source": source, "rack_id": rack.id, "rack_code": rack.code, "previous_status": old_rack_status, "new_status": rack.status, "related_order": row.id, "at": now.isoformat()},
+                message=f"[RACK RELEASE] rack_id={rack.id} source={source} related_order={row.id}",
+                created_at=now,
+            )
+
+    logger.info(
+        "CANCEL_UNDO_TERMINAL_CLOSE order_id=%s rack_id=%s rack_code=%s robot_code=%s previous_dispatch_status=%s new_dispatch_status=%s rcs_status=%s source=%s reason=%s",
+        row.id,
+        row.rack_id,
+        rack.code if rack else None,
+        row.agv_code,
+        previous_status,
+        row.status,
+        row.rcs_status,
+        source,
+        f"remote_status:{remote_terminal_status}",
+    )
+    logger.info(
+        "[CANCEL ORDER] order_id=%s order_code=%s previous_status=%s new_status=%s source=%s admin=%s reason=%s",
+        row.id,
+        row.order_code,
+        previous_status,
+        row.status,
+        source,
+        source,
+        f"remote_status:{remote_terminal_status}",
+    )
+    _append_monitor_debug_event(
+        db,
+        payload={"action": "cancel_order", "source": source, "order_id": row.id, "order_code": row.order_code, "previous_status": previous_status, "new_status": row.status, "admin": source, "reason": f"remote_status:{remote_terminal_status}", "at": now.isoformat()},
+        message=f"[CANCEL ORDER] order_id={row.id} source={source} reason=remote_status:{remote_terminal_status}",
+        created_at=now,
+    )
+    if auto_commit:
+        db.commit()
+    return row
 
 
 def generate_req_code_ms() -> str:
@@ -106,6 +229,8 @@ def _normalize_remote_status(value: str) -> str:
         "failed": "failed",
         "error": "failed",
         "abnormal": "failed",
+        "aborted": "failed",
+        "terminated": "failed",
     }
     return status_map.get(raw, raw)
 
@@ -115,6 +240,7 @@ def _mark_order_terminal_without_move(db, order: MovementOrder, terminal_status:
     _ensure_rack_available(db, order, source=source)
     previous_status = order.status or ""
     order.status = terminal_status
+    order.rcs_status = terminal_status
     order.cancel_source = source
     order.cancel_reason = f"remote_status:{terminal_status}"
     order.closed_by = source
@@ -149,12 +275,45 @@ def apply_remote_status_to_order(db, row: MovementOrder, task_status: str, *, so
     logger.info("Applying remote status order_id=%s order_code=%s remote_status=%s", row.id, row.order_code, normalized)
 
     if normalized == "completed":
-        if row.status != "completed":
-            simulate_order_completed(db, row.id)
-            row = db.execute(select(MovementOrder).where(MovementOrder.id == row.id)).scalar_one()
+        if row.status == "cancel_requested_undo":
+            previous_status = row.status or ""
+            return _finalize_cancel_return_undo(db, row, previous_status=previous_status, remote_terminal_status="completed", source=source, auto_commit=auto_commit)
+        order_id = row.id
+        if row.status in {"pending_dispatch", "dispatched", "in_progress"}:
+            try:
+                simulate_order_completed(db, order_id)
+                row = db.execute(select(MovementOrder).where(MovementOrder.id == order_id)).scalar_one()
+            except Exception as exc:
+                db.rollback()
+                row = db.execute(select(MovementOrder).where(MovementOrder.id == order_id)).scalar_one()
+                now = datetime.utcnow()
+                row.status = "completed"
+                row.rcs_status = "completed"
+                row.closed_by = source
+                row.closed_at = now
+                row.release_source = source
+                row.updated_at = now
+                _ensure_rack_available(db, row, source=source)
+                db.add(row)
+                logger.warning(
+                    "RCS_COMPLETED_WITHOUT_LOCAL_CELL_MOVE order_id=%s order_code=%s rack_id=%s source=%s cells_modified=false error=%s",
+                    row.id,
+                    row.order_code,
+                    row.rack_id,
+                    source,
+                    exc,
+                )
+                if auto_commit:
+                    db.commit()
+                return row
         _ensure_rack_available(db, row, source=source)
+        now = datetime.utcnow()
         row.status = "completed"
-        row.updated_at = datetime.utcnow()
+        row.rcs_status = "completed"
+        row.closed_by = source
+        row.closed_at = now
+        row.release_source = source
+        row.updated_at = now
         db.add(row)
         if auto_commit:
             db.commit()
@@ -163,33 +322,7 @@ def apply_remote_status_to_order(db, row: MovementOrder, task_status: str, *, so
     if normalized == "cancelled":
         previous_status = row.status or ""
         if row.status == "cancel_requested_undo":
-            undo_movement_order(db, row.id)
-            row = db.execute(select(MovementOrder).where(MovementOrder.id == row.id)).scalar_one()
-            row.cancel_source = source
-            row.cancel_reason = "remote_status:cancelled"
-            row.closed_by = source
-            row.closed_at = datetime.utcnow()
-            row.release_source = source
-            row.updated_at = row.closed_at
-            db.add(row)
-            logger.info(
-                "[CANCEL ORDER] order_id=%s order_code=%s previous_status=%s new_status=%s source=%s admin=%s reason=%s",
-                row.id,
-                row.order_code,
-                previous_status,
-                row.status,
-                source,
-                source,
-                "remote_status:cancelled",
-            )
-            _append_monitor_debug_event(
-                db,
-                payload={"action": "cancel_order", "source": source, "order_id": row.id, "order_code": row.order_code, "previous_status": previous_status, "new_status": row.status, "admin": source, "reason": "remote_status:cancelled", "at": row.closed_at.isoformat()},
-                message=f"[CANCEL ORDER] order_id={row.id} source={source} reason=remote_status:cancelled",
-                created_at=row.closed_at,
-            )
-            if auto_commit:
-                db.commit()
+            row = _finalize_cancel_return_undo(db, row, previous_status=previous_status, remote_terminal_status="cancelled", source=source, auto_commit=auto_commit)
         elif row.status not in {"cancelled", "undone"}:
             _mark_order_terminal_without_move(db, row, "cancelled", source=source, auto_commit=auto_commit)
             row = db.execute(select(MovementOrder).where(MovementOrder.id == row.id)).scalar_one()
@@ -214,14 +347,6 @@ def apply_remote_status_to_order(db, row: MovementOrder, task_status: str, *, so
         return row
 
     if normalized == "failed":
-        if row.status in {"cancel_requested_undo", "cancel_requested_total"}:
-            _ensure_rack_available(db, row, source=source)
-            row.status = "failed"
-            row.updated_at = datetime.utcnow()
-            db.add(row)
-            if auto_commit:
-                db.commit()
-            return row
         _mark_order_terminal_without_move(db, row, "failed", source=source, auto_commit=auto_commit)
         row = db.execute(select(MovementOrder).where(MovementOrder.id == row.id)).scalar_one()
         return row
@@ -247,6 +372,15 @@ def check_active_tasks(
             rows = db.execute(
                 select(MovementOrder).where(MovementOrder.status.in_(tuple(ACTIVE_REMOTE_QUERY_STATUSES))).order_by(MovementOrder.id.asc())
             ).scalars().all()
+            for row in rows:
+                if not str(row.remote_task_code or "").strip():
+                    logger.warning(
+                        "RCS_STATUS_UNMATCHED_IGNORED order_id=%s order_code=%s remote_task_code=%s queried_task_codes=%s source=task_monitor reason=empty_remote_task_code",
+                        row.id,
+                        row.order_code,
+                        row.remote_task_code,
+                        [],
+                    )
             target_rows = [row for row in rows if row.remote_task_code and (row.dispatch_status or "") == "success"]
             if not target_rows:
                 return 0
@@ -281,9 +415,13 @@ def check_active_tasks(
 
                 touched_rows = []
                 for task_code, rows_for_code in task_map.items():
-                    item = normalized_map.get(task_code, {})
+                    item = normalized_map.get(task_code)
+                    has_exact_match = isinstance(item, dict)
+                    has_single_code_fallback = len(task_codes) == 1 and not normalized_map and bool(response.task_status)
+                    reliable_status = has_exact_match or has_single_code_fallback
+                    item = item or {}
                     raw_item = item.get("raw") if isinstance(item, dict) else None
-                    task_status = _normalize_remote_status(str(item.get("taskStatus") or item.get("task_status") or response.task_status or ""))
+                    task_status = _normalize_remote_status(str(item.get("taskStatus") or item.get("task_status") or (response.task_status if has_single_code_fallback else "") or ""))
                     message = str(item.get("message") or response.message or "")
                     response_payload = raw_item if isinstance(raw_item, dict) else (response.raw or {})
 
@@ -293,11 +431,21 @@ def check_active_tasks(
                         row.status_query_response_json = json.dumps(response_payload, ensure_ascii=False)
                         row.status_query_checked_at = now
                         row.rcs_last_update = now
-                        row.rcs_status = task_status or row.rcs_status
+                        if reliable_status:
+                            row.rcs_status = task_status or row.rcs_status
                         row.rcs_message = message or row.rcs_message
                         _append_status_query_log(db, row, kind="status_query", request_payload=request_payload, response_payload=response_payload, message=message, arrived_at=now)
                         db.add(row)
-                        touched_rows.append((row.id, task_status))
+                        if reliable_status and task_status:
+                            touched_rows.append((row.id, task_status))
+                        else:
+                            logger.warning(
+                                "RCS_STATUS_UNMATCHED_IGNORED order_id=%s order_code=%s remote_task_code=%s queried_task_codes=%s source=task_monitor",
+                                row.id,
+                                row.order_code,
+                                row.remote_task_code,
+                                task_codes,
+                            )
 
                 db.commit()
 

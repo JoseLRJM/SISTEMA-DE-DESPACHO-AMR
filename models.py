@@ -1,7 +1,7 @@
 from datetime import datetime
 from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
-from logging_config import configure_logging, configure_sqlalchemy_logging
+from logging_config import configure_logging, configure_sqlalchemy_logging, get_logger
 
 DB_URL = "sqlite:///./agv.db"
 DB_GRID_W = 100
@@ -14,6 +14,7 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 configure_logging()
 configure_sqlalchemy_logging(SessionLocal)
+logger = get_logger("app.main")
 
 
 def rack_status_from_reservation(reserved: bool) -> str:
@@ -28,9 +29,53 @@ def rack_status_is_available(value) -> bool:
     return str(value or "").strip().lower() in {"available", "disponible", "free", "libre"}
 
 
-def apply_rack_reservation_status(rack, reserved: bool, *, updated_at=None):
+def apply_rack_reservation_status(
+    rack,
+    reserved: bool,
+    *,
+    updated_at=None,
+    order_id=None,
+    dispatch_status=None,
+    source: str = "",
+    reason: str = "",
+):
+    old_status = getattr(rack, "status", None)
+    old_reserved = rack_status_is_reserved(old_status)
+    if not reserved:
+        logger.info(
+            "RACK_RELEASE_ATTEMPT rack_id=%s rack_code=%s order_id=%s dispatch_status=%s source=%s reason=%s",
+            getattr(rack, "id", None),
+            getattr(rack, "code", None),
+            order_id,
+            dispatch_status,
+            source,
+            reason,
+        )
     rack.status = rack_status_from_reservation(reserved)
     rack.updated_at = updated_at or datetime.utcnow()
+    logger.info(
+        "RACK_RESERVATION_CHANGE rack_id=%s rack_code=%s from_reserved=%s to_reserved=%s from_status=%s to_status=%s order_id=%s dispatch_status=%s source=%s reason=%s",
+        getattr(rack, "id", None),
+        getattr(rack, "code", None),
+        old_reserved,
+        bool(reserved),
+        old_status,
+        getattr(rack, "status", None),
+        order_id,
+        dispatch_status,
+        source,
+        reason,
+    )
+    if not reserved:
+        logger.info(
+            "RACK_RELEASE_COMPLETED rack_id=%s rack_code=%s order_id=%s dispatch_status=%s source=%s reason=%s",
+            getattr(rack, "id", None),
+            getattr(rack, "code", None),
+            order_id,
+            dispatch_status,
+            source,
+            reason,
+        )
     return rack
 
 

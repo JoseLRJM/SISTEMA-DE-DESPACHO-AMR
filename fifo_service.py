@@ -14,6 +14,7 @@ ACTIVE_RACK_STATUSES = {"available", "disponible"}
 INACTIVE_RACK_STATUSES = {"reserved", "moving", "error", "blocked", "reservado", "moviendo", "bloqueado"}
 VALID_PRIORITIES = {"normal", "alta", "urgente"}
 ORDER_STATUSES_WITH_DESTINATION_RESERVATION = {"pending_dispatch", "dispatched", "in_progress"}
+RACK_RESERVATION_ACTIVE_STATUSES = ("pending_dispatch", "dispatched", "in_progress", "cancel_requested_total", "cancel_requested_undo")
 NO_MATERIAL_CODE = "SIN_MATERIAL"
 NO_MATERIAL_CODE_NORMALIZED = "SINMATERIAL"
 logger = get_logger("app.fifo")
@@ -303,7 +304,6 @@ def execute_direct_move_request(
         raise HTTPException(status_code=409, detail="La celda destino ya está reservada por otra orden")
 
     now = datetime.utcnow()
-    apply_rack_reservation_status(rack, True, updated_at=now)
 
     order = MovementOrder(
         order_code=f"DM-{now.strftime('%Y%m%d%H%M%S')}-{rack.id}",
@@ -326,6 +326,9 @@ def execute_direct_move_request(
     )
     db.add(rack)
     db.add(order)
+    db.flush()
+    apply_rack_reservation_status(rack, True, updated_at=now, order_id=order.id, dispatch_status=order.status, source="fifo_service", reason="direct_move_created")
+    db.add(rack)
     db.commit()
     db.refresh(order)
     logger.info("Direct move order created order_id=%s order_code=%s rack_id=%s source_cell_id=%s destination_cell_id=%s", order.id, order.order_code, rack.id, source_cell.id, destination_cell.id)
@@ -359,7 +362,6 @@ def execute_fifo_request(
         raise HTTPException(status_code=409, detail="La celda destino ya no está disponible")
 
     now = datetime.utcnow()
-    apply_rack_reservation_status(rack, True, updated_at=now)
 
     order_code = f"MO-{now.strftime('%Y%m%d%H%M%S')}-{rack.id}"
     order = MovementOrder(
@@ -385,6 +387,9 @@ def execute_fifo_request(
     db.add(source_cell)
     db.add(destination_cell)
     db.add(order)
+    db.flush()
+    apply_rack_reservation_status(rack, True, updated_at=now, order_id=order.id, dispatch_status=order.status, source="fifo_service", reason="fifo_order_created")
+    db.add(rack)
     db.commit()
     db.refresh(order)
     logger.info("FIFO order created order_id=%s order_code=%s rack_id=%s source_cell_id=%s destination_cell_id=%s", order.id, order.order_code, rack.id, source_cell.id, destination_cell.id)
@@ -429,10 +434,43 @@ def simulate_order_completed(db, order_id: int) -> MovementOrder:
     destination_cell.status = 1
     destination_cell.updated_at = now
 
-    apply_rack_reservation_status(rack, False, updated_at=now)
+    active_other = db.execute(
+        select(MovementOrder).where(
+            MovementOrder.rack_id == rack.id,
+            MovementOrder.id != order.id,
+            MovementOrder.status.in_(RACK_RESERVATION_ACTIVE_STATUSES),
+        )
+    ).scalars().first()
+    logger.info(
+        "RACK_RELEASE_ATTEMPT rack_id=%s rack_code=%s order_id=%s dispatch_status=%s source=%s reason=%s",
+        rack.id,
+        rack.code,
+        order.id,
+        order.status,
+        "fifo_service",
+        "movement_order_completed",
+    )
+    if active_other:
+        apply_rack_reservation_status(rack, True, updated_at=now, order_id=active_other.id, dispatch_status=active_other.status, source="fifo_service", reason="active_order_same_rack")
+        logger.warning(
+            "RACK_RELEASE_BLOCKED_ACTIVE_ORDER rack_id=%s rack_code=%s attempted_order_id=%s blocking_order_id=%s blocking_dispatch_status=%s source=%s reason=%s",
+            rack.id,
+            rack.code,
+            order.id,
+            active_other.id,
+            active_other.status,
+            "fifo_service",
+            "movement_order_completed",
+        )
+    else:
+        apply_rack_reservation_status(rack, False, updated_at=now, order_id=order.id, dispatch_status=order.status, source="fifo_service", reason="movement_order_completed")
     rack.last_moved_at = now
 
     order.status = "completed"
+    order.rcs_status = "completed"
+    order.closed_by = "fifo_service"
+    order.closed_at = now
+    order.release_source = "fifo_service"
     order.updated_at = now
 
     db.add(source_cell)
@@ -481,11 +519,44 @@ def undo_movement_order(db, order_id: int) -> MovementOrder:
     source_cell.status = 1
     source_cell.updated_at = now
 
-    apply_rack_reservation_status(rack, False, updated_at=now)
-    rack.last_moved_at = now
-
     order.status = "cancelled" if order.status in ORDER_STATUSES_WITH_DESTINATION_RESERVATION or order.status == "cancel_requested_undo" else "undone"
+    order.rcs_status = order.status
+    order.closed_by = "fifo_service"
+    order.closed_at = now
+    order.release_source = "fifo_service"
     order.updated_at = now
+
+    active_other = db.execute(
+        select(MovementOrder).where(
+            MovementOrder.rack_id == rack.id,
+            MovementOrder.id != order.id,
+            MovementOrder.status.in_(RACK_RESERVATION_ACTIVE_STATUSES),
+        )
+    ).scalars().first()
+    logger.info(
+        "RACK_RELEASE_ATTEMPT rack_id=%s rack_code=%s order_id=%s dispatch_status=%s source=%s reason=%s",
+        rack.id,
+        rack.code,
+        order.id,
+        order.status,
+        "fifo_service",
+        "movement_order_undone",
+    )
+    if active_other:
+        apply_rack_reservation_status(rack, True, updated_at=now, order_id=active_other.id, dispatch_status=active_other.status, source="fifo_service", reason="active_order_same_rack")
+        logger.warning(
+            "RACK_RELEASE_BLOCKED_ACTIVE_ORDER rack_id=%s rack_code=%s attempted_order_id=%s blocking_order_id=%s blocking_dispatch_status=%s source=%s reason=%s",
+            rack.id,
+            rack.code,
+            order.id,
+            active_other.id,
+            active_other.status,
+            "fifo_service",
+            "movement_order_undone",
+        )
+    else:
+        apply_rack_reservation_status(rack, False, updated_at=now, order_id=order.id, dispatch_status=order.status, source="fifo_service", reason="movement_order_undone")
+    rack.last_moved_at = now
 
     db.add(source_cell)
     db.add(rack)
