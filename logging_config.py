@@ -24,6 +24,9 @@ _CONFIGURED = False
 _DB_LOGGING_CONFIGURED = False
 _LOCK = threading.Lock()
 _SENSITIVE_KEYWORDS = ("password", "token", "secret", "auth", "key")
+# SQLAlchemy row-level INSERT/UPDATE/DELETE logs can be noisy in production.
+# Enable only when diagnosing DB mutations: set DB_CHANGE_LOGGING_ENABLED=1.
+DB_CHANGE_LOGGING_ENABLED = os.getenv("DB_CHANGE_LOGGING_ENABLED", "").strip().lower() in {"1", "true", "yes", "on", "si", "sí"}
 
 
 def ensure_log_file() -> Path:
@@ -195,6 +198,10 @@ def configure_sqlalchemy_logging(session_factory) -> None:
             return
 
         db_logger = logging.getLogger("app.db")
+        if not DB_CHANGE_LOGGING_ENABLED:
+            db_logger.info("DB change logging disabled; set DB_CHANGE_LOGGING_ENABLED=1 to enable row-level INSERT/UPDATE/DELETE logs")
+            _DB_LOGGING_CONFIGURED = True
+            return
 
         @event.listens_for(session_factory.class_, "after_flush")
         def _log_db_changes(session, flush_context):

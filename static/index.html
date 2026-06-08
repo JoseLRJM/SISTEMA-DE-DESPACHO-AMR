@@ -5,7 +5,8 @@
 <meta charset="UTF-8"/>
 <meta content="width=device-width,initial-scale=1" name="viewport"/>
 <title>SISTEMA DE DESPACHO LITE</title>
-<link href="/static/styles.css" rel="stylesheet"/>
+<link href="/static/styles.css?v=local" rel="stylesheet"/>
+<script>window.APP_BUILD_ID="local";console.log("APP_BUILD_ID","local");</script>
 </head>
 <body>
 <header class="topbar"><div class="topbar-logo topbar-logo-left"><img alt="CRBT" src="/static/logo-crbt-white.png"/></div><div class="topbar-center"><div class="brand">SISTEMA DE DESPACHO LITE</div><div class="status status-centered" id="connStatus">Conectando…</div></div><div class="topbar-logo topbar-logo-right"><img alt="Mabuchi Motor" src="/static/logo-mabuchi.png"/></div></header>
@@ -682,6 +683,19 @@
 </div>
 <div class="row two-col">
 <div>
+<label>Auto recovery cancel undo</label>
+<select disabled="" id="cancelUndoAutoRecoveryEnabled">
+<option value="1">Activo</option>
+<option value="0">Inactivo</option>
+</select>
+</div>
+<div>
+<label>Cancel undo min age (min)</label>
+<input disabled="" id="cancelUndoAutoRecoveryMinAge" min="1" placeholder="5" step="1" type="number"/>
+</div>
+</div>
+<div class="row two-col">
+<div>
 <label>Habilitar mapShortName</label>
 <select disabled="" id="rcsEnableMapShortName">
 <option value="1">Sí</option>
@@ -859,6 +873,8 @@ reqCode automático · reqTime automático · mapShortName configurable y habili
 <h4>Recuperaci&oacute;n avanzada</h4>
 <div class="small">Racks bloqueados por &oacute;rdenes activas viejas</div>
 <div class="diagnosis-table-wrap" id="diagnosisOldActiveRacks">Sin datos.</div>
+<div class="small">Cancelaciones atoradas recuperables</div>
+<div class="diagnosis-table-wrap" id="diagnosisStuckCancelRecoverable">Sin datos.</div>
 <div class="row diagnosis-advanced-actions">
 <button class="btn danger force-release-btn" id="btnForceReleaseOldActiveRacks" type="button">Forzar cierre local y liberar rack seleccionado</button>
 <button class="btn warn hidden" id="createOldActiveOrderTestBtn" type="button" style="display:none">Crear orden activa vieja de prueba</button>
@@ -924,6 +940,6 @@ reqCode automático · reqTime automático · mapShortName configurable y habili
 </div>
 </div>
 </div>
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=local"></script>
 </body>
 </html>

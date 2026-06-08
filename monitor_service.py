@@ -8,7 +8,7 @@ from datetime import datetime
 
 from sqlalchemy import select
 
-from fifo_service import simulate_order_completed, undo_movement_order
+from fifo_service import simulate_order_completed
 from logging_config import get_logger
 from models import DebugConsoleEvent, MovementOrder, Rack, SessionLocal, apply_rack_reservation_status
 
@@ -99,17 +99,15 @@ def _ensure_rack_available(db, order: MovementOrder, *, source: str = "monitor_r
 
 
 def _finalize_cancel_return_undo(db, row: MovementOrder, *, previous_status: str, remote_terminal_status: str, source: str, auto_commit: bool = True) -> MovementOrder:
-    # cancel_return stuck: RCS confirmed a terminal state, so close locally as undone and release only if no other active order uses the rack.
-    rack_id = row.rack_id
-    rack_before = db.execute(select(Rack).where(Rack.id == rack_id)).scalar_one_or_none() if rack_id else None
-    old_rack_status = rack_before.status if rack_before else ""
-    undo_movement_order(db, row.id)
-    row = db.execute(select(MovementOrder).where(MovementOrder.id == row.id)).scalar_one()
+    # A terminal cancel-return response does not prove the rack's physical cell, so close without moving local cells.
     now = datetime.utcnow()
-    active_other = _active_orders_for_rack(db, rack_id, exclude_order_id=row.id)
-    rack = db.execute(select(Rack).where(Rack.id == rack_id)).scalar_one_or_none() if rack_id else None
 
-    row.status = "undone"
+    if remote_terminal_status == "completed":
+        row.status = "completed"
+    elif remote_terminal_status == "cancelled":
+        row.status = "cancelled"
+    else:
+        row.status = "failed"
     row.rcs_status = remote_terminal_status
     row.cancel_source = source
     row.cancel_reason = f"remote_status:{remote_terminal_status}"
@@ -118,41 +116,11 @@ def _finalize_cancel_return_undo(db, row: MovementOrder, *, previous_status: str
     row.updated_at = now
     row.release_source = source
     db.add(row)
-
-    if rack:
-        if active_other:
-            blocking = active_other[0]
-            logger.warning(
-                "RACK_RELEASE_BLOCKED_ACTIVE_ORDER rack_id=%s rack_code=%s attempted_order_id=%s blocking_order_id=%s blocking_dispatch_status=%s source=%s reason=%s",
-                rack.id,
-                rack.code,
-                row.id,
-                blocking.id,
-                blocking.status,
-                source,
-                f"remote_status:{remote_terminal_status}",
-            )
-            apply_rack_reservation_status(rack, True, updated_at=now, order_id=blocking.id, dispatch_status=blocking.status, source=source, reason="active_order_same_rack")
-            db.add(rack)
-            _append_monitor_debug_event(
-                db,
-                payload={"action": "rack_release_skipped", "source": source, "rack_id": rack.id, "rack_code": rack.code, "order_id": row.id, "active_other_order_ids": [o.id for o in active_other], "at": now.isoformat()},
-                message=f"[RACK RELEASE] omitido rack_id={rack.id} tiene otra orden activa",
-                created_at=now,
-            )
-        else:
-            if (rack.status or "").strip().lower() != "available":
-                apply_rack_reservation_status(rack, False, updated_at=now, order_id=row.id, dispatch_status=row.status, source=source, reason=f"remote_status:{remote_terminal_status}")
-                db.add(rack)
-            _append_monitor_debug_event(
-                db,
-                payload={"action": "rack_release", "source": source, "rack_id": rack.id, "rack_code": rack.code, "previous_status": old_rack_status, "new_status": rack.status, "related_order": row.id, "at": now.isoformat()},
-                message=f"[RACK RELEASE] rack_id={rack.id} source={source} related_order={row.id}",
-                created_at=now,
-            )
+    _ensure_rack_available(db, row, source=source)
+    rack = db.execute(select(Rack).where(Rack.id == row.rack_id)).scalar_one_or_none() if row.rack_id else None
 
     logger.info(
-        "CANCEL_UNDO_TERMINAL_CLOSE order_id=%s rack_id=%s rack_code=%s robot_code=%s previous_dispatch_status=%s new_dispatch_status=%s rcs_status=%s source=%s reason=%s",
+        "CANCEL_UNDO_TERMINAL_CLOSE order_id=%s rack_id=%s rack_code=%s robot_code=%s previous_dispatch_status=%s new_dispatch_status=%s rcs_status=%s source=%s reason=%s cells_modified=false",
         row.id,
         row.rack_id,
         rack.code if rack else None,
@@ -175,8 +143,8 @@ def _finalize_cancel_return_undo(db, row: MovementOrder, *, previous_status: str
     )
     _append_monitor_debug_event(
         db,
-        payload={"action": "cancel_order", "source": source, "order_id": row.id, "order_code": row.order_code, "previous_status": previous_status, "new_status": row.status, "admin": source, "reason": f"remote_status:{remote_terminal_status}", "at": now.isoformat()},
-        message=f"[CANCEL ORDER] order_id={row.id} source={source} reason=remote_status:{remote_terminal_status}",
+        payload={"action": "cancel_order", "source": source, "order_id": row.id, "order_code": row.order_code, "previous_status": previous_status, "new_status": row.status, "admin": source, "reason": f"remote_status:{remote_terminal_status}", "cells_modified": False, "at": now.isoformat()},
+        message=f"[CANCEL ORDER] order_id={row.id} source={source} reason=remote_status:{remote_terminal_status} cells_modified=false",
         created_at=now,
     )
     if auto_commit:

@@ -17,10 +17,17 @@ logger = get_logger("app.rcs_client")
 
 
 def _safe_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    safe = dict(payload or {})
-    for key in ("tokenCode", "password", "secret"):
-        if key in safe and safe[key]:
+    safe = {}
+    for key, value in dict(payload or {}).items():
+        key_text = str(key or "").strip().lower()
+        if (key_text == "key" or any(fragment in key_text for fragment in ("password", "token", "authorization", "auth_header", "secret", "api_key", "apikey"))) and value:
             safe[key] = "[REDACTED]"
+        elif isinstance(value, dict):
+            safe[key] = _safe_payload(value)
+        elif isinstance(value, list):
+            safe[key] = [_safe_payload(item) if isinstance(item, dict) else item for item in value]
+        else:
+            safe[key] = value
     return safe
 
 
@@ -382,7 +389,7 @@ class RcsClient:
         data = self._safe_json(resp)
         _log_empty_data("queryAgvStatus", endpoint, payload, data)
         logger.info("RCS request success | endpoint=%s | robot=%s | status=%s | response_code=%s", endpoint, context["robot"] or "-", resp.status_code, _response_code(data) or "-")
-        logger.info("RCS queryAgvStatus response body=%s", data)
+        logger.info("RCS queryAgvStatus response body=%s", _safe_payload(data))
         return data
 
 

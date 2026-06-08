@@ -22,7 +22,7 @@ import zipfile
 from pathlib import PurePosixPath
 
 from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select, func, delete, text
@@ -75,12 +75,27 @@ NO_MATERIAL_COLOR = "#94a3b8"
 RACK_RESERVATION_ACTIVE_STATUSES = ("pending_dispatch", "dispatched", "in_progress", "cancel_requested_total", "cancel_requested_undo")
 logger = get_logger("app.main")
 SOFTWARE_UPDATE_LOCK = threading.Lock()
+SOFTWARE_BUILD_INFO_REL_PATH = "static/build_info.json"
 RACK_POSITION_POLL_INTERVAL_SECONDS = 10
 RACK_POSITION_POLL_TIMEOUT_SECONDS = 10 * 60
 _rack_position_poll_lock = threading.Lock()
 _rack_position_poll_active: set[tuple[int, int]] = set()
 CANCEL_REQUEST_STATUSES = {"cancel_requested_total", "cancel_requested_undo"}
 CANCEL_RETURN_RCS_TERMINAL_STATUSES = {"cancelled", "completed"}
+CLEANUP_RCS_TERMINAL_STATUS_MAP = {
+    "completed": "completed",
+    "done": "completed",
+    "success": "completed",
+    "cancelled": "cancelled",
+    "canceled": "cancelled",
+    "failed": "failed",
+    "aborted": "failed",
+    "terminated": "failed",
+}
+
+
+def _app_root() -> str:
+    return os.path.dirname(os.path.abspath(__file__))
 STUCK_CANCEL_RETURN_AUTO_RELEASE_INTERVAL_SECONDS = 30
 _stuck_cancel_return_auto_release_lock = threading.Lock()
 _stuck_cancel_return_auto_release_last_ts = 0.0
@@ -355,6 +370,7 @@ class SoftwareUpdateApplyOut(BaseModel):
     applied_files: List[str] = []
     skipped_files: List[str] = []
     backup_path: str = ""
+    build_info: dict = {}
     rollback: bool = False
     warnings: List[str] = []
     errors: List[str] = []
@@ -369,6 +385,7 @@ class SoftwareUpdateRestartOut(BaseModel):
     service: str = ""
     command: str = ""
     message: str = ""
+    diagnostics: dict = {}
     errors: List[str] = []
 
 
@@ -1705,7 +1722,7 @@ def _audit_order_close(
     auto_commit: bool = False,
 ):
     now = closed_at or datetime.utcnow()
-    if new_status in {"completed", "cancelled", "undone"}:
+    if new_status in {"completed", "cancelled", "undone", "failed"}:
         order.status = new_status
         if str(order.rcs_status or "").strip().lower() not in {"completed", "cancelled", "undone"}:
             order.rcs_status = new_status
@@ -2511,8 +2528,18 @@ def _dispatch_movement_order(db, row: MovementOrder) -> MovementOrderDispatchOut
         return _movement_order_dispatch_out(row)
 
 
+class NoCacheStaticFiles(StaticFiles):
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        if path.endswith((".js", ".css", ".json", ".html")):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+        return response
+
+
 app = FastAPI(title="AGV Orders App")
-app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/static", NoCacheStaticFiles(directory=os.path.join(_app_root(), "static")), name="static")
 app.state.task_monitor = TaskMonitor(interval_seconds=3)
 
 
@@ -2596,7 +2623,23 @@ def on_shutdown():
 
 @app.get("/")
 def root():
-    return FileResponse("static/index.html")
+    index_path = os.path.join(_app_root(), "static", "index.html")
+    build_id = _software_build_id()
+    build_script = f'<script>window.APP_BUILD_ID="{build_id}";console.log("APP_BUILD_ID","{build_id}");</script>'
+    try:
+        with open(index_path, "r", encoding="utf-8") as f:
+            html = f.read()
+        html = re.sub(r'href="/static/styles\.css(?:\?v=[^"]*)?"', f'href="/static/styles.css?v={build_id}"', html)
+        html = re.sub(r'src="/static/app\.js(?:\?v=[^"]*)?"', f'src="/static/app.js?v={build_id}"', html)
+        if "window.APP_BUILD_ID" in html:
+            html = re.sub(r"<script>window\.APP_BUILD_ID=.*?</script>", build_script, html, flags=re.DOTALL)
+        else:
+            html = html.replace("</head>", f"{build_script}</head>")
+        headers = {"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache", "Expires": "0"}
+        return HTMLResponse(html, headers=headers)
+    except Exception:
+        logger.exception("Failed to render versioned index.html build_id=%s path=%s", build_id, index_path)
+        return FileResponse(index_path, headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"})
 
 
 @app.get("/api/logs/download")
@@ -2814,11 +2857,11 @@ def _zip_entry_is_symlink_or_special(info: zipfile.ZipInfo) -> Optional[str]:
 
 
 def _software_update_staging_root() -> str:
-    return os.path.abspath(os.path.join("updates", "staging"))
+    return os.path.abspath(os.path.join(_app_root(), "updates", "staging"))
 
 
 def _software_update_latest_metadata_path() -> str:
-    return os.path.abspath(os.path.join("updates", "latest_validated.json"))
+    return os.path.abspath(os.path.join(_app_root(), "updates", "latest_validated.json"))
 
 
 def _software_update_validation_metadata_path(staging_dir: str) -> str:
@@ -2881,6 +2924,58 @@ def _read_json_file(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     return data if isinstance(data, dict) else {}
+
+
+def _software_build_info_path(root_dir: Optional[str] = None) -> str:
+    return os.path.abspath(os.path.join(root_dir or _app_root(), SOFTWARE_BUILD_INFO_REL_PATH))
+
+
+def _read_software_build_info(root_dir: Optional[str] = None) -> dict:
+    path = _software_build_info_path(root_dir)
+    if not os.path.exists(path):
+        return {}
+    try:
+        return _read_json_file(path)
+    except Exception:
+        return {}
+
+
+def _software_build_id(root_dir: Optional[str] = None) -> str:
+    info = _read_software_build_info(root_dir)
+    build_id = str(info.get("build_id") or info.get("applied_at") or "").strip()
+    if build_id:
+        return re.sub(r"[^A-Za-z0-9_.:-]", "", build_id)[:80] or "unknown"
+    try:
+        mtimes = []
+        base = root_dir or _app_root()
+        for rel_path in ("main.py", "monitor_service.py", "fifo_service.py", "models.py", "rcs_client.py", "static/app.js", "static/styles.css", "static/index.html"):
+            path = os.path.join(base, rel_path)
+            if os.path.exists(path):
+                mtimes.append(os.path.getmtime(path))
+        if mtimes:
+            return datetime.utcfromtimestamp(max(mtimes)).strftime("%Y%m%d%H%M%S")
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _write_software_build_info(root_dir: str, *, build_id: str, applied_files: List[str], backup_path: str, staging_id: str = "", staging_dir: str = "") -> dict:
+    info = {
+        "build_id": build_id,
+        "applied_at": datetime.utcnow().isoformat() + "Z",
+        "app_root": os.path.abspath(root_dir),
+        "main_file": os.path.abspath(__file__),
+        "pid": os.getpid(),
+        "staging_id": staging_id,
+        "staging_dir": os.path.abspath(staging_dir) if staging_dir else "",
+        "backup_path": os.path.abspath(backup_path) if backup_path else "",
+        "applied_files": list(applied_files),
+    }
+    path = _software_build_info_path(root_dir)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(info, f, ensure_ascii=False, indent=2)
+    return info
 
 
 def _resolve_validated_software_staging(staging_id: Optional[str]) -> tuple[str, dict]:
@@ -3075,7 +3170,7 @@ def _run_systemctl_check(args: List[str]) -> subprocess.CompletedProcess:
 
 
 def _resolve_restart_script(script_name: str) -> str:
-    app_root = os.path.abspath(".")
+    app_root = _app_root()
     script_path = os.path.abspath(script_name if os.path.isabs(script_name) else os.path.join(app_root, script_name))
     if os.path.commonpath([app_root, script_path]) != app_root:
         raise ValueError("script fuera del directorio de la app")
@@ -3144,7 +3239,7 @@ async def admin_validate_software_update(file: UploadFile = File(...), x_admin_t
 
     timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
     staging_id = timestamp
-    staging_dir = os.path.abspath(os.path.join("updates", "staging", timestamp))
+    staging_dir = os.path.abspath(os.path.join(_software_update_staging_root(), timestamp))
     os.makedirs(staging_dir, exist_ok=True)
 
     try:
@@ -3303,7 +3398,7 @@ def admin_apply_software_update(body: Optional[SoftwareUpdateApplyIn] = None, x_
         return SoftwareUpdateApplyOut(ok=False, errors=["Ya hay una operacion de actualizacion en curso."])
     body = body or SoftwareUpdateApplyIn()
     try:
-        app_root = os.path.abspath(".")
+        app_root = _app_root()
         applied_files: List[str] = []
         skipped_files: List[str] = []
         warnings: List[str] = []
@@ -3311,6 +3406,7 @@ def admin_apply_software_update(body: Optional[SoftwareUpdateApplyIn] = None, x_
         rollback = False
         backup_path = ""
         staging_dir = ""
+        build_info: dict = {}
 
         try:
             staging_dir, metadata = _resolve_validated_software_staging(body.staging_id)
@@ -3319,6 +3415,16 @@ def admin_apply_software_update(body: Optional[SoftwareUpdateApplyIn] = None, x_
         except Exception as exc:
             logger.exception("[SOFTWARE UPDATE] source=admin_upload result=fail reason=resolve_staging")
             raise HTTPException(status_code=400, detail=f"no se pudo resolver staging validado: {exc}")
+
+        logger.info(
+            "[SOFTWARE UPDATE] apply_start cwd=%s main_file=%s app_root=%s pid=%s staging_id=%s staging_dir=%s",
+            os.getcwd(),
+            os.path.abspath(__file__),
+            app_root,
+            os.getpid(),
+            body.staging_id or "",
+            staging_dir,
+        )
 
         required_errors = []
         if not os.path.exists(os.path.join(staging_dir, "main.py")):
@@ -3384,6 +3490,22 @@ def admin_apply_software_update(body: Optional[SoftwareUpdateApplyIn] = None, x_
                         if f.read() != old_requirements:
                             warnings.append("requirements.txt cambio; instalacion manual o fase posterior requerida.")
 
+            build_id = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+            build_info_path = _software_build_info_path(app_root)
+            existed_before[SOFTWARE_BUILD_INFO_REL_PATH] = os.path.exists(build_info_path)
+            if not existed_before[SOFTWARE_BUILD_INFO_REL_PATH]:
+                created_files.append(SOFTWARE_BUILD_INFO_REL_PATH)
+            if SOFTWARE_BUILD_INFO_REL_PATH not in applied_files:
+                applied_files.append(SOFTWARE_BUILD_INFO_REL_PATH)
+            build_info = _write_software_build_info(
+                app_root,
+                build_id=build_id,
+                applied_files=applied_files,
+                backup_path=backup_path,
+                staging_id=str(metadata.get("staging_id") or body.staging_id or ""),
+                staging_dir=staging_dir,
+            )
+
             compile_ok, compile_warnings, compile_errors = _run_app_py_compile(app_root)
             warnings.extend(compile_warnings)
             if not compile_ok:
@@ -3396,6 +3518,7 @@ def admin_apply_software_update(body: Optional[SoftwareUpdateApplyIn] = None, x_
                     applied_files=applied_files,
                     skipped_files=skipped_files,
                     backup_path=backup_path,
+                    build_info=build_info,
                     rollback=True,
                     warnings=warnings,
                     errors=errors,
@@ -3411,17 +3534,31 @@ def admin_apply_software_update(body: Optional[SoftwareUpdateApplyIn] = None, x_
                 applied_files=applied_files,
                 skipped_files=skipped_files,
                 backup_path=backup_path,
+                build_info=build_info,
                 rollback=True,
                 warnings=warnings,
                 errors=errors,
             )
 
-        logger.info("[SOFTWARE UPDATE] source=admin_upload staging_dir=%s backup=%s result=success applied=%s skipped=%s warnings=%s duration_ms=%s", staging_dir, backup_path, len(applied_files), len(skipped_files), len(warnings), int((time.monotonic() - started) * 1000))
+        logger.info(
+            "[SOFTWARE UPDATE] source=admin_upload staging_dir=%s app_root=%s main_file=%s pid=%s backup=%s build_id=%s result=success applied=%s skipped=%s warnings=%s duration_ms=%s",
+            staging_dir,
+            app_root,
+            os.path.abspath(__file__),
+            os.getpid(),
+            backup_path,
+            build_info.get("build_id", ""),
+            len(applied_files),
+            len(skipped_files),
+            len(warnings),
+            int((time.monotonic() - started) * 1000),
+        )
         return SoftwareUpdateApplyOut(
             ok=True,
             applied_files=applied_files,
             skipped_files=skipped_files,
             backup_path=backup_path,
+            build_info=build_info,
             rollback=rollback,
             warnings=warnings,
             errors=errors,
@@ -3434,12 +3571,43 @@ def _schedule_software_restart() -> SoftwareUpdateRestartOut:
     current_os = platform.system()
     configured_mode, service_name, script_name = _software_restart_config()
     mode, detected_message = _detect_software_restart_mode(configured_mode, current_os, service_name, script_name)
+    app_root = _app_root()
     service_command = f"systemctl restart {service_name} --no-block"
+    diagnostics = {
+        "cwd": os.getcwd(),
+        "main_file": os.path.abspath(__file__),
+        "app_root": app_root,
+        "pid": os.getpid(),
+        "configured_mode": configured_mode,
+        "detected_mode": mode,
+        "os": current_os,
+    }
+    logger.info(
+        "[SOFTWARE UPDATE RESTART] cwd=%s main_file=%s app_root=%s pid=%s os=%s configured_mode=%s detected_mode=%s",
+        diagnostics["cwd"],
+        diagnostics["main_file"],
+        diagnostics["app_root"],
+        diagnostics["pid"],
+        current_os,
+        configured_mode,
+        mode,
+    )
 
     if mode == "disabled":
         message = detected_message or "Reinicio automático deshabilitado. Reinicia manualmente la aplicación."
-        logger.info("[SOFTWARE UPDATE RESTART] os=%s configured_mode=%s detected_mode=%s result=disabled", current_os, configured_mode, mode)
-        return SoftwareUpdateRestartOut(ok=True, mode=mode, configured_mode=configured_mode, detected_mode=mode, os=current_os, service=service_name, command="", message=message)
+        logger.warning(
+            "[SOFTWARE UPDATE RESTART] cwd=%s main_file=%s app_root=%s pid=%s os=%s configured_mode=%s detected_mode=%s command=%s result=disabled message=%s",
+            diagnostics["cwd"],
+            diagnostics["main_file"],
+            diagnostics["app_root"],
+            diagnostics["pid"],
+            current_os,
+            configured_mode,
+            mode,
+            "",
+            message,
+        )
+        return SoftwareUpdateRestartOut(ok=False, mode=mode, configured_mode=configured_mode, detected_mode=mode, os=current_os, service=service_name, command="", message=message, diagnostics=diagnostics, errors=[message])
 
     try:
         if current_os == "Linux":
@@ -3487,21 +3655,24 @@ def _schedule_software_restart() -> SoftwareUpdateRestartOut:
                     command=service_command,
                     errors=[f"No se pudo reiniciar. Configure permisos del servicio o use modo disabled. {detail}".strip()],
                 )
-            logger.info("[SOFTWARE UPDATE RESTART] os=%s mode=systemd service=%s result=scheduled", current_os, service_name)
+            diagnostics["command"] = service_command
+            logger.info("[SOFTWARE UPDATE RESTART] cwd=%s main_file=%s app_root=%s pid=%s os=%s mode=systemd service=%s command=%s result=scheduled", diagnostics["cwd"], diagnostics["main_file"], diagnostics["app_root"], diagnostics["pid"], current_os, service_name, service_command)
             return SoftwareUpdateRestartOut(ok=True, mode=mode, configured_mode=configured_mode, detected_mode=mode, os=current_os, service=service_name, command=service_command, message="Se solicitó reinicio por systemd.")
 
         if current_os == "Windows":
             if mode != "windows_script":
-                return SoftwareUpdateRestartOut(ok=False, mode=mode, configured_mode=configured_mode, detected_mode=mode, os=current_os, command=script_name, errors=["En Windows configure software_restart_mode=windows_script, auto o disabled."])
+                diagnostics["command"] = script_name
+                return SoftwareUpdateRestartOut(ok=False, mode=mode, configured_mode=configured_mode, detected_mode=mode, os=current_os, command=script_name, diagnostics=diagnostics, errors=["En Windows configure software_restart_mode=windows_script, auto o disabled."])
             script_path = _resolve_restart_script(script_name)
+            diagnostics["command"] = script_path
             subprocess.Popen(
                 ["cmd", "/c", "start", "", script_path, str(os.getpid())],
-                cwd=os.path.abspath("."),
+                cwd=app_root,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 close_fds=True,
             )
-            logger.info("[SOFTWARE UPDATE RESTART] os=%s mode=windows_script script=%s result=scheduled", current_os, script_path)
+            logger.info("[SOFTWARE UPDATE RESTART] cwd=%s main_file=%s app_root=%s pid=%s os=%s mode=windows_script command=%s result=scheduled", diagnostics["cwd"], diagnostics["main_file"], diagnostics["app_root"], diagnostics["pid"], current_os, script_path)
             return SoftwareUpdateRestartOut(ok=True, mode=mode, configured_mode=configured_mode, detected_mode=mode, os=current_os, command=script_path, message="La aplicación se reiniciará automáticamente.")
 
         return SoftwareUpdateRestartOut(ok=False, mode=mode, configured_mode=configured_mode, detected_mode=mode, os=current_os, errors=["Sistema operativo no soportado. Use modo disabled."])
@@ -3528,7 +3699,17 @@ def admin_restart_after_software_update(x_admin_token: Optional[str] = Header(de
 
 @app.get("/api/health")
 def health_check():
-    return {"ok": True, "status": "ok", "time": datetime.utcnow().isoformat()}
+    return {
+        "ok": True,
+        "status": "ok",
+        "time": datetime.utcnow().isoformat(),
+        "pid": os.getpid(),
+        "cwd": os.getcwd(),
+        "main_file": os.path.abspath(__file__),
+        "app_root": _app_root(),
+        "build_info": _read_software_build_info(),
+        "build_id": _software_build_id(),
+    }
 
 
 @app.get("/api/admin/client-ip", response_model=ClientIPOut)
@@ -5568,8 +5749,9 @@ def _validate_cleanup_order_eligible(db, order: MovementOrder, *, now: datetime,
     allowed_statuses = {"cancel_requested_undo", "cancel_requested_total", "dispatched"}
     if (order.status or "") not in allowed_statuses:
         return False, "status no elegible"
-    if str(order.rcs_status or "").strip().lower() != "cancelled":
-        return False, "rcs_status no es cancelled"
+    rcs_status = str(order.rcs_status or "").strip().lower()
+    if rcs_status not in CANCEL_RETURN_RCS_TERMINAL_STATUSES:
+        return False, "rcs_status no es completed/cancelled"
     created_at = order.created_at or order.updated_at or now
     if created_at > now - timedelta(minutes=min_age_minutes):
         return False, f"menor a {min_age_minutes} minutos"
@@ -5577,7 +5759,9 @@ def _validate_cleanup_order_eligible(db, order: MovementOrder, *, now: datetime,
         return False, "movimiento activo"
     if _robot_monitor_indicates_order_running(order):
         return False, "AGV ejecutando la orden"
-    return True, ""
+    if (order.status or "") == "cancel_requested_undo":
+        return True, "SAFE_CANCEL_COMPLETED"
+    return True, f"SAFE_RCS_{rcs_status.upper()}"
 
 
 def _rack_safe_to_release_after_cleanup(db, rack_id: int, closed_order_id: int, *, now: datetime, min_age_minutes: int) -> tuple[bool, str]:
@@ -5726,10 +5910,19 @@ def _cancel_return_recovery_eligible(order: MovementOrder, *, now: datetime, min
     return True, "Cancelacion con regreso finalizada por RCS; robot idle o sin tarea activa."
 
 
+def _normalized_cleanup_rcs_terminal_status(value) -> str:
+    return CLEANUP_RCS_TERMINAL_STATUS_MAP.get(str(value or "").strip().lower(), "")
+
+
 def _validate_force_release_order(order: MovementOrder, *, now: datetime, min_age_minutes: int) -> tuple[bool, str]:
     cutoff = now - timedelta(minutes=min_age_minutes)
     if (order.status or "") not in RACK_RESERVATION_ACTIVE_STATUSES:
         return False, f"orden no activa ID {order.id}"
+    if _normalized_cleanup_rcs_terminal_status(order.rcs_status):
+        return True, "SAFE_RCS_TERMINAL"
+    created_at = order.created_at or order.updated_at or now
+    if created_at > cutoff:
+        return False, f"No se puede liberar: orden activa reciente ID {order.id}."
     if (order.status or "") == "cancel_requested_undo":
         eligible, reason = _cancel_undo_recovery_candidate(None, order, now=now, min_age_minutes=min_age_minutes)
         return eligible, reason
@@ -5742,9 +5935,6 @@ def _validate_force_release_order(order: MovementOrder, *, now: datetime, min_ag
         if _robot_monitor_indicates_order_running(order):
             return False, f"No se puede liberar: AGV ejecutando cancelacion ID {order.id}."
         return True, ""
-    created_at = order.created_at or order.updated_at or now
-    if created_at > cutoff:
-        return False, f"No se puede liberar: orden activa reciente ID {order.id}."
     recent_at = _recent_order_activity_at(order)
     if recent_at and recent_at > cutoff:
         return False, f"No se puede liberar: orden con actualización reciente ID {order.id}."
@@ -5754,12 +5944,12 @@ def _validate_force_release_order(order: MovementOrder, *, now: datetime, min_ag
 def _force_close_old_active_order(db, order: MovementOrder, *, now: datetime, admin_user: str) -> dict:
     old_status = order.status or ""
     rcs_status = str(order.rcs_status or "").strip().lower()
+    normalized_rcs_terminal = _normalized_cleanup_rcs_terminal_status(rcs_status)
     is_confirmed_cancel_return = old_status == "cancel_requested_undo" and rcs_status in CANCEL_RETURN_RCS_TERMINAL_STATUSES
     is_confirmed_cancel_request = old_status == "cancel_requested_total" and rcs_status == "cancelled"
     if is_confirmed_cancel_return:
-        # cancel_return stuck: RCS already cancelled, so finish with the same terminal states used by the monitor.
-        order.status = "undone"
-        order.rcs_status = rcs_status
+        order.status = normalized_rcs_terminal
+        order.rcs_status = normalized_rcs_terminal
         order.dispatch_status = order.dispatch_status or "success"
         order.forced_local_close_reason = "admin_force_release_cancel_return_terminal"
         order.rcs_message = ((order.rcs_message or "").strip() + " | Cierre local por recuperacion avanzada de cancelacion con regreso finalizada por RCS.").strip(" |")[:512]
@@ -5769,18 +5959,24 @@ def _force_close_old_active_order(db, order: MovementOrder, *, now: datetime, ad
         order.dispatch_status = order.dispatch_status or "success"
         order.forced_local_close_reason = "admin_force_release_cancelled_cancel_request"
         order.rcs_message = ((order.rcs_message or "").strip() + " | Cierre local por recuperacion avanzada de cancelacion confirmada.").strip(" |")[:512]
-    elif rcs_status == "completed":
+    elif normalized_rcs_terminal == "completed":
         order.status = "completed"
         order.rcs_status = "completed"
         order.dispatch_status = order.dispatch_status or "success"
         order.forced_local_close_reason = "admin_force_release_rcs_completed"
         order.rcs_message = ((order.rcs_message or "").strip() + " | Cierre local por recuperacion avanzada: RCS ya confirmo completed.").strip(" |")[:512]
-    elif rcs_status == "cancelled":
+    elif normalized_rcs_terminal == "cancelled":
         order.status = "cancelled"
         order.rcs_status = "cancelled"
         order.dispatch_status = order.dispatch_status or "success"
         order.forced_local_close_reason = "admin_force_release_rcs_cancelled"
         order.rcs_message = ((order.rcs_message or "").strip() + " | Cierre local por recuperacion avanzada: RCS ya confirmo cancelled.").strip(" |")[:512]
+    elif normalized_rcs_terminal == "failed":
+        order.status = "failed"
+        order.rcs_status = "failed"
+        order.dispatch_status = order.dispatch_status or "success"
+        order.forced_local_close_reason = "admin_force_release_rcs_failed"
+        order.rcs_message = ((order.rcs_message or "").strip() + " | Cierre local por recuperacion avanzada: RCS ya confirmo failed.").strip(" |")[:512]
     else:
         order.status = "forced_local_closed"
         order.rcs_status = "unknown_or_not_found"
@@ -5805,7 +6001,7 @@ def _force_close_old_active_order(db, order: MovementOrder, *, now: datetime, ad
     if old_status == "cancel_requested_undo":
         rack = db.execute(select(Rack).where(Rack.id == order.rack_id)).scalar_one_or_none() if order.rack_id else None
         logger.info(
-            "CANCEL_UNDO_TERMINAL_CLOSE order_id=%s rack_id=%s rack_code=%s robot_code=%s previous_dispatch_status=%s new_dispatch_status=%s rcs_status=%s source=%s reason=%s",
+            "CANCEL_UNDO_TERMINAL_CLOSE order_id=%s rack_id=%s rack_code=%s robot_code=%s previous_dispatch_status=%s new_dispatch_status=%s rcs_status=%s source=%s reason=%s cells_modified=false",
             order.id,
             order.rack_id,
             rack.code if rack else None,
@@ -5920,13 +6116,13 @@ def _annotate_cleanup_safety(db, diagnosis: dict) -> dict:
         order = db.execute(select(MovementOrder).where(MovementOrder.id == int(row.get("order_id") or 0))).scalar_one_or_none()
         safe, reason = _validate_cleanup_order_eligible(db, order, now=now, min_age_minutes=min_age_minutes) if order else (False, "orden no encontrada")
         row["safe"] = bool(safe)
-        row["safe_reason"] = "" if safe else reason
+        row["safe_reason"] = reason
 
     for row in diagnosis.get("active_order_available_racks", []) or []:
         order = db.execute(select(MovementOrder).where(MovementOrder.id == int(row.get("order_id") or 0))).scalar_one_or_none()
         safe, reason = _validate_cleanup_order_eligible(db, order, now=now, min_age_minutes=min_age_minutes) if order else (False, "orden no encontrada")
         row["safe"] = bool(safe)
-        row["safe_reason"] = "" if safe else reason
+        row["safe_reason"] = reason
     return diagnosis
 
 
@@ -5975,7 +6171,7 @@ def _run_cleanup_diagnosis(db) -> dict:
             mo.updated_at
         FROM movement_orders mo
         LEFT JOIN racks r ON r.id = mo.rack_id
-        WHERE lower(trim(coalesce(mo.rcs_status, ''))) = 'cancelled'
+        WHERE lower(trim(coalesce(mo.rcs_status, ''))) IN ('completed', 'cancelled')
           AND mo.status IN ('cancel_requested_undo', 'cancel_requested_total', 'dispatched')
         ORDER BY mo.id
         """,
@@ -6036,8 +6232,9 @@ def _run_cleanup_diagnosis(db) -> dict:
     for order, rack in active_order_rows:
         created_at = order.created_at or order.updated_at or now
         age_minutes = max(0, int((now - created_at).total_seconds() // 60))
+        terminal_rcs_status = _normalized_cleanup_rcs_terminal_status(order.rcs_status)
         safe, safe_reason = _validate_force_release_order(order, now=now, min_age_minutes=force_min_age_minutes)
-        if safe and (order.status or "") in CANCEL_REQUEST_STATUSES:
+        if safe and not terminal_rcs_status and (order.status or "") in CANCEL_REQUEST_STATUSES:
             if (order.status or "") != "cancel_requested_undo" and not rack_status_is_reserved(rack.status or ""):
                 safe = False
                 safe_reason = "rack no esta reservado"
@@ -6045,7 +6242,7 @@ def _run_cleanup_diagnosis(db) -> dict:
             if safe and active_other:
                 safe = False
                 safe_reason = "otra orden activa asociada al mismo rack"
-        if safe and (order.status or "") not in CANCEL_REQUEST_STATUSES and rack.last_moved_at and rack.last_moved_at > (now - timedelta(minutes=force_min_age_minutes)):
+        if safe and not terminal_rcs_status and (order.status or "") not in CANCEL_REQUEST_STATUSES and rack.last_moved_at and rack.last_moved_at > (now - timedelta(minutes=force_min_age_minutes)):
             safe = False
             safe_reason = "rack con movimiento reciente"
         old_active_racks.append({
@@ -6057,7 +6254,8 @@ def _run_cleanup_diagnosis(db) -> dict:
             "age_minutes": age_minutes,
             "recovery_case": "cancel_return_stuck" if (order.status or "") == "cancel_requested_undo" and str(order.rcs_status or "").strip().lower() in CANCEL_RETURN_RCS_TERMINAL_STATUSES else "old_active_order",
             "safe": bool(safe),
-            "safe_reason": safe_reason if safe and (order.status or "") == "cancel_requested_undo" else ("" if safe else safe_reason),
+            "safe_reason": safe_reason,
+            "motivo": "RCS terminal confirmado" if safe_reason == "SAFE_RCS_TERMINAL" else safe_reason,
         })
     cancel_undo_auto_enabled = _cancel_undo_auto_recovery_enabled(db)
     cancel_undo_min_age = _cancel_undo_auto_recovery_min_age_minutes(db)
@@ -6172,7 +6370,7 @@ def cleanup_close_inconsistent_orders(body: CleanupSelectionIn, x_admin_token: O
                 select(MovementOrder).where(
                     MovementOrder.id.in_(order_ids),
                     MovementOrder.status.in_(("cancel_requested_undo", "cancel_requested_total", "dispatched")),
-                    func.lower(func.trim(func.coalesce(MovementOrder.rcs_status, ""))) == "cancelled",
+                    func.lower(func.trim(func.coalesce(MovementOrder.rcs_status, ""))).in_(CANCEL_RETURN_RCS_TERMINAL_STATUSES),
                 ).order_by(MovementOrder.id.asc())
             ).scalars().all()
             found_order_ids = {order.id for order in candidates}
@@ -6237,7 +6435,7 @@ def cleanup_resolve_inconsistent_racks(body: CleanupSelectionIn, x_admin_token: 
                     select(MovementOrder).where(
                         MovementOrder.rack_id == rack_id,
                         MovementOrder.status.in_(("cancel_requested_undo", "cancel_requested_total", "dispatched")),
-                        func.lower(func.trim(func.coalesce(MovementOrder.rcs_status, ""))) == "cancelled",
+                        func.lower(func.trim(func.coalesce(MovementOrder.rcs_status, ""))).in_(CANCEL_RETURN_RCS_TERMINAL_STATUSES),
                     ).order_by(MovementOrder.id.asc())
                 ).scalars().first()
                 if not order:
@@ -6292,6 +6490,9 @@ def force_release_old_active_racks(body: CleanupSelectionIn, x_admin_token: Opti
             if not active_orders:
                 skipped.append({"rack_id": rack_id, "rack_code": rack.code, "reason": "rack sin orden activa asociada"})
                 continue
+            if len(active_orders) > 1:
+                skipped.append({"rack_id": rack_id, "rack_code": rack.code, "reason": "No se puede liberar: existe otra orden activa asociada al mismo rack."})
+                continue
 
             confirmed_cancel_requests = [
                 order for order in active_orders
@@ -6305,8 +6506,9 @@ def force_release_old_active_racks(body: CleanupSelectionIn, x_admin_token: Opti
                 continue
 
             only_cancel_requests = all((order.status or "") in CANCEL_REQUEST_STATUSES for order in active_orders)
+            all_rcs_terminal = all(_normalized_cleanup_rcs_terminal_status(order.rcs_status) for order in active_orders)
             rack_recent_move = rack.last_moved_at and rack.last_moved_at > (now - timedelta(minutes=min_age_minutes))
-            if rack_recent_move:
+            if rack_recent_move and not all_rcs_terminal:
                 if not only_cancel_requests:
                     skipped.append({"rack_id": rack_id, "rack_code": rack.code, "reason": "No se puede liberar: rack con movimiento reciente."})
                     continue
@@ -6533,16 +6735,17 @@ def update_rack(rack_id: int, body: RackIn, x_admin_token: Optional[str] = Heade
                 previous_status,
                 rack_status_is_reserved(previous_status),
             )
-            logger.info(
-                "ADMIN_RACK_MANUAL_RELEASE_REQUEST rack_id=%s rack_code=%s requested_status=%s requested_reserved=%s current_status=%s current_reserved=%s",
-                row.id,
-                row.code,
-                rack_status_from_reservation(False),
-                False,
-                previous_status,
-                rack_status_is_reserved(previous_status),
-            )
-            _manual_release_rack_or_raise(db, row, actor="admin", reason="admin_rack_save_available")
+            if rack_status_is_reserved(previous_status):
+                logger.info(
+                    "ADMIN_RACK_MANUAL_RELEASE_REQUEST rack_id=%s rack_code=%s requested_status=%s requested_reserved=%s current_status=%s current_reserved=%s",
+                    row.id,
+                    row.code,
+                    rack_status_from_reservation(False),
+                    False,
+                    previous_status,
+                    True,
+                )
+                _manual_release_rack_or_raise(db, row, actor="admin", reason="admin_rack_save_available")
             requested_status = rack_status_from_reservation(False)
         else:
             logger.info(
@@ -6595,7 +6798,7 @@ def update_rack_reservation(rack_id: int, body: RackReservationIn, x_admin_token
             old_status,
             rack_status_is_reserved(old_status),
         )
-        if not should_reserve:
+        if not should_reserve and rack_status_is_reserved(old_status):
             logger.info(
                 "ADMIN_RACK_MANUAL_RELEASE_REQUEST rack_id=%s rack_code=%s requested_status=%s requested_reserved=%s current_status=%s current_reserved=%s",
                 row.id,
@@ -6606,8 +6809,10 @@ def update_rack_reservation(rack_id: int, body: RackReservationIn, x_admin_token
                 rack_status_is_reserved(old_status),
             )
             closed_orders = _manual_release_rack_or_raise(db, row, actor="admin", reason="admin_rack_reservation_false", now=now)
-        else:
+        elif should_reserve:
             apply_rack_reservation_status(row, True, updated_at=now, source="admin_racks_manual", reason="admin_rack_reservation_true")
+            closed_orders = []
+        else:
             closed_orders = []
         db.add(row)
         _audit_rack_reservation_change(db, rack=row, previous_status=old_status, new_status=row.status, source="local_ui", reason="admin_rack_reservation_toggle", actor="admin", at=now, auto_commit=False)

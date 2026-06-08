@@ -1,4 +1,5 @@
 console.log("[startup] app.js cargado");
+console.log("APP_BUILD_ID", window.APP_BUILD_ID || "unknown");
 window.addEventListener("error", function(e) {
   console.error("[GLOBAL ERROR]", e.error || e.message);
 });
@@ -147,6 +148,7 @@ const diagnosisOrphanRacks = $("diagnosisOrphanRacks");
 const diagnosisInconsistentOrders = $("diagnosisInconsistentOrders");
 const diagnosisInconsistentRacks = $("diagnosisInconsistentRacks");
 const diagnosisOldActiveRacks = $("diagnosisOldActiveRacks");
+const diagnosisStuckCancelRecoverable = $("diagnosisStuckCancelRecoverable");
 const diagnosisInconsistentLocations = $("diagnosisInconsistentLocations");
 const diagnosisIntegrityCheck = $("diagnosisIntegrityCheck");
 const btnForceReleaseOldActiveRacks = $("btnForceReleaseOldActiveRacks");
@@ -236,6 +238,8 @@ const rcsTaskMonitorInterval = $("rcsTaskMonitorInterval");
 const rcsAgvMonitorInterval = $("rcsAgvMonitorInterval");
 const cleanupMinAgeMinutes = $("cleanupMinAgeMinutes");
 const forceReleaseMinAgeMinutes = $("forceReleaseMinAgeMinutes");
+const cancelUndoAutoRecoveryEnabled = $("cancelUndoAutoRecoveryEnabled");
+const cancelUndoAutoRecoveryMinAge = $("cancelUndoAutoRecoveryMinAge");
 const rcsEnableMapShortName = $("rcsEnableMapShortName");
 const rcsMapShortName = $("rcsMapShortName");
 const rcsEnableMapCode = $("rcsEnableMapCode");
@@ -2275,8 +2279,16 @@ function renderCleanupDiagnosis(data = {}) {
     { key: "order_status", label: "Status orden" },
     { key: "rcs_status", label: "RCS status" },
     { key: "age_minutes", label: "Edad (min)" },
-    { key: "safe_reason", label: "Motivo" },
+    { key: "motivo", label: "Motivo" },
   ], { type: "rack", section: "old-active-rack", idKey: "rack_id", emptyText: "Sin racks bloqueados por órdenes activas viejas." });
+  renderSelectableDiagnosisTable(diagnosisStuckCancelRecoverable, data.stuck_cancel_recoverable, [
+    { key: "order_id", label: "Orden ID" },
+    { key: "rack_id", label: "Rack ID" },
+    { key: "robot_code", label: "Robot" },
+    { key: "age_minutes", label: "Edad (min)" },
+    { key: "motivo_detectado", label: "Motivo" },
+    { key: "safe_recovery", label: "safe_recovery" },
+  ], { type: "rack", section: "old-active-rack", idKey: "rack_id", emptyText: "Sin cancelaciones atoradas recuperables." });
   renderDiagnosisTable(diagnosisInconsistentLocations, data.inconsistent_locations, [
     { key: "location_id", label: "Location ID" },
     { key: "x", label: "X" },
@@ -3152,6 +3164,8 @@ async function adminLoadRcsConfig() {
   if (rcsAgvMonitorInterval) rcsAgvMonitorInterval.value = String(Number(data.agv_monitor_interval_seconds ?? 5));
   if (cleanupMinAgeMinutes) cleanupMinAgeMinutes.value = String(Number(data.cleanup_min_age_minutes ?? 30));
   if (forceReleaseMinAgeMinutes) forceReleaseMinAgeMinutes.value = String(Number(data.force_release_min_age_minutes ?? 20));
+  if (cancelUndoAutoRecoveryEnabled) cancelUndoAutoRecoveryEnabled.value = String(Number(data.cancel_undo_auto_recovery_enabled ?? 1));
+  if (cancelUndoAutoRecoveryMinAge) cancelUndoAutoRecoveryMinAge.value = String(Number(data.cancel_undo_auto_recovery_min_age_minutes ?? 5));
   if (rcsEnableMapShortName) rcsEnableMapShortName.value = String(Number(data.enable_map_short_name ?? 1));
   if (rcsMapShortName) rcsMapShortName.value = data.map_short_name || 'AA';
   if (rcsEnableMapCode) rcsEnableMapCode.value = String(Number(data.enable_map_code ?? 0));
@@ -3180,6 +3194,8 @@ async function adminSaveRcsConfig() {
     agv_monitor_interval_seconds: safeNumberInput(rcsAgvMonitorInterval, 5),
     cleanup_min_age_minutes: Math.max(1, Math.round(safeNumberInput(cleanupMinAgeMinutes, 30))),
     force_release_min_age_minutes: Math.max(1, Math.round(safeNumberInput(forceReleaseMinAgeMinutes, 20))),
+    cancel_undo_auto_recovery_enabled: safeFlagValue(cancelUndoAutoRecoveryEnabled, 1),
+    cancel_undo_auto_recovery_min_age_minutes: Math.max(1, Math.round(safeNumberInput(cancelUndoAutoRecoveryMinAge, 5))),
     enable_map_short_name: safeFlagValue(rcsEnableMapShortName, 1),
     map_short_name: (rcsMapShortName?.value || '').trim() || 'AA',
     enable_map_code: safeFlagValue(rcsEnableMapCode, 0),
@@ -3501,8 +3517,9 @@ function renderOrdersList() {
     const active = order.order_id === selectedOrderId ? ' style="border-color:#60a5fa;background:rgba(96,165,250,.12);"' : '';
     const areaText = `${order.source_area_name || order.source_area_id} → ${order.destination_area_name || order.destination_area_id}`;
     const auditText = order.cancel_source ? `${order.status} · ${order.cancel_source}` : order.status;
-    const cancelTitle = order.can_undo ? 'Cancelar tarea' : historyOrderUnavailableReason(order);
-    const cancelDisabled = order.can_undo ? '' : ' disabled';
+    const canCancel = historyOrderCanCancel(order);
+    const cancelTitle = canCancel ? 'Cancelar tarea' : historyOrderUnavailableReason(order);
+    const cancelDisabled = canCancel ? '' : ' disabled';
     return `<div class="order-history-row">
       <button type="button" class="list-item order-list-main" data-order-id="${order.order_id}"${active}>
         <div><b>${order.order_code}</b></div>
@@ -3730,6 +3747,11 @@ function historyOrderUnavailableReason(order) {
   return '';
 }
 
+function historyOrderCanCancel(order) {
+  const status = String(order?.status || '').trim().toLowerCase();
+  return status !== 'completed' && !!order?.can_undo;
+}
+
 function renderSelectedOrderDetail(order) {
   if (!orderDetailBox) return;
   if (!order) {
@@ -3765,10 +3787,11 @@ function renderSelectedOrderDetail(order) {
     <div class="small"><b>Comentario:</b> ${order.comment || 'Sin comentario'}</div>
     <div class="small"><b>Creada:</b> ${new Date(order.created_at).toLocaleString()}</div>
   `;
+  const canCancel = historyOrderCanCancel(order);
   if (btnSimulateComplete) btnSimulateComplete.disabled = !order.can_simulate_complete;
-  if (btnUndoOrder) btnUndoOrder.disabled = !order.can_undo;
+  if (btnUndoOrder) btnUndoOrder.disabled = !canCancel;
   if (btnSimulateComplete) btnSimulateComplete.title = order.can_simulate_complete ? '' : unavailableReason;
-  if (btnUndoOrder) btnUndoOrder.title = order.can_undo ? '' : unavailableReason;
+  if (btnUndoOrder) btnUndoOrder.title = canCancel ? '' : unavailableReason;
   if (btnDeleteOrder) btnDeleteOrder.disabled = !adminToken;
 }
 
@@ -3828,6 +3851,8 @@ async function simulateSelectedOrderComplete() {
 
 async function undoSelectedOrder(returnAreaId = null, matterArea = '') {
   if (!selectedOrderId) throw new Error('Selecciona una tarea.');
+  const order = movementOrders.find(x => x.order_id === selectedOrderId) || null;
+  if (order && !historyOrderCanCancel(order)) throw new Error(historyOrderUnavailableReason(order) || 'Esta orden no permite cancelacion desde historial.');
   const body = returnAreaId ? { return_to_area: true, return_area_id: Number(returnAreaId), matter_area: matterArea || '' } : { return_to_area: true };
   const result = await fetchJson(API.movementOrderUndo(selectedOrderId), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   orderMsg.textContent = `Orden ${result.order_code} cancelada desde historial con cancelTask forceCancel=1 y reversa local del almacén. Nuevo estado: ${result.status}.`;
@@ -4620,6 +4645,8 @@ async function confirmOperatorActionModal() {
   if (actionModalContext.mode === 'history_undo') {
     const orderId = actionModalContext.orderId || selectedOrderId;
     if (!orderId) throw new Error('Selecciona una tarea.');
+    const order = movementOrders.find(x => x.order_id === orderId) || null;
+    if (order && !historyOrderCanCancel(order)) throw new Error(historyOrderUnavailableReason(order) || 'Esta orden no permite cancelacion desde historial.');
     const returnToArea = operatorCancelMode?.value === 'return_area';
     const returnAreaId = returnToArea && operatorCancelReturnArea?.value ? Number(operatorCancelReturnArea.value) : null;
     if (returnToArea && !returnAreaId) throw new Error('Selecciona el area de devolucion.');
@@ -4732,7 +4759,7 @@ function renderHistoryUndoPreviewText(order) {
 function openHistoryUndoModal(orderArg = null) {
   const order = orderArg || movementOrders.find(x => x.order_id === selectedOrderId) || null;
   if (!order) throw new Error('Selecciona una tarea.');
-  if (!order.can_undo) throw new Error(historyOrderUnavailableReason(order) || 'La tarea seleccionada no permite cancelar o deshacer.');
+  if (!historyOrderCanCancel(order)) throw new Error(historyOrderUnavailableReason(order) || 'La tarea seleccionada no permite cancelar o deshacer.');
   actionModalContext = { mode: 'history_undo', orderId: order.order_id };
   if (operatorActionModalTitle) operatorActionModalTitle.textContent = 'Confirmar cancelación / deshacer';
   if (btnOperatorActionConfirm) btnOperatorActionConfirm.textContent = 'Enviar';
