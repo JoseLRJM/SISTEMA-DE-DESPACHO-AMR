@@ -48,6 +48,7 @@ from models import (
     DB_GRID_H,
     DB_GRID_W,
     DebugConsoleEvent,
+    RackSyncEvent,
     Location,
     MaterialGroup,
     MovementOrder,
@@ -80,6 +81,9 @@ RACK_POSITION_POLL_INTERVAL_SECONDS = 10
 RACK_POSITION_POLL_TIMEOUT_SECONDS = 10 * 60
 _rack_position_poll_lock = threading.Lock()
 _rack_position_poll_active: set[tuple[int, int]] = set()
+RACK_SYNC_SCHEDULER_INTERVAL_SECONDS = 60
+_rack_sync_scheduler_stop_event = threading.Event()
+_rack_sync_scheduler_lock = threading.Lock()
 CANCEL_REQUEST_STATUSES = {"cancel_requested_total", "cancel_requested_undo"}
 CANCEL_RETURN_RCS_TERMINAL_STATUSES = {"cancelled", "completed"}
 CLEANUP_RCS_TERMINAL_STATUS_MAP = {
@@ -268,6 +272,10 @@ class RcsConfigIn(BaseModel):
     resume_robot_endpoint: str = Field(default="/rcms/services/rest/hikRpcService/resumeRobot", max_length=256)
     agv_status_endpoint: str = Field(default="/rcms-dps/rest/queryAgvStatus", max_length=256)
     pod_position_endpoint: str = Field(default="/rcms/services/rest/hikRpcService/queryPodPosition", max_length=256)
+    rack_sync_query_endpoint: str = Field(default="/rcms/services/rest/hikRpcService/queryPodBerthAndMat", max_length=256)
+    rack_sync_bind_endpoint: str = Field(default="/rcms/services/rest/hikRpcService/bindPodAndBerth", max_length=256)
+    rack_sync_schedule_enabled: int = Field(default=0, ge=0, le=1)
+    rack_sync_schedule_time: str = Field(default="12:00", max_length=5)
     task_monitor_interval_seconds: float = Field(default=3.0, ge=0.2, le=3600.0)
     agv_monitor_interval_seconds: float = Field(default=5.0, ge=0.2, le=3600.0)
     enable_map_short_name: int = Field(default=1, ge=0, le=1)
@@ -305,6 +313,7 @@ class RcsConfigIn(BaseModel):
         "enable_map_short_name",
         "enable_map_code",
         "enable_amr_monitor",
+        "rack_sync_schedule_enabled",
         "verify_tls",
         mode="before",
     )
@@ -314,6 +323,7 @@ class RcsConfigIn(BaseModel):
             "enable_map_short_name": 1,
             "enable_map_code": 0,
             "enable_amr_monitor": 1,
+            "rack_sync_schedule_enabled": 0,
             "verify_tls": 0,
         }
         if isinstance(v, bool):
@@ -331,11 +341,25 @@ class RcsConfigIn(BaseModel):
         except Exception:
             return defaults.get(info.field_name, 0)
 
+    @field_validator("rack_sync_schedule_time", mode="before")
+    @classmethod
+    def _coerce_rack_sync_schedule_time(cls, value):
+        text = str(value or "12:00").strip()
+        if not re.fullmatch(r"\d{1,2}:\d{2}", text):
+            raise ValueError("rack_sync_schedule_time debe tener formato HH:MM")
+        hour_text, minute_text = text.split(":", 1)
+        hour = int(hour_text)
+        minute = int(minute_text)
+        if hour > 23 or minute > 59:
+            raise ValueError("rack_sync_schedule_time debe estar entre 00:00 y 23:59")
+        return f"{hour:02d}:{minute:02d}"
+
 
 class RcsConfigOut(RcsConfigIn):
     resolved_base_url: str = ""
     resolved_token_code: str = ""
     resolved_auth_header: str = ""
+    rack_sync_schedule_last_run_date: str = ""
 
 
 class CleanupCloseOrdersOut(BaseModel):
@@ -441,6 +465,109 @@ class RcsConfigTestOut(BaseModel):
     verify_tls: bool = False
     has_token_code: bool = False
     has_auth_header: bool = False
+
+
+class RackSyncPreviewItem(BaseModel):
+    location_id: int
+    location_code: Optional[str] = None
+    location_x: int
+    location_y: int
+    rack_id: int
+    rack_code: Optional[str] = None
+    status: str
+    errors: List[str] = Field(default_factory=list)
+    query_payload: dict = Field(default_factory=dict)
+    bind_payload: dict = Field(default_factory=dict)
+
+
+class RackSyncQueryItem(RackSyncPreviewItem):
+    rcs_position_code: Optional[str] = None
+    rcs_map_data_code: Optional[str] = None
+    action: str = "none"
+    response_payload: dict = Field(default_factory=dict)
+    query_error: Optional[str] = None
+
+
+class RackSyncPreviewOut(BaseModel):
+    ok: bool
+    mode: str = "preview_only"
+    blocked: bool = False
+    active_tasks_count: int = 0
+    query_endpoint: str
+    bind_endpoint: str
+    map_short_name: str = ""
+    total_assigned_racks: int = 0
+    ready_count: int = 0
+    error_count: int = 0
+    message: str = ""
+    items: List[RackSyncPreviewItem] = Field(default_factory=list)
+
+
+class RackSyncQueryOut(BaseModel):
+    ok: bool
+    mode: str = "query_compare_only"
+    active_tasks_count: int = 0
+    query_endpoint: str
+    bind_endpoint: str
+    map_short_name: str = ""
+    total_assigned_racks: int = 0
+    match_count: int = 0
+    mismatch_count: int = 0
+    missing_count: int = 0
+    invalid_count: int = 0
+    error_count: int = 0
+    message: str = ""
+    items: List[RackSyncQueryItem] = Field(default_factory=list)
+
+
+class RackSyncBindItem(RackSyncQueryItem):
+    bind_status: str = "not_sent"
+    bind_response_payload: dict = Field(default_factory=dict)
+    bind_error: Optional[str] = None
+
+
+class RackSyncBindOut(BaseModel):
+    ok: bool
+    mode: str = "bind_mismatches_manual"
+    blocked: bool = False
+    active_tasks_count: int = 0
+    query_endpoint: str
+    bind_endpoint: str
+    total_assigned_racks: int = 0
+    mismatch_count: int = 0
+    attempted_count: int = 0
+    success_count: int = 0
+    error_count: int = 0
+    skipped_count: int = 0
+    message: str = ""
+    items: List[RackSyncBindItem] = Field(default_factory=list)
+
+
+class RackSyncEventOut(BaseModel):
+    id: int
+    action: str
+    ok: bool
+    blocked: bool = False
+    total_assigned_racks: int = 0
+    match_count: int = 0
+    mismatch_count: int = 0
+    missing_count: int = 0
+    invalid_count: int = 0
+    attempted_count: int = 0
+    success_count: int = 0
+    error_count: int = 0
+    skipped_count: int = 0
+    active_tasks_count: int = 0
+    duration_ms: int = 0
+    message: str = ""
+    payload: dict = Field(default_factory=dict)
+    created_at: datetime
+
+
+class RackSyncScheduleRunOut(BaseModel):
+    ok: bool
+    ran: bool = False
+    message: str = ""
 
 class OperatorWindowIn(BaseModel):
     id: Optional[int] = None
@@ -963,6 +1090,11 @@ def ensure_default_settings():
             "rcs_create_task_endpoint": "/rcs/task/create",
             "rcs_query_task_status_endpoint": "/rcms/services/rest/hikRpcService/queryTaskStatus",
             "rcs_cancel_task_endpoint": "/rcms/services/rest/hikRpcService/cancelTask",
+            "rcs_rack_sync_query_endpoint": "/rcms/services/rest/hikRpcService/queryPodBerthAndMat",
+            "rcs_rack_sync_bind_endpoint": "/rcms/services/rest/hikRpcService/bindPodAndBerth",
+            "rcs_rack_sync_schedule_enabled": "0",
+            "rcs_rack_sync_schedule_time": "12:00",
+            "rcs_rack_sync_schedule_last_run_date": "",
             "rcs_task_monitor_interval_seconds": "3.0",
             "rcs_agv_monitor_interval_seconds": "5.0",
             "rcs_enable_map_short_name": "1",
@@ -2057,6 +2189,18 @@ def _get_rcs_config(db) -> RcsConfigOut:
     resume_robot_endpoint = (get_setting(db, "rcs_resume_robot_endpoint", "/rcms/services/rest/hikRpcService/resumeRobot") or "/rcms/services/rest/hikRpcService/resumeRobot").strip() or "/rcms/services/rest/hikRpcService/resumeRobot"
     agv_status_endpoint = (get_setting(db, "rcs_agv_status_endpoint", "/rcms-dps/rest/queryAgvStatus") or "/rcms-dps/rest/queryAgvStatus").strip() or "/rcms-dps/rest/queryAgvStatus"
     pod_position_endpoint = (get_setting(db, "rcs_pod_position_endpoint", "/rcms/services/rest/hikRpcService/queryPodPosition") or "/rcms/services/rest/hikRpcService/queryPodPosition").strip() or "/rcms/services/rest/hikRpcService/queryPodPosition"
+    rack_sync_query_endpoint = (get_setting(db, "rcs_rack_sync_query_endpoint", "/rcms/services/rest/hikRpcService/queryPodBerthAndMat") or "/rcms/services/rest/hikRpcService/queryPodBerthAndMat").strip() or "/rcms/services/rest/hikRpcService/queryPodBerthAndMat"
+    rack_sync_bind_endpoint = (get_setting(db, "rcs_rack_sync_bind_endpoint", "/rcms/services/rest/hikRpcService/bindPodAndBerth") or "/rcms/services/rest/hikRpcService/bindPodAndBerth").strip() or "/rcms/services/rest/hikRpcService/bindPodAndBerth"
+    rack_sync_schedule_enabled_raw = (get_setting(db, "rcs_rack_sync_schedule_enabled", "0") or "0").strip().lower()
+    rack_sync_schedule_time = (get_setting(db, "rcs_rack_sync_schedule_time", "12:00") or "12:00").strip() or "12:00"
+    if not re.fullmatch(r"\d{1,2}:\d{2}", rack_sync_schedule_time):
+        rack_sync_schedule_time = "12:00"
+    else:
+        hour_text, minute_text = rack_sync_schedule_time.split(":", 1)
+        hour = min(23, max(0, int(hour_text)))
+        minute = min(59, max(0, int(minute_text)))
+        rack_sync_schedule_time = f"{hour:02d}:{minute:02d}"
+    rack_sync_schedule_last_run_date = (get_setting(db, "rcs_rack_sync_schedule_last_run_date", "") or "").strip()
     task_monitor_interval_seconds = float(get_setting(db, "rcs_task_monitor_interval_seconds", "3.0") or 3.0)
     agv_monitor_interval_seconds = float(get_setting(db, "rcs_agv_monitor_interval_seconds", "5.0") or 5.0)
     enable_map_short_name_raw = (get_setting(db, "rcs_enable_map_short_name", "1") or "1").strip().lower()
@@ -2094,6 +2238,10 @@ def _get_rcs_config(db) -> RcsConfigOut:
         resume_robot_endpoint=resume_robot_endpoint,
         agv_status_endpoint=agv_status_endpoint,
         pod_position_endpoint=pod_position_endpoint,
+        rack_sync_query_endpoint=rack_sync_query_endpoint,
+        rack_sync_bind_endpoint=rack_sync_bind_endpoint,
+        rack_sync_schedule_enabled=1 if rack_sync_schedule_enabled_raw in {"1", "true", "yes", "si", "sÃ­"} else 0,
+        rack_sync_schedule_time=rack_sync_schedule_time,
         task_monitor_interval_seconds=task_monitor_interval_seconds,
         agv_monitor_interval_seconds=agv_monitor_interval_seconds,
         enable_map_short_name=1 if enable_map_short_name_raw in {"1", "true", "yes", "si", "sí"} else 0,
@@ -2111,6 +2259,7 @@ def _get_rcs_config(db) -> RcsConfigOut:
         resolved_base_url=resolved_base_url,
         resolved_token_code=_mask_secret(resolved_token_code),
         resolved_auth_header=_mask_secret(resolved_auth_header),
+        rack_sync_schedule_last_run_date=rack_sync_schedule_last_run_date,
     )
 
 
@@ -2122,6 +2271,10 @@ def _save_rcs_config(db, payload: RcsConfigIn) -> RcsConfigOut:
     resume_robot_endpoint = (payload.resume_robot_endpoint or "/rcms/services/rest/hikRpcService/resumeRobot").strip() or "/rcms/services/rest/hikRpcService/resumeRobot"
     agv_status_endpoint = (payload.agv_status_endpoint or "/rcms-dps/rest/queryAgvStatus").strip() or "/rcms-dps/rest/queryAgvStatus"
     pod_position_endpoint = (payload.pod_position_endpoint or "/rcms/services/rest/hikRpcService/queryPodPosition").strip() or "/rcms/services/rest/hikRpcService/queryPodPosition"
+    rack_sync_query_endpoint = (payload.rack_sync_query_endpoint or "/rcms/services/rest/hikRpcService/queryPodBerthAndMat").strip() or "/rcms/services/rest/hikRpcService/queryPodBerthAndMat"
+    rack_sync_bind_endpoint = (payload.rack_sync_bind_endpoint or "/rcms/services/rest/hikRpcService/bindPodAndBerth").strip() or "/rcms/services/rest/hikRpcService/bindPodAndBerth"
+    rack_sync_schedule_enabled = 1 if int(payload.rack_sync_schedule_enabled or 0) else 0
+    rack_sync_schedule_time = (payload.rack_sync_schedule_time or "12:00").strip() or "12:00"
     task_monitor_interval_seconds = float(payload.task_monitor_interval_seconds or 3.0)
     agv_monitor_interval_seconds = float(payload.agv_monitor_interval_seconds or 5.0)
     cleanup_min_age_minutes = max(1, int(payload.cleanup_min_age_minutes or 30))
@@ -2147,6 +2300,10 @@ def _save_rcs_config(db, payload: RcsConfigIn) -> RcsConfigOut:
         agv_status_endpoint = "/" + agv_status_endpoint
     if not pod_position_endpoint.startswith("/"):
         pod_position_endpoint = "/" + pod_position_endpoint
+    if not rack_sync_query_endpoint.startswith("/"):
+        rack_sync_query_endpoint = "/" + rack_sync_query_endpoint
+    if not rack_sync_bind_endpoint.startswith("/"):
+        rack_sync_bind_endpoint = "/" + rack_sync_bind_endpoint
     set_setting(db, "rcs_base_url", (payload.base_url or "").strip())
     set_setting(db, "rcs_create_task_endpoint", endpoint)
     set_setting(db, "rcs_query_task_status_endpoint", query_endpoint)
@@ -2155,6 +2312,10 @@ def _save_rcs_config(db, payload: RcsConfigIn) -> RcsConfigOut:
     set_setting(db, "rcs_resume_robot_endpoint", resume_robot_endpoint)
     set_setting(db, "rcs_agv_status_endpoint", agv_status_endpoint)
     set_setting(db, "rcs_pod_position_endpoint", pod_position_endpoint)
+    set_setting(db, "rcs_rack_sync_query_endpoint", rack_sync_query_endpoint)
+    set_setting(db, "rcs_rack_sync_bind_endpoint", rack_sync_bind_endpoint)
+    set_setting(db, "rcs_rack_sync_schedule_enabled", "1" if rack_sync_schedule_enabled else "0")
+    set_setting(db, "rcs_rack_sync_schedule_time", rack_sync_schedule_time)
     set_setting(db, "rcs_task_monitor_interval_seconds", str(task_monitor_interval_seconds))
     set_setting(db, "rcs_agv_monitor_interval_seconds", str(agv_monitor_interval_seconds))
     set_setting(db, "rcs_enable_map_short_name", "1" if enable_map_short_name else "0")
@@ -2286,6 +2447,536 @@ def _pod_position_endpoint(db) -> str:
     if not endpoint.startswith("/") and not endpoint.startswith("http://") and not endpoint.startswith("https://"):
         endpoint = "/" + endpoint
     return endpoint
+
+
+def _rack_sync_endpoint(value: str, default: str) -> str:
+    endpoint = (value or default).strip() or default
+    if not endpoint.startswith("/") and not endpoint.startswith("http://") and not endpoint.startswith("https://"):
+        endpoint = "/" + endpoint
+    return endpoint
+
+
+def _rack_sync_active_tasks_count(db) -> int:
+    active_statuses = ("pending_dispatch", "dispatched", "in_progress", "cancel_requested_total", "cancel_requested_undo")
+    return int(db.execute(select(func.count()).select_from(MovementOrder).where(MovementOrder.status.in_(active_statuses))).scalar() or 0)
+
+
+def _rack_sync_event_out(row: RackSyncEvent) -> RackSyncEventOut:
+    return RackSyncEventOut(
+        id=row.id,
+        action=row.action,
+        ok=bool(row.ok),
+        blocked=bool(row.blocked),
+        total_assigned_racks=int(row.total_assigned_racks or 0),
+        match_count=int(row.match_count or 0),
+        mismatch_count=int(row.mismatch_count or 0),
+        missing_count=int(row.missing_count or 0),
+        invalid_count=int(row.invalid_count or 0),
+        attempted_count=int(row.attempted_count or 0),
+        success_count=int(row.success_count or 0),
+        error_count=int(row.error_count or 0),
+        skipped_count=int(row.skipped_count or 0),
+        active_tasks_count=int(row.active_tasks_count or 0),
+        duration_ms=int(row.duration_ms or 0),
+        message=row.message or "",
+        payload=_safe_json_loads(row.payload_json) or {},
+        created_at=row.created_at,
+    )
+
+
+def _append_rack_sync_event(db, *, action: str, result, duration_ms: int = 0):
+    payload = result.model_dump(mode="json") if hasattr(result, "model_dump") else {}
+    items = payload.get("items") if isinstance(payload, dict) else []
+    if isinstance(items, list) and len(items) > 80:
+        payload["items"] = items[:80]
+        payload["items_truncated"] = len(items) - 80
+    row = RackSyncEvent(
+        action=(action or "unknown").strip()[:32],
+        ok=1 if bool(getattr(result, "ok", False)) else 0,
+        blocked=1 if bool(getattr(result, "blocked", False)) else 0,
+        total_assigned_racks=int(getattr(result, "total_assigned_racks", 0) or 0),
+        match_count=int(getattr(result, "match_count", 0) or 0),
+        mismatch_count=int(getattr(result, "mismatch_count", 0) or 0),
+        missing_count=int(getattr(result, "missing_count", 0) or 0),
+        invalid_count=int(getattr(result, "invalid_count", 0) or 0),
+        attempted_count=int(getattr(result, "attempted_count", 0) or 0),
+        success_count=int(getattr(result, "success_count", 0) or 0),
+        error_count=int(getattr(result, "error_count", 0) or 0),
+        skipped_count=int(getattr(result, "skipped_count", 0) or 0),
+        active_tasks_count=int(getattr(result, "active_tasks_count", 0) or 0),
+        duration_ms=max(0, int(duration_ms or 0)),
+        message=str(getattr(result, "message", "") or "")[:512],
+        payload_json=json.dumps(_sanitize_log_payload(payload), ensure_ascii=False),
+        created_at=datetime.utcnow(),
+    )
+    db.add(row)
+    db.commit()
+    logger.info(
+        "Rack sync event action=%s ok=%s blocked=%s total=%s mismatches=%s errors=%s duration_ms=%s",
+        row.action,
+        row.ok,
+        row.blocked,
+        row.total_assigned_racks,
+        row.mismatch_count,
+        row.error_count,
+        row.duration_ms,
+    )
+    return row
+
+
+def _list_rack_sync_events_out(db, limit: int = 50) -> List[RackSyncEventOut]:
+    rows = db.execute(
+        select(RackSyncEvent)
+        .order_by(RackSyncEvent.created_at.desc(), RackSyncEvent.id.desc())
+        .limit(max(1, min(200, int(limit or 50))))
+    ).scalars().all()
+    return [_rack_sync_event_out(row) for row in rows]
+
+
+def _build_rack_sync_preview(db) -> RackSyncPreviewOut:
+    cfg = _get_rcs_config(db)
+    query_endpoint = _rack_sync_endpoint(cfg.rack_sync_query_endpoint, "/rcms/services/rest/hikRpcService/queryPodBerthAndMat")
+    bind_endpoint = _rack_sync_endpoint(cfg.rack_sync_bind_endpoint, "/rcms/services/rest/hikRpcService/bindPodAndBerth")
+    map_short_name = cfg.map_short_name if int(cfg.enable_map_short_name or 0) == 1 else ""
+    active_tasks_count = _rack_sync_active_tasks_count(db)
+    now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows = (
+        db.execute(
+            select(Location, Rack)
+            .join(Rack, Location.rack_id == Rack.id)
+            .where(Location.rack_id.is_not(None))
+            .order_by(Location.y.asc(), Location.x.asc(), Rack.code.asc())
+        )
+        .all()
+    )
+    location_code_counts = {}
+    for loc, _rack in rows:
+        code = (loc.code or "").strip()
+        if code:
+            location_code_counts[code] = location_code_counts.get(code, 0) + 1
+    items: List[RackSyncPreviewItem] = []
+    for index, (loc, rack) in enumerate(rows, start=1):
+        rack_code = (rack.code or "").strip()
+        position_code = (loc.code or "").strip()
+        errors = []
+        if not rack_code:
+            errors.append("missing_rack_code")
+        if not position_code:
+            errors.append("missing_location_code")
+        elif location_code_counts.get(position_code, 0) > 1:
+            errors.append("duplicate_location_code")
+        req_suffix = f"{index:04d}"
+        query_payload = {
+            "reqCode": f"{generate_req_code_ms()}Q{req_suffix}",
+            "reqTime": now_text,
+            "clientCode": "",
+            "tokenCode": "",
+            "podCode": rack_code,
+            "materialLot": "",
+            "positionCode": "",
+            "areaCode": "",
+            "mapShortName": map_short_name,
+        }
+        bind_payload = {
+            "reqCode": f"{generate_req_code_ms()}B{req_suffix}",
+            "reqTime": now_text,
+            "clientCode": "",
+            "tokenCode": "",
+            "podCode": rack_code,
+            "positionCode": position_code,
+            "podDir": "0",
+            "characterValue": "",
+            "indBind": "1",
+        }
+        status = "ready" if not errors else "invalid"
+        items.append(RackSyncPreviewItem(
+            location_id=loc.id,
+            location_code=position_code or None,
+            location_x=loc.x,
+            location_y=loc.y,
+            rack_id=rack.id,
+            rack_code=rack_code or None,
+            status=status,
+            errors=errors,
+            query_payload=query_payload,
+            bind_payload=bind_payload,
+        ))
+    ready_count = sum(1 for item in items if item.status == "ready")
+    error_count = len(items) - ready_count
+    blocked = active_tasks_count > 0
+    message = "Vista previa generada. No se envio nada al RCS."
+    if blocked:
+        message += f" Hay {active_tasks_count} tarea(s) activa(s); futuras ejecuciones deben bloquearse."
+    if error_count:
+        message += f" {error_count} rack(s) tienen errores de configuracion."
+    return RackSyncPreviewOut(
+        ok=error_count == 0,
+        blocked=blocked,
+        active_tasks_count=active_tasks_count,
+        query_endpoint=query_endpoint,
+        bind_endpoint=bind_endpoint,
+        map_short_name=map_short_name,
+        total_assigned_racks=len(items),
+        ready_count=ready_count,
+        error_count=error_count,
+        message=message,
+        items=items,
+    )
+
+
+def _rack_sync_response_items(response_payload: Any) -> List[dict]:
+    if not isinstance(response_payload, dict):
+        return []
+    data = response_payload.get("data")
+    if isinstance(data, str):
+        data = data.strip()
+        if not data:
+            return []
+        try:
+            data = json.loads(data)
+        except Exception:
+            return []
+    if isinstance(data, dict):
+        return [data]
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    return []
+
+
+def _rack_sync_find_response_item(response_payload: Any, rack_code: str) -> Optional[dict]:
+    rows = _rack_sync_response_items(response_payload)
+    if not rows:
+        return None
+    rack_code_norm = str(rack_code or "").strip()
+    for row in rows:
+        response_rack = str(row.get("podCode") or row.get("pod_code") or row.get("rackCode") or row.get("rack_code") or "").strip()
+        if response_rack and response_rack == rack_code_norm:
+            return row
+    if len(rows) == 1:
+        return rows[0]
+    return None
+
+
+def _rack_sync_position_from_response(row: Optional[dict]) -> tuple[Optional[str], Optional[str]]:
+    if not isinstance(row, dict):
+        return None, None
+    position_code = str(
+        row.get("positionCode")
+        or row.get("position_code")
+        or row.get("locationCode")
+        or row.get("location_code")
+        or row.get("cellCode")
+        or row.get("cell_code")
+        or row.get("posCode")
+        or row.get("position")
+        or ""
+    ).strip()
+    map_data_code = str(row.get("mapDataCode") or row.get("map_data_code") or "").strip()
+    return position_code or None, map_data_code or None
+
+
+def _query_rack_sync_comparison(db) -> RackSyncQueryOut:
+    preview = _build_rack_sync_preview(db)
+    client = _get_rcs_client_from_settings(db)
+    token_code = getattr(client, "_token_code", "") or ""
+    query_endpoint = preview.query_endpoint
+    debug_base_url, debug_endpoint = _resolve_rcs_target(db, endpoint=query_endpoint, mode="query")
+    items: List[RackSyncQueryItem] = []
+
+    for item in preview.items:
+        base_data = item.model_dump()
+        if item.status != "ready":
+            items.append(RackSyncQueryItem(**base_data, status="invalid", action="skip"))
+            continue
+
+        request_payload = dict(item.query_payload or {})
+        request_payload["reqCode"] = generate_req_code_ms()
+        request_payload["reqTime"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        request_payload["tokenCode"] = token_code
+        bind_payload = dict(item.bind_payload or {})
+        bind_payload["tokenCode"] = token_code
+        base_data["query_payload"] = request_payload
+        base_data["bind_payload"] = bind_payload
+        context_payload = {
+            **request_payload,
+            "location_id": item.location_id,
+            "rack_id": item.rack_id,
+            "expected_position_code": item.location_code,
+        }
+
+        try:
+            _append_debug_console_event(
+                db,
+                direction="sent",
+                module="rack_sync_query",
+                base_url=debug_base_url,
+                endpoint=debug_endpoint,
+                payload=context_payload,
+                message=f"Consulta rack/posicion para {item.rack_code}",
+                auto_commit=False,
+            )
+            response_payload = client.post_json_payload(request_payload, endpoint_override=query_endpoint)
+            _append_debug_console_event(
+                db,
+                direction="received",
+                module="rack_sync_query",
+                base_url=debug_base_url,
+                endpoint=debug_endpoint,
+                payload=response_payload,
+                message=str(response_payload.get("message") or f"Respuesta rack/posicion para {item.rack_code}"),
+                auto_commit=False,
+            )
+        except RcsError as exc:
+            _append_debug_console_event(
+                db,
+                direction="received",
+                module="rack_sync_query",
+                base_url=debug_base_url,
+                endpoint=debug_endpoint,
+                payload={"error": str(exc), "rack_id": item.rack_id, "rack_code": item.rack_code},
+                message=str(exc),
+                auto_commit=False,
+            )
+            items.append(RackSyncQueryItem(**base_data, status="query_error", action="retry", query_error=str(exc)))
+            continue
+
+        response_item = _rack_sync_find_response_item(response_payload, item.rack_code or "")
+        rcs_position_code, rcs_map_data_code = _rack_sync_position_from_response(response_item)
+        expected_position = str(item.location_code or "").strip()
+        actual_position = (rcs_position_code or rcs_map_data_code or "").strip()
+        if not response_item or not actual_position:
+            status = "not_found"
+            action = "manual_review"
+        elif actual_position == expected_position:
+            status = "match"
+            action = "none"
+        else:
+            status = "mismatch"
+            action = "reassign_needed"
+
+        items.append(RackSyncQueryItem(
+            **base_data,
+            status=status,
+            action=action,
+            rcs_position_code=rcs_position_code,
+            rcs_map_data_code=rcs_map_data_code,
+            response_payload=response_payload,
+        ))
+
+    db.commit()
+    match_count = sum(1 for item in items if item.status == "match")
+    mismatch_count = sum(1 for item in items if item.status == "mismatch")
+    missing_count = sum(1 for item in items if item.status == "not_found")
+    invalid_count = sum(1 for item in items if item.status == "invalid")
+    error_count = sum(1 for item in items if item.status == "query_error")
+    message = "Consulta RCS terminada. No se envio ningun bind/reasignacion."
+    if mismatch_count:
+        message += f" {mismatch_count} rack(s) requieren reasignacion en una etapa posterior."
+    if missing_count:
+        message += f" {missing_count} rack(s) no regresaron posicion en RCS."
+    if error_count:
+        message += f" {error_count} consulta(s) fallaron."
+
+    return RackSyncQueryOut(
+        ok=(mismatch_count == 0 and missing_count == 0 and invalid_count == 0 and error_count == 0),
+        active_tasks_count=preview.active_tasks_count,
+        query_endpoint=preview.query_endpoint,
+        bind_endpoint=preview.bind_endpoint,
+        map_short_name=preview.map_short_name,
+        total_assigned_racks=preview.total_assigned_racks,
+        match_count=match_count,
+        mismatch_count=mismatch_count,
+        missing_count=missing_count,
+        invalid_count=invalid_count,
+        error_count=error_count,
+        message=message,
+        items=items,
+    )
+
+
+def _bind_rack_sync_mismatches(db) -> RackSyncBindOut:
+    comparison = _query_rack_sync_comparison(db)
+    if comparison.active_tasks_count > 0:
+        return RackSyncBindOut(
+            ok=False,
+            blocked=True,
+            active_tasks_count=comparison.active_tasks_count,
+            query_endpoint=comparison.query_endpoint,
+            bind_endpoint=comparison.bind_endpoint,
+            total_assigned_racks=comparison.total_assigned_racks,
+            mismatch_count=comparison.mismatch_count,
+            skipped_count=comparison.mismatch_count,
+            message=f"Reasignacion bloqueada: hay {comparison.active_tasks_count} tarea(s) activa(s). No se envio bindPodAndBerth.",
+            items=[
+                RackSyncBindItem(**item.model_dump(), bind_status="blocked")
+                for item in comparison.items
+                if item.status == "mismatch"
+            ],
+        )
+
+    client = _get_rcs_client_from_settings(db)
+    token_code = getattr(client, "_token_code", "") or ""
+    bind_endpoint = comparison.bind_endpoint
+    debug_base_url, debug_endpoint = _resolve_rcs_target(db, endpoint=bind_endpoint, mode="query")
+    items: List[RackSyncBindItem] = []
+
+    for item in comparison.items:
+        if item.status != "mismatch":
+            if item.status in {"invalid", "query_error", "not_found"}:
+                items.append(RackSyncBindItem(**item.model_dump(), bind_status="skipped"))
+            continue
+
+        bind_payload = dict(item.bind_payload or {})
+        bind_payload["reqCode"] = generate_req_code_ms()
+        bind_payload["reqTime"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        bind_payload["tokenCode"] = token_code
+        bind_payload["indBind"] = "1"
+        item_data = item.model_dump()
+        item_data["bind_payload"] = bind_payload
+        context_payload = {
+            **bind_payload,
+            "location_id": item.location_id,
+            "rack_id": item.rack_id,
+            "previous_rcs_position_code": item.rcs_position_code or item.rcs_map_data_code,
+        }
+
+        try:
+            _append_debug_console_event(
+                db,
+                direction="sent",
+                module="rack_sync_bind",
+                base_url=debug_base_url,
+                endpoint=debug_endpoint,
+                payload=context_payload,
+                message=f"Bind rack {item.rack_code} a posicion {item.location_code}",
+                auto_commit=False,
+            )
+            response_payload = client.post_json_payload(bind_payload, endpoint_override=bind_endpoint)
+            response_code = str(response_payload.get("code") or response_payload.get("statusCode") or "").strip()
+            bind_ok = response_code in {"", "0", "200", "success", "successful"} or str(response_payload.get("message") or "").strip().lower() == "successful"
+            _append_debug_console_event(
+                db,
+                direction="received",
+                module="rack_sync_bind",
+                base_url=debug_base_url,
+                endpoint=debug_endpoint,
+                payload=response_payload,
+                message=str(response_payload.get("message") or f"Respuesta bind para {item.rack_code}"),
+                auto_commit=False,
+            )
+            items.append(RackSyncBindItem(
+                **item_data,
+                bind_status="bind_ok" if bind_ok else "bind_rejected",
+                bind_response_payload=response_payload,
+                bind_error=None if bind_ok else str(response_payload.get("message") or response_payload),
+            ))
+        except RcsError as exc:
+            _append_debug_console_event(
+                db,
+                direction="received",
+                module="rack_sync_bind",
+                base_url=debug_base_url,
+                endpoint=debug_endpoint,
+                payload={"error": str(exc), "rack_id": item.rack_id, "rack_code": item.rack_code, "position_code": item.location_code},
+                message=str(exc),
+                auto_commit=False,
+            )
+            items.append(RackSyncBindItem(**item_data, bind_status="bind_error", bind_error=str(exc)))
+
+    db.commit()
+    attempted_count = sum(1 for item in items if item.bind_status in {"bind_ok", "bind_rejected", "bind_error"})
+    success_count = sum(1 for item in items if item.bind_status == "bind_ok")
+    error_count = sum(1 for item in items if item.bind_status in {"bind_rejected", "bind_error"})
+    skipped_count = sum(1 for item in items if item.bind_status == "skipped")
+    message = "Reasignacion manual terminada."
+    if attempted_count == 0:
+        message = "No habia discrepancias para reasignar."
+    elif error_count:
+        message += f" {success_count} exitosas, {error_count} con error."
+    else:
+        message += f" {success_count} bind(s) enviados correctamente."
+
+    return RackSyncBindOut(
+        ok=(error_count == 0),
+        active_tasks_count=comparison.active_tasks_count,
+        query_endpoint=comparison.query_endpoint,
+        bind_endpoint=comparison.bind_endpoint,
+        total_assigned_racks=comparison.total_assigned_racks,
+        mismatch_count=comparison.mismatch_count,
+        attempted_count=attempted_count,
+        success_count=success_count,
+        error_count=error_count,
+        skipped_count=skipped_count,
+        message=message,
+        items=items,
+    )
+
+
+def _rack_sync_schedule_due(db, now: Optional[datetime] = None) -> tuple[bool, str]:
+    now = now or datetime.now()
+    cfg = _get_rcs_config(db)
+    if int(cfg.rack_sync_schedule_enabled or 0) != 1:
+        return False, "programacion deshabilitada"
+    schedule_time = (cfg.rack_sync_schedule_time or "12:00").strip() or "12:00"
+    try:
+        hour, minute = [int(part) for part in schedule_time.split(":", 1)]
+    except Exception:
+        return False, "hora programada invalida"
+    scheduled_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    today_text = now.strftime("%Y-%m-%d")
+    last_run_date = (get_setting(db, "rcs_rack_sync_schedule_last_run_date", "") or "").strip()
+    if last_run_date == today_text:
+        return False, "ya ejecutada hoy"
+    if now < scheduled_at:
+        return False, "aun no es hora"
+    return True, "ejecucion programada pendiente"
+
+
+def _run_scheduled_rack_sync_once() -> bool:
+    if not _rack_sync_scheduler_lock.acquire(blocking=False):
+        return False
+    started = time.monotonic()
+    try:
+        with SessionLocal() as db:
+            due, reason = _rack_sync_schedule_due(db)
+            if not due:
+                return False
+            today_text = datetime.now().strftime("%Y-%m-%d")
+            logger.info("Scheduled rack sync triggered reason=%s date=%s", reason, today_text)
+            result = _bind_rack_sync_mismatches(db)
+            if result.blocked:
+                result.message = f"Sincronizacion programada omitida: {result.message}"
+            else:
+                result.message = f"Sincronizacion programada: {result.message}"
+            set_setting(db, "rcs_rack_sync_schedule_last_run_date", today_text)
+            _append_rack_sync_event(db, action="scheduled_bind", result=result, duration_ms=int((time.monotonic() - started) * 1000))
+            return True
+    except Exception as exc:
+        logger.exception("Scheduled rack sync failed")
+        with SessionLocal() as db:
+            error_result = RackSyncBindOut(
+                ok=False,
+                query_endpoint=_get_rcs_config(db).rack_sync_query_endpoint,
+                bind_endpoint=_get_rcs_config(db).rack_sync_bind_endpoint,
+                error_count=1,
+                message=f"Sincronizacion programada fallo: {exc}",
+            )
+            _append_rack_sync_event(db, action="scheduled_bind", result=error_result, duration_ms=int((time.monotonic() - started) * 1000))
+        return False
+    finally:
+        _rack_sync_scheduler_lock.release()
+
+
+def _rack_sync_scheduler_worker():
+    while not _rack_sync_scheduler_stop_event.wait(RACK_SYNC_SCHEDULER_INTERVAL_SECONDS):
+        _run_scheduled_rack_sync_once()
+
+
+def _start_rack_sync_scheduler():
+    _rack_sync_scheduler_stop_event.clear()
+    thread = threading.Thread(target=_rack_sync_scheduler_worker, daemon=True, name="rack-sync-scheduler")
+    thread.start()
+    return thread
 
 
 def _query_pod_position_from_rcs(db, rack: Rack, *, module: str = "query_pod_position", related_order_id: Optional[int] = None, attempt: Optional[int] = None) -> dict:
@@ -2652,6 +3343,10 @@ def on_startup():
         app.state.task_monitor.start()
     except Exception:
         logger.exception("Failed to start task monitor")
+    try:
+        app.state.rack_sync_scheduler_thread = _start_rack_sync_scheduler()
+    except Exception:
+        logger.exception("Failed to start rack sync scheduler")
     logger.info("Application startup completed")
 
 
@@ -2667,6 +3362,10 @@ def on_shutdown():
         app.state.task_monitor.stop()
     except Exception:
         logger.exception("Failed to stop task monitor")
+    try:
+        _rack_sync_scheduler_stop_event.set()
+    except Exception:
+        logger.exception("Failed to stop rack sync scheduler")
     task = getattr(app.state, "runtime_broadcast_task", None)
     if task is not None:
         task.cancel()
@@ -3782,6 +4481,50 @@ def admin_set_client_ip(payload: ClientIPIn, x_admin_token: Optional[str] = Head
     with SessionLocal() as db:
         set_setting(db, "client_ip", payload.client_ip.strip())
         return ClientIPOut(client_ip=get_setting(db, "client_ip", ""))
+
+
+@app.get("/api/admin/rcs/rack-sync/preview", response_model=RackSyncPreviewOut)
+def preview_rack_sync(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    started = time.monotonic()
+    with SessionLocal() as db:
+        result = _build_rack_sync_preview(db)
+        _append_rack_sync_event(db, action="preview", result=result, duration_ms=int((time.monotonic() - started) * 1000))
+        return result
+
+
+@app.post("/api/admin/rcs/rack-sync/query", response_model=RackSyncQueryOut)
+def query_rack_sync(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    started = time.monotonic()
+    with SessionLocal() as db:
+        result = _query_rack_sync_comparison(db)
+        _append_rack_sync_event(db, action="query", result=result, duration_ms=int((time.monotonic() - started) * 1000))
+        return result
+
+
+@app.post("/api/admin/rcs/rack-sync/bind-mismatches", response_model=RackSyncBindOut)
+def bind_rack_sync_mismatches(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    started = time.monotonic()
+    with SessionLocal() as db:
+        result = _bind_rack_sync_mismatches(db)
+        _append_rack_sync_event(db, action="bind", result=result, duration_ms=int((time.monotonic() - started) * 1000))
+        return result
+
+
+@app.get("/api/admin/rcs/rack-sync/history", response_model=List[RackSyncEventOut])
+def list_rack_sync_history(limit: int = 50, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        return _list_rack_sync_events_out(db, limit=limit)
+
+
+@app.post("/api/admin/rcs/rack-sync/schedule/run-due", response_model=RackSyncScheduleRunOut)
+def run_due_rack_sync_schedule(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    ran = _run_scheduled_rack_sync_once()
+    return RackSyncScheduleRunOut(ok=True, ran=ran, message="Sincronizacion programada ejecutada." if ran else "No habia sincronizacion programada pendiente.")
 
 
 @app.get("/api/admin/rcs-config", response_model=RcsConfigOut)

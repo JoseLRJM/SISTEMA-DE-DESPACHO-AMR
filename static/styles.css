@@ -528,10 +528,12 @@ textarea[disabled], select[disabled]{opacity:.6}
 }
 
 
-.console-log-box{white-space:normal;display:flex;flex-direction:column;gap:12px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;}
+.console-log-box{white-space:normal;display:flex;flex-direction:column;gap:10px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:1.25;}
+.console-log-box.paused{outline:1px solid rgba(96,165,250,.45);outline-offset:-1px;}
 .console-entry{border-bottom:1px dashed rgba(148,163,184,.7);padding-bottom:12px;}
 .console-entry:last-child{border-bottom:none;padding-bottom:0;}
-.console-entry .json-pre{margin:8px 0 0 0;white-space:pre-wrap;word-break:break-word;}
+.console-entry .small{font-size:11px;line-height:1.25;}
+.console-entry .json-pre{margin:6px 0 0 0;white-space:pre-wrap;word-break:break-word;font-size:10.5px;line-height:1.25;}
 .order-history-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:stretch}
 .order-history-row .list-item{margin:0;width:100%;text-align:left}
 .order-cancel-btn{align-self:center;white-space:nowrap}

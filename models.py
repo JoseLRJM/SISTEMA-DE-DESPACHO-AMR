@@ -267,3 +267,29 @@ class DebugConsoleEvent(Base):
     payload_json = Column(Text, nullable=True)
     message = Column(String(512), nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class RackSyncEvent(Base):
+    __tablename__ = "rack_sync_events"
+    __table_args__ = (
+        Index("ix_rack_sync_events_created_at_id", "created_at", "id"),
+        Index("ix_rack_sync_events_action", "action"),
+    )
+    id = Column(Integer, primary_key=True)
+    action = Column(String(32), nullable=False)
+    ok = Column(Integer, nullable=False, default=0)
+    blocked = Column(Integer, nullable=False, default=0)
+    total_assigned_racks = Column(Integer, nullable=False, default=0)
+    match_count = Column(Integer, nullable=False, default=0)
+    mismatch_count = Column(Integer, nullable=False, default=0)
+    missing_count = Column(Integer, nullable=False, default=0)
+    invalid_count = Column(Integer, nullable=False, default=0)
+    attempted_count = Column(Integer, nullable=False, default=0)
+    success_count = Column(Integer, nullable=False, default=0)
+    error_count = Column(Integer, nullable=False, default=0)
+    skipped_count = Column(Integer, nullable=False, default=0)
+    active_tasks_count = Column(Integer, nullable=False, default=0)
+    duration_ms = Column(Integer, nullable=False, default=0)
+    message = Column(String(512), nullable=True)
+    payload_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)

@@ -25,6 +25,10 @@ const API = {
   adminRcsConfigGet: "/api/admin/rcs-config",
   adminRcsConfigSet: "/api/admin/rcs-config",
   adminRcsConfigTest: "/api/admin/rcs-config/test",
+  adminRackSyncPreview: "/api/admin/rcs/rack-sync/preview",
+  adminRackSyncQuery: "/api/admin/rcs/rack-sync/query",
+  adminRackSyncBind: "/api/admin/rcs/rack-sync/bind-mismatches",
+  adminRackSyncHistory: "/api/admin/rcs/rack-sync/history",
   rcsConfigPublic: "/api/rcs-config-public",
   adminHideConfiguredRange: "/api/admin/hide-configured-range",
   adminShowConfiguredRange: "/api/admin/show-configured-range",
@@ -97,6 +101,7 @@ let multiSelectedLocationIds = new Set();
 let multiSelectMode = false;
 let multiSelectBox = null;
 let adminToken = null;
+let lastRackSyncData = null;
 let mapLayoutMode = "grid";
 let freeLayoutDrag = null;
 let suppressNextCanvasClick = false;
@@ -116,6 +121,8 @@ const agvOverlayConfig = { scale_x: 1, scale_y: 1, offset_x: 0, offset_y: 0, rot
 let runtimeSocket = null;
 let runtimeSocketReconnectHandle = null;
 let runtimeSocketConnected = false;
+let debugConsoleHoverPaused = false;
+let debugConsolePendingEntries = null;
 let RUNTIME_AUTO_REFRESH_MS = 5000;
 let RUNTIME_SOCKET_RECONNECT_MS = 3000;
 const ROBOT_MONITOR_POS_KEY = "agv_robot_monitor_pos_v1";
@@ -248,6 +255,10 @@ const rcsStopEndpoint = $("rcsStopEndpoint");
 const rcsResumeEndpoint = $("rcsResumeEndpoint");
 const rcsAgvStatusEndpoint = $("rcsAgvStatusEndpoint");
 const rcsPodPositionEndpoint = $("rcsPodPositionEndpoint");
+const rcsRackSyncQueryEndpoint = $("rcsRackSyncQueryEndpoint");
+const rcsRackSyncBindEndpoint = $("rcsRackSyncBindEndpoint");
+const rcsRackSyncScheduleEnabled = $("rcsRackSyncScheduleEnabled");
+const rcsRackSyncScheduleTime = $("rcsRackSyncScheduleTime");
 const rcsTaskMonitorInterval = $("rcsTaskMonitorInterval");
 const rcsAgvMonitorInterval = $("rcsAgvMonitorInterval");
 const cleanupMinAgeMinutes = $("cleanupMinAgeMinutes");
@@ -270,6 +281,12 @@ const podPositionRack = $("podPositionRack");
 const btnQueryPodPosition = $("btnQueryPodPosition");
 const podPositionResult = $("podPositionResult");
 const podPositionMsg = $("podPositionMsg");
+const btnRackSyncPreview = $("btnRackSyncPreview");
+const btnRackSyncQuery = $("btnRackSyncQuery");
+const btnRackSyncBind = $("btnRackSyncBind");
+const btnRackSyncHistory = $("btnRackSyncHistory");
+const rackSyncResult = $("rackSyncResult");
+const rackSyncMsg = $("rackSyncMsg");
 const oldPwd = $("oldPwd");
 const newPwd = $("newPwd");
 const btnChangePwd = $("btnChangePwd");
@@ -495,6 +512,7 @@ const CARD_ORDER = [
   "card-client-bg",
   "card-debug-rcs",
   "card-pod-position",
+  "card-rack-sync",
   "card-config-rcs",
   "card-admin-password",
   "card-admin-login",
@@ -1126,6 +1144,7 @@ const ACTION_CARD_ORDER = [
   "card-client-bg",
   "card-debug-rcs",
   "card-pod-position",
+  "card-rack-sync",
   "card-config-rcs",
   "card-admin-password",
   "card-admin-login",
@@ -1146,7 +1165,7 @@ const ACTION_CARD_TABS = [
   {
     key: "advanced",
     label: "Configuraci\u00f3n avanzada",
-    cards: ["card-general", "card-direct-move", "card-fifo", "card-client-bg", "card-debug-rcs", "card-pod-position", "card-config-rcs", "card-admin-password", "card-admin-login"],
+    cards: ["card-general", "card-direct-move", "card-fifo", "card-client-bg", "card-debug-rcs", "card-pod-position", "card-rack-sync", "card-config-rcs", "card-admin-password", "card-admin-login"],
   },
 ];
 let activeActionTabId = safeStorageGet(ACTION_TAB_STORAGE_KEY) || "operation";
@@ -2998,7 +3017,7 @@ function setAdminUI(enabled) {
     "operatorWindowId", "operatorWindowName", "operatorWindowActive", "operatorWindowBgColor", "operatorWindowButtonCount", "operatorWindowPasswordAdmin", "btnSaveOperatorWindow", "btnNewOperatorWindow", "adminWindowSelect",
     "btnSelectCellsByArea",
     "mapLayoutMode", "freeLayoutEditEnabled", "btnAddFreeCell",
-    "podPositionRack", "btnQueryPodPosition", "rcsPodPositionEndpoint",
+    "podPositionRack", "btnQueryPodPosition", "rcsPodPositionEndpoint", "rcsRackSyncQueryEndpoint", "rcsRackSyncBindEndpoint", "rcsRackSyncScheduleEnabled", "rcsRackSyncScheduleTime", "btnRackSyncPreview", "btnRackSyncQuery", "btnRackSyncBind", "btnRackSyncHistory",
     "operatorButtonIndex", "operatorButtonActive", "operatorButtonLabel", "operatorButtonColor", "operatorButtonMode", "operatorButtonPriority", "operatorButtonSourceArea", "operatorButtonDestinationArea", "operatorButtonPointDestinationArea", "operatorButtonMaterial", "operatorButtonSourceCell", "operatorButtonDestinationCell", "btnOperatorButtonPickSource", "btnOperatorButtonPickDestination", "operatorButtonAgv", "operatorButtonTaskTyp", "operatorButtonComment", "btnSaveOperatorButton", "btnAddOperatorPointField"
   ]);
 
@@ -3038,6 +3057,7 @@ function setAdminUI(enabled) {
   updateBackupControls();
   setCellBulkControlsState();
   updateAddFreeCellAvailability();
+  updateRackSyncButtons();
 }
 function applyAgvOverlayConfigFromGrid(cfg = {}) {
   agvOverlayConfig.scale_x = Number(cfg.agv_overlay_scale_x ?? 1) || 1;
@@ -3367,6 +3387,10 @@ function renderRcsResolvedInfo(data) {
     `Endpoint resume robot: ${data.resume_robot_endpoint || '/rcms/services/rest/hikRpcService/resumeRobot'}`,
     `Endpoint estado AMR: ${data.agv_status_endpoint || '/rcms-dps/rest/queryAgvStatus'}`,
     `Endpoint posicion rack/pod: ${data.pod_position_endpoint || '/rcms/services/rest/hikRpcService/queryPodPosition'}`,
+    `Endpoint consultar rack/posicion: ${data.rack_sync_query_endpoint || '/rcms/services/rest/hikRpcService/queryPodBerthAndMat'}`,
+    `Endpoint vincular rack/posicion: ${data.rack_sync_bind_endpoint || '/rcms/services/rest/hikRpcService/bindPodAndBerth'}`,
+    `Sync racks programada: ${Number(data.rack_sync_schedule_enabled ?? 0) === 1 ? `Habilitada ${data.rack_sync_schedule_time || '12:00'}` : 'Deshabilitada'}`,
+    `Ultima sync programada: ${data.rack_sync_schedule_last_run_date || '-'}`,
     `Frecuencia monitoreo tarea: ${Number(data.task_monitor_interval_seconds ?? 3).toFixed(1)} s`,
     `Frecuencia monitoreo AGV: ${Number(data.agv_monitor_interval_seconds ?? 5).toFixed(1)} s`,
     `Habilitar mapShortName: ${Number(data.enable_map_short_name ?? 1) === 1 ? 'Sí' : 'No'}`,
@@ -3401,6 +3425,10 @@ async function adminLoadRcsConfig() {
   if (rcsResumeEndpoint) rcsResumeEndpoint.value = data.resume_robot_endpoint || '/rcms/services/rest/hikRpcService/resumeRobot';
   if (rcsAgvStatusEndpoint) rcsAgvStatusEndpoint.value = data.agv_status_endpoint || '/rcms-dps/rest/queryAgvStatus';
   if (rcsPodPositionEndpoint) rcsPodPositionEndpoint.value = data.pod_position_endpoint || '/rcms/services/rest/hikRpcService/queryPodPosition';
+  if (rcsRackSyncQueryEndpoint) rcsRackSyncQueryEndpoint.value = data.rack_sync_query_endpoint || '/rcms/services/rest/hikRpcService/queryPodBerthAndMat';
+  if (rcsRackSyncBindEndpoint) rcsRackSyncBindEndpoint.value = data.rack_sync_bind_endpoint || '/rcms/services/rest/hikRpcService/bindPodAndBerth';
+  if (rcsRackSyncScheduleEnabled) rcsRackSyncScheduleEnabled.value = String(Number(data.rack_sync_schedule_enabled ?? 0));
+  if (rcsRackSyncScheduleTime) rcsRackSyncScheduleTime.value = data.rack_sync_schedule_time || '12:00';
   if (rcsTaskMonitorInterval) rcsTaskMonitorInterval.value = String(Number(data.task_monitor_interval_seconds ?? 3));
   if (rcsAgvMonitorInterval) rcsAgvMonitorInterval.value = String(Number(data.agv_monitor_interval_seconds ?? 5));
   if (cleanupMinAgeMinutes) cleanupMinAgeMinutes.value = String(Number(data.cleanup_min_age_minutes ?? 30));
@@ -3431,6 +3459,10 @@ async function adminSaveRcsConfig() {
     resume_robot_endpoint: (rcsResumeEndpoint?.value || '').trim() || '/rcms/services/rest/hikRpcService/resumeRobot',
     agv_status_endpoint: (rcsAgvStatusEndpoint?.value || '').trim() || '/rcms-dps/rest/queryAgvStatus',
     pod_position_endpoint: (rcsPodPositionEndpoint?.value || '').trim() || '/rcms/services/rest/hikRpcService/queryPodPosition',
+    rack_sync_query_endpoint: (rcsRackSyncQueryEndpoint?.value || '').trim() || '/rcms/services/rest/hikRpcService/queryPodBerthAndMat',
+    rack_sync_bind_endpoint: (rcsRackSyncBindEndpoint?.value || '').trim() || '/rcms/services/rest/hikRpcService/bindPodAndBerth',
+    rack_sync_schedule_enabled: safeFlagValue(rcsRackSyncScheduleEnabled, 0),
+    rack_sync_schedule_time: (rcsRackSyncScheduleTime?.value || '12:00').trim() || '12:00',
     task_monitor_interval_seconds: safeNumberInput(rcsTaskMonitorInterval, 3),
     agv_monitor_interval_seconds: safeNumberInput(rcsAgvMonitorInterval, 5),
     cleanup_min_age_minutes: Math.max(1, Math.round(safeNumberInput(cleanupMinAgeMinutes, 30))),
@@ -3493,6 +3525,161 @@ async function queryPodPosition() {
     if (podPositionMsg) podPositionMsg.textContent = data.message || 'Consulta terminada.';
   } finally {
     if (btnQueryPodPosition) btnQueryPodPosition.disabled = !adminToken;
+  }
+}
+
+function renderRackSyncPreview(data) {
+  if (!rackSyncResult) return;
+  lastRackSyncData = data || null;
+  if (!data) {
+    rackSyncResult.textContent = 'Etapa 3: consulta RCS y permite reasignar discrepancias manualmente con confirmacion.';
+    updateRackSyncButtons();
+    return;
+  }
+  const items = Array.isArray(data.items) ? data.items : [];
+  const isQuery = data.mode === 'query_compare_only';
+  const isBind = data.mode === 'bind_mismatches_manual';
+  const lines = [
+    `Modo: ${data.mode || 'preview_only'}`,
+    isBind ? 'Bind RCS: ejecutado' : (isQuery ? 'Consulta RCS: ejecutada' : 'Consulta RCS: no ejecutada'),
+    data.blocked == null ? '' : `Bloqueado por tareas activas: ${data.blocked ? 'Si' : 'No'}`,
+    `Tareas activas: ${Number(data.active_tasks_count || 0)}`,
+    `Endpoint consulta: ${data.query_endpoint || '-'}`,
+    `Endpoint bind: ${data.bind_endpoint || '-'}`,
+    data.map_short_name == null ? '' : `mapShortName: ${data.map_short_name || '(vacio)'}`,
+    `Racks asignados: ${Number(data.total_assigned_racks || 0)}`,
+    isBind
+      ? `Discrepancias: ${Number(data.mismatch_count || 0)} | Intentados: ${Number(data.attempted_count || 0)} | Exitosos: ${Number(data.success_count || 0)} | Errores: ${Number(data.error_count || 0)} | Omitidos: ${Number(data.skipped_count || 0)}`
+      : isQuery
+      ? `Coinciden: ${Number(data.match_count || 0)} | Diferentes: ${Number(data.mismatch_count || 0)} | No encontrados: ${Number(data.missing_count || 0)} | Invalidos: ${Number(data.invalid_count || 0)} | Errores: ${Number(data.error_count || 0)}`
+      : `Listos: ${Number(data.ready_count || 0)} | Con errores: ${Number(data.error_count || 0)}`,
+    '',
+    'Detalle:',
+  ].filter(Boolean);
+  for (const item of items.slice(0, 80)) {
+    lines.push('');
+    lines.push(`Rack ${item.rack_code || '(sin codigo)'} -> posicion local ${item.location_code || '(sin codigo)'} (${item.location_x}, ${item.location_y})`);
+    if (isBind) {
+      const rcsPosition = item.rcs_position_code || item.rcs_map_data_code || '(sin posicion previa)';
+      lines.push(`RCS previo: ${rcsPosition}`);
+      lines.push(`Estado comparacion: ${item.status} | accion: ${item.action || 'none'}`);
+      lines.push(`Resultado bind: ${item.bind_status || 'not_sent'}${item.bind_error ? ` | error: ${item.bind_error}` : ''}`);
+      if (item.bind_response_payload && Object.keys(item.bind_response_payload).length) {
+        lines.push('Respuesta bindPodAndBerth:');
+        lines.push(JSON.stringify(item.bind_response_payload || {}, null, 2));
+      }
+    } else if (isQuery) {
+      const rcsPosition = item.rcs_position_code || item.rcs_map_data_code || '(sin posicion)';
+      lines.push(`RCS reporta: ${rcsPosition}`);
+      lines.push(`Estado: ${item.status} | accion: ${item.action || 'none'}${item.query_error ? ` | error: ${item.query_error}` : ''}`);
+      if (item.status === 'mismatch') {
+        lines.push('JSON futuro bindPodAndBerth para etapa posterior:');
+        lines.push(JSON.stringify(item.bind_payload || {}, null, 2));
+      }
+    } else {
+      lines.push(`Estado: ${item.status}${Array.isArray(item.errors) && item.errors.length ? ` | errores: ${item.errors.join(', ')}` : ''}`);
+      lines.push('JSON consulta queryPodBerthAndMat:');
+      lines.push(JSON.stringify(item.query_payload || {}, null, 2));
+      lines.push('JSON futuro bindPodAndBerth si hay discrepancia:');
+      lines.push(JSON.stringify(item.bind_payload || {}, null, 2));
+    }
+  }
+  if (items.length > 80) lines.push(`\n... ${items.length - 80} racks adicionales no mostrados en pantalla.`);
+  rackSyncResult.textContent = lines.join('\n');
+  updateRackSyncButtons();
+}
+
+function updateRackSyncButtons() {
+  if (btnRackSyncPreview) btnRackSyncPreview.disabled = !adminToken;
+  if (btnRackSyncQuery) btnRackSyncQuery.disabled = !adminToken;
+  if (btnRackSyncHistory) btnRackSyncHistory.disabled = !adminToken;
+  if (btnRackSyncBind) {
+    const canBind = !!adminToken
+      && lastRackSyncData?.mode === 'query_compare_only'
+      && Number(lastRackSyncData?.mismatch_count || 0) > 0
+      && Number(lastRackSyncData?.active_tasks_count || 0) === 0;
+    btnRackSyncBind.disabled = !canBind;
+  }
+}
+
+function renderRackSyncHistory(rows) {
+  if (!rackSyncResult) return;
+  const events = Array.isArray(rows) ? rows : [];
+  lastRackSyncData = null;
+  const lines = [
+    'Historial reciente de sincronizacion rack-RCS',
+    `Eventos: ${events.length}`,
+    '',
+  ];
+  if (!events.length) {
+    lines.push('Sin eventos registrados todavia.');
+  }
+  for (const event of events) {
+    lines.push(`${event.created_at || ''} | ${event.action || '-'} | ${event.ok ? 'ok' : 'revision'} | ${Number(event.duration_ms || 0)} ms`);
+    lines.push(`Racks: ${Number(event.total_assigned_racks || 0)} | match: ${Number(event.match_count || 0)} | mismatch: ${Number(event.mismatch_count || 0)} | missing: ${Number(event.missing_count || 0)} | invalid: ${Number(event.invalid_count || 0)} | intentados: ${Number(event.attempted_count || 0)} | exitosos: ${Number(event.success_count || 0)} | errores: ${Number(event.error_count || 0)} | activos: ${Number(event.active_tasks_count || 0)}`);
+    if (event.message) lines.push(`Mensaje: ${event.message}`);
+    lines.push('');
+  }
+  rackSyncResult.textContent = lines.join('\n');
+  updateRackSyncButtons();
+}
+
+async function loadRackSyncPreview() {
+  if (rackSyncMsg) rackSyncMsg.textContent = 'Generando vista previa local...';
+  if (btnRackSyncPreview) btnRackSyncPreview.disabled = true;
+  try {
+    const data = await fetchJson(API.adminRackSyncPreview, { headers: fetchHeaders() });
+    renderRackSyncPreview(data);
+    if (rackSyncMsg) rackSyncMsg.textContent = data.message || 'Vista previa generada. No se envio nada al RCS.';
+  } finally {
+    updateRackSyncButtons();
+  }
+}
+
+async function loadRackSyncQuery() {
+  if (rackSyncMsg) rackSyncMsg.textContent = 'Consultando RCS y comparando posiciones...';
+  if (btnRackSyncPreview) btnRackSyncPreview.disabled = true;
+  if (btnRackSyncQuery) btnRackSyncQuery.disabled = true;
+  try {
+    const data = await fetchJson(API.adminRackSyncQuery, { method: 'POST', headers: fetchHeaders() });
+    renderRackSyncPreview(data);
+    if (rackSyncMsg) rackSyncMsg.textContent = data.message || 'Consulta RCS terminada. No se envio bind al RCS.';
+  } finally {
+    updateRackSyncButtons();
+  }
+}
+
+async function loadRackSyncHistory() {
+  if (rackSyncMsg) rackSyncMsg.textContent = 'Cargando historial de sincronizacion...';
+  if (btnRackSyncPreview) btnRackSyncPreview.disabled = true;
+  if (btnRackSyncQuery) btnRackSyncQuery.disabled = true;
+  if (btnRackSyncBind) btnRackSyncBind.disabled = true;
+  if (btnRackSyncHistory) btnRackSyncHistory.disabled = true;
+  try {
+    const data = await fetchJson(`${API.adminRackSyncHistory}?limit=30`, { headers: fetchHeaders() });
+    renderRackSyncHistory(data);
+    if (rackSyncMsg) rackSyncMsg.textContent = 'Historial cargado.';
+  } finally {
+    updateRackSyncButtons();
+  }
+}
+
+async function bindRackSyncMismatches() {
+  const mismatchCount = Number(lastRackSyncData?.mismatch_count || 0);
+  if (!mismatchCount) throw new Error('Primero consulta RCS y compara para detectar discrepancias.');
+  if (Number(lastRackSyncData?.active_tasks_count || 0) > 0) throw new Error('Hay tareas activas. No se puede reasignar racks en RCS.');
+  const confirmed = window.confirm(`Se enviara bindPodAndBerth para ${mismatchCount} rack(s) con discrepancia. Esta accion modifica la ubicacion del rack en RCS. ¿Continuar?`);
+  if (!confirmed) return;
+  if (rackSyncMsg) rackSyncMsg.textContent = 'Enviando bindPodAndBerth para discrepancias...';
+  if (btnRackSyncPreview) btnRackSyncPreview.disabled = true;
+  if (btnRackSyncQuery) btnRackSyncQuery.disabled = true;
+  if (btnRackSyncBind) btnRackSyncBind.disabled = true;
+  try {
+    const data = await fetchJson(API.adminRackSyncBind, { method: 'POST', headers: fetchHeaders() });
+    renderRackSyncPreview(data);
+    if (rackSyncMsg) rackSyncMsg.textContent = data.message || 'Reasignacion manual terminada.';
+  } finally {
+    updateRackSyncButtons();
   }
 }
 
@@ -4031,7 +4218,13 @@ function formatStatusLogEntries(entries) {
 }
 
 function renderOrderStatusQuery(_requestPayload, _responsePayload, logEntries = [], _force = false) {
-  if (orderStatusQueryResponseBox) orderStatusQueryResponseBox.innerHTML = formatStatusLogEntries(logEntries);
+  if (!orderStatusQueryResponseBox) return;
+  if (debugConsoleHoverPaused) {
+    debugConsolePendingEntries = Array.isArray(logEntries) ? [...logEntries] : [];
+    return;
+  }
+  debugConsolePendingEntries = null;
+  orderStatusQueryResponseBox.innerHTML = formatStatusLogEntries(logEntries);
 }
 
 
@@ -5545,6 +5738,25 @@ btnUploadBg?.addEventListener("click", async () => {
 btnSaveClientIp?.addEventListener("click", () => adminSaveClientIp().catch(err => adminMsg.textContent = `Error: ${String(err)}`));
 btnSaveRcsConfig?.addEventListener("click", () => adminSaveRcsConfig().catch(err => rcsConfigMsg.textContent = `Error: ${String(err)}`));
 btnTestRcsConfig?.addEventListener("click", () => adminTestRcsConfig().catch(err => rcsConfigMsg.textContent = `Error: ${String(err)}`));
+btnRackSyncPreview?.addEventListener("click", () => loadRackSyncPreview().catch(err => {
+  if (rackSyncMsg) rackSyncMsg.textContent = `Error: ${String(err)}`;
+  if (btnRackSyncPreview) btnRackSyncPreview.disabled = !adminToken;
+  if (btnRackSyncQuery) btnRackSyncQuery.disabled = !adminToken;
+}));
+btnRackSyncQuery?.addEventListener("click", () => loadRackSyncQuery().catch(err => {
+  if (rackSyncMsg) rackSyncMsg.textContent = `Error: ${String(err)}`;
+  if (btnRackSyncPreview) btnRackSyncPreview.disabled = !adminToken;
+  if (btnRackSyncQuery) btnRackSyncQuery.disabled = !adminToken;
+  updateRackSyncButtons();
+}));
+btnRackSyncBind?.addEventListener("click", () => bindRackSyncMismatches().catch(err => {
+  if (rackSyncMsg) rackSyncMsg.textContent = `Error: ${String(err)}`;
+  updateRackSyncButtons();
+}));
+btnRackSyncHistory?.addEventListener("click", () => loadRackSyncHistory().catch(err => {
+  if (rackSyncMsg) rackSyncMsg.textContent = `Error: ${String(err)}`;
+  updateRackSyncButtons();
+}));
 btnQueryPodPosition?.addEventListener("click", () => queryPodPosition().catch(err => {
   if (podPositionMsg) podPositionMsg.textContent = `Error: ${String(err)}`;
   if (btnQueryPodPosition) btnQueryPodPosition.disabled = !adminToken;
@@ -5602,6 +5814,19 @@ orderJsonBox?.addEventListener("blur", () => { isEditingOrderJson = false; });
 orderStatusQueryRequestBox?.addEventListener("focus", () => { if (currentStatusQueryMode() === "manual") isEditingStatusQueryRequest = true; });
 orderStatusQueryRequestBox?.addEventListener("blur", () => { isEditingStatusQueryRequest = false; });
 orderStatusQueryRequestBox?.addEventListener("input", () => { if (currentStatusQueryMode() === "manual") isEditingStatusQueryRequest = true; });
+orderStatusQueryResponseBox?.addEventListener("mouseenter", () => {
+  debugConsoleHoverPaused = true;
+  orderStatusQueryResponseBox.classList.add("paused");
+});
+orderStatusQueryResponseBox?.addEventListener("mouseleave", () => {
+  debugConsoleHoverPaused = false;
+  orderStatusQueryResponseBox.classList.remove("paused");
+  if (debugConsolePendingEntries) {
+    const pendingEntries = debugConsolePendingEntries;
+    debugConsolePendingEntries = null;
+    renderOrderStatusQuery(null, null, pendingEntries, true);
+  }
+});
 orderStatusQueryMode?.addEventListener("change", () => {
   isEditingStatusQueryRequest = false;
   refreshStatusQueryEditor(true).catch(err => orderMsg.textContent = `Error: ${String(err)}`);
