@@ -12,6 +12,9 @@ const API = {
   adminLogin: "/api/admin/login",
   adminLocPatch: (x, y) => `/api/admin/locations/${x}/${y}`,
   adminLocSave: (x, y) => `/api/admin/locations/${x}/${y}`,
+  adminLocFreeCreate: "/api/admin/locations/free",
+  adminLocFreeLayout: (id) => `/api/admin/locations/${id}/free-layout`,
+  adminLocFreeLayoutFromGrid: "/api/admin/locations/free-layout/from-grid",
   adminGrid: "/api/admin/grid-config",
   adminChangePwd: "/api/admin/change-password",
   background: "/api/background",
@@ -89,7 +92,14 @@ let GRID_W = 100;
 let GRID_H = 100;
 let locations = new Array(DB_W * DB_H).fill(null);
 let selected = { x: 0, y: 0 };
+const KEEP_VALUE = "__keep";
+let multiSelectedLocationIds = new Set();
+let multiSelectMode = false;
+let multiSelectBox = null;
 let adminToken = null;
+let mapLayoutMode = "grid";
+let freeLayoutDrag = null;
+let suppressNextCanvasClick = false;
 let catalog = { areas: [], materials: [], racks: [] };
 let hoverCell = null;
 let hoverPointer = { x: 0, y: 0 };
@@ -183,6 +193,10 @@ let lastSoftwareUpdateValidation = null;
 
 const dispRows = $("dispRows");
 const dispCols = $("dispCols");
+const mapLayoutModeSelect = $("mapLayoutMode");
+const freeLayoutEditEnabled = $("freeLayoutEditEnabled");
+const btnAddFreeCell = $("btnAddFreeCell");
+const freeLayoutMsg = $("freeLayoutMsg");
 const btnSaveGeneralConfig = $("btnSaveGeneralConfig");
 const btnHideConfiguredRange = $("btnHideConfiguredRange");
 const btnShowConfiguredRange = $("btnShowConfiguredRange");
@@ -273,6 +287,7 @@ const cellReservationState = $("cellReservationState");
 const cellReservationRack = $("cellReservationRack");
 const cellReservationTask = $("cellReservationTask");
 const cellNote = $("cellNote");
+const btnSelectCellsByArea = $("btnSelectCellsByArea");
 const btnSaveCell = $("btnSaveCell");
 const cellMsg = $("cellMsg");
 
@@ -1540,6 +1555,112 @@ function canvasToGrid(mx, my) {
   if (x < 0 || y < 0 || x >= GRID_W || y >= GRID_H) return null;
   return { x, y };
 }
+function isFreeLayoutMode() {
+  return mapLayoutMode === "free";
+}
+function isFreeLayoutEditing() {
+  return isFreeLayoutMode() && adminToken && String(freeLayoutEditEnabled?.value || "0") === "1";
+}
+function updateAddFreeCellAvailability() {
+  if (btnAddFreeCell) btnAddFreeCell.disabled = !isFreeLayoutEditing();
+}
+function canvasToWorld(mx, my) {
+  const scale = clamp(cam.scale, MIN_ZOOM, MAX_ZOOM);
+  return { x: (mx - cam.offX) / scale, y: (my - cam.offY) / scale };
+}
+function freeLayoutLocations() {
+  return locations.filter(loc => (
+    loc &&
+    Number(loc.x) >= 0 &&
+    Number(loc.y) >= 0 &&
+    Number(loc.x) < GRID_W &&
+    Number(loc.y) < GRID_H &&
+    (Number(loc.free_enabled || 0) === 1 || Number(loc.is_visible ?? 1) === 1)
+  ));
+}
+function freeRectForLocation(loc) {
+  const basePitch = BASE_CELL + BASE_GAP;
+  const hasFreePosition = Number(loc?.free_enabled || 0) === 1;
+  const x = hasFreePosition && Number.isFinite(Number(loc?.free_x)) ? Number(loc.free_x) : Number(loc?.x || 0) * basePitch;
+  const y = hasFreePosition && Number.isFinite(Number(loc?.free_y)) ? Number(loc.free_y) : Number(loc?.y || 0) * basePitch;
+  const w = hasFreePosition && Number.isFinite(Number(loc?.free_w)) ? Math.max(4, Number(loc.free_w)) : BASE_CELL;
+  const h = hasFreePosition && Number.isFinite(Number(loc?.free_h)) ? Math.max(4, Number(loc.free_h)) : BASE_CELL;
+  return { x, y, w, h };
+}
+function freeRectToCanvas(rect) {
+  const scale = clamp(cam.scale, MIN_ZOOM, MAX_ZOOM);
+  return {
+    x: cam.offX + rect.x * scale,
+    y: cam.offY + rect.y * scale,
+    w: rect.w * scale,
+    h: rect.h * scale,
+  };
+}
+function hitTestFreeLocation(mx, my) {
+  const world = canvasToWorld(mx, my);
+  const rows = freeLayoutLocations();
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    const loc = rows[i];
+    const rect = freeRectForLocation(loc);
+    if (world.x >= rect.x && world.x <= rect.x + rect.w && world.y >= rect.y && world.y <= rect.y + rect.h) {
+      return loc;
+    }
+  }
+  return null;
+}
+function normalizedCanvasRect(box) {
+  if (!box) return null;
+  const left = Math.min(box.startX, box.endX);
+  const top = Math.min(box.startY, box.endY);
+  const right = Math.max(box.startX, box.endX);
+  const bottom = Math.max(box.startY, box.endY);
+  return { left, top, right, bottom, width: right - left, height: bottom - top };
+}
+function rectsIntersect(a, b) {
+  return a.left <= b.right && a.right >= b.left && a.top <= b.bottom && a.bottom >= b.top;
+}
+function locationCanvasRect(loc) {
+  if (!loc) return null;
+  if (isFreeLayoutMode()) {
+    const rect = freeRectToCanvas(freeRectForLocation(loc));
+    return { left: rect.x, top: rect.y, right: rect.x + rect.w, bottom: rect.y + rect.h };
+  }
+  const { cell, pitch } = gridMetrics();
+  const x = cam.offX + Number(loc.x) * pitch;
+  const y = cam.offY + Number(loc.y) * pitch;
+  return { left: x, top: y, right: x + cell, bottom: y + cell };
+}
+function selectableLocationsForCurrentView() {
+  if (isFreeLayoutMode()) return freeLayoutLocations();
+  return locations.filter(loc => (
+    loc &&
+    Number(loc.is_visible ?? 1) === 1 &&
+    Number(loc.x) >= 0 &&
+    Number(loc.y) >= 0 &&
+    Number(loc.x) < GRID_W &&
+    Number(loc.y) < GRID_H
+  ));
+}
+function locationsInsideSelectionBox(box) {
+  const rect = normalizedCanvasRect(box);
+  if (!rect || rect.width < 2 || rect.height < 2) return [];
+  return selectableLocationsForCurrentView().filter(loc => {
+    const locRect = locationCanvasRect(loc);
+    return locRect && rectsIntersect(rect, locRect);
+  });
+}
+function drawMultiSelectBox() {
+  const rect = normalizedCanvasRect(multiSelectBox);
+  if (!rect) return;
+  ctx.save();
+  ctx.fillStyle = "rgba(56,189,248,0.12)";
+  ctx.strokeStyle = "rgba(56,189,248,0.95)";
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([6, 4]);
+  ctx.fillRect(rect.left, rect.top, rect.width, rect.height);
+  ctx.strokeRect(rect.left, rect.top, rect.width, rect.height);
+  ctx.restore();
+}
 function cellColor(loc) {
   if (!loc) return "rgba(0,0,0,0)";
   if (Number(loc.enabled ?? 1) !== 1) return "rgba(91,104,131,0.40)";
@@ -2022,11 +2143,70 @@ function drawAgvOverlay() {
     drawAgvRobotIcon(animated);
   });
 }
+function drawFreeLocationOutline(loc, color, inset = 2, width = 3) {
+  if (!loc) return;
+  const canvasRect = freeRectToCanvas(freeRectForLocation(loc));
+  ctx.lineWidth = width;
+  ctx.strokeStyle = color;
+  ctx.strokeRect(
+    canvasRect.x + inset,
+    canvasRect.y + inset,
+    Math.max(1, canvasRect.w - inset * 2),
+    Math.max(1, canvasRect.h - inset * 2),
+  );
+}
+function drawFreeLayout() {
+  const { scale } = gridMetrics();
+  const rows = freeLayoutLocations();
+  for (const loc of rows) {
+    const rect = freeRectToCanvas(freeRectForLocation(loc));
+    ctx.strokeStyle = "rgba(36,50,74,0.32)";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
+    ctx.fillStyle = cellColor(loc);
+    ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
+    const aColor = areaColorFor(loc);
+    if (aColor) {
+      ctx.strokeStyle = aColor;
+      ctx.lineWidth = Math.max(2, 3.2 * scale);
+      ctx.strokeRect(rect.x + 1.5, rect.y + 1.5, Math.max(1, rect.w - 3), Math.max(1, rect.h - 3));
+    }
+    const rack = getRackById(loc.rack_id);
+    if (rack) drawRackIcon(rect.x, rect.y, Math.min(rect.w, rect.h), rack, scale);
+    if (isFreeLayoutEditing()) {
+      ctx.fillStyle = "rgba(214,222,235,0.82)";
+      ctx.font = `${Math.max(10, 11 * scale)}px ui-sans-serif`;
+      const label = String(loc.code || `${loc.x},${loc.y}`).slice(0, 18);
+      ctx.fillText(label, rect.x + 4, rect.y + Math.max(12, 13 * scale));
+    }
+  }
+
+  drawAgvOverlay();
+  drawFreeLocationOutline(getLocationById(directMoveSourceCellId), "rgba(34,197,94,1)", 2, 3);
+  drawFreeLocationOutline(getLocationById(directMoveDestinationCellId), "rgba(96,165,250,1)", 4, 3);
+  drawFreeLocationOutline(operatorButtonSourceCell?.value ? getLocationById(Number(operatorButtonSourceCell.value)) : null, "rgba(16,185,129,1)", 6, 3);
+  drawFreeLocationOutline(operatorButtonDestinationCell?.value ? getLocationById(Number(operatorButtonDestinationCell.value)) : null, "rgba(59,130,246,1)", 8, 3);
+  if (hoverCell) drawFreeLocationOutline(hoverCell, "rgba(255,255,255,0.7)", 3, 2);
+  for (const loc of selectedLocations()) {
+    drawFreeLocationOutline(loc, "rgba(56,189,248,0.95)", 5, 2);
+  }
+  const selectedLoc = getLocationAtGrid(selected.x, selected.y);
+  drawFreeLocationOutline(selectedLoc, "rgba(255,209,102,1)", 1, 2);
+
+  ctx.fillStyle = "rgba(147,164,199,0.9)";
+  ctx.font = `${Math.max(12, 12 * scale)}px ui-sans-serif`;
+  ctx.fillText(`Vista libre: ${rows.length} celdas | Zoom: ${scale.toFixed(2)}x`, 10, 18);
+  drawMultiSelectBox();
+}
 function draw() {
   ctx.clearRect(0, 0, canvasCssW, canvasCssH);
   ctx.fillStyle = "#0a0f18";
   ctx.fillRect(0, 0, canvasCssW, canvasCssH);
   drawBackgroundImage();
+  if (isFreeLayoutMode()) {
+    drawFreeLayout();
+    return;
+  }
   const { scale, cell, pitch } = gridMetrics();
   const sx = clamp(Math.floor((-cam.offX) / pitch) - 1, 0, GRID_W - 1);
   const sy = clamp(Math.floor((-cam.offY) / pitch) - 1, 0, GRID_H - 1);
@@ -2112,9 +2292,19 @@ function draw() {
     ctx.strokeRect(px + 1, py + 1, cell - 2, cell - 2);
   }
 
+  for (const loc of selectedLocations()) {
+    if (!loc || Number(loc.is_visible ?? 1) !== 1) continue;
+    const px = cam.offX + Number(loc.x) * pitch;
+    const py = cam.offY + Number(loc.y) * pitch;
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "rgba(56,189,248,0.95)";
+    ctx.strokeRect(px + 5, py + 5, cell - 10, cell - 10);
+  }
+
   ctx.fillStyle = "rgba(147,164,199,0.9)";
   ctx.font = `${Math.max(12, 12 * scale)}px ui-sans-serif`;
   ctx.fillText(`Vista: ${GRID_W}×${GRID_H} | Zoom: ${scale.toFixed(2)}x`, 10, 18);
+  drawMultiSelectBox();
 }
 function fitGridToScreen() {
   const basePitch = BASE_CELL + BASE_GAP;
@@ -2126,7 +2316,41 @@ function fitGridToScreen() {
   cam.offY = (canvasCssH - GRID_H * pitch) / 2;
   draw();
 }
+function fitFreeLayoutToScreen() {
+  const rows = freeLayoutLocations();
+  if (!rows.length) {
+    fitMapToScreen();
+    return;
+  }
+  const bounds = rows.reduce((acc, loc) => {
+    const rect = freeRectForLocation(loc);
+    return {
+      minX: Math.min(acc.minX, rect.x),
+      minY: Math.min(acc.minY, rect.y),
+      maxX: Math.max(acc.maxX, rect.x + rect.w),
+      maxY: Math.max(acc.maxY, rect.y + rect.h),
+    };
+  }, { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity });
+  const pad = 48;
+  const worldW = Math.max(1, bounds.maxX - bounds.minX);
+  const worldH = Math.max(1, bounds.maxY - bounds.minY);
+  cam.scale = clamp(Math.min((canvasCssW - pad) / worldW, (canvasCssH - pad) / worldH), MIN_ZOOM, MAX_ZOOM);
+  cam.offX = (canvasCssW - worldW * cam.scale) / 2 - bounds.minX * cam.scale;
+  cam.offY = (canvasCssH - worldH * cam.scale) / 2 - bounds.minY * cam.scale;
+  draw();
+}
+function fitMapToScreen() {
+  if (isFreeLayoutMode()) fitFreeLayoutToScreen();
+  else fitGridToScreen();
+}
 function zoomAtPoint(nextScale, mx, my) {
+  if (isFreeLayoutMode()) {
+    const before = canvasToWorld(mx, my);
+    cam.scale = clamp(nextScale, MIN_ZOOM, MAX_ZOOM);
+    cam.offX = mx - before.x * cam.scale;
+    cam.offY = my - before.y * cam.scale;
+    return;
+  }
   const before = canvasToGrid(mx, my);
   cam.scale = clamp(nextScale, MIN_ZOOM, MAX_ZOOM);
   const after = canvasToGrid(mx, my);
@@ -2772,6 +2996,8 @@ function setAdminUI(enabled) {
 
   const adminOnlyIds = new Set([
     "operatorWindowId", "operatorWindowName", "operatorWindowActive", "operatorWindowBgColor", "operatorWindowButtonCount", "operatorWindowPasswordAdmin", "btnSaveOperatorWindow", "btnNewOperatorWindow", "adminWindowSelect",
+    "btnSelectCellsByArea",
+    "mapLayoutMode", "freeLayoutEditEnabled", "btnAddFreeCell",
     "podPositionRack", "btnQueryPodPosition", "rcsPodPositionEndpoint",
     "operatorButtonIndex", "operatorButtonActive", "operatorButtonLabel", "operatorButtonColor", "operatorButtonMode", "operatorButtonPriority", "operatorButtonSourceArea", "operatorButtonDestinationArea", "operatorButtonPointDestinationArea", "operatorButtonMaterial", "operatorButtonSourceCell", "operatorButtonDestinationCell", "btnOperatorButtonPickSource", "btnOperatorButtonPickDestination", "operatorButtonAgv", "operatorButtonTaskTyp", "operatorButtonComment", "btnSaveOperatorButton", "btnAddOperatorPointField"
   ]);
@@ -2810,6 +3036,8 @@ function setAdminUI(enabled) {
   refreshActionTabsAfterVisibilityChange();
   repairActionTabsLayout();
   updateBackupControls();
+  setCellBulkControlsState();
+  updateAddFreeCellAvailability();
 }
 function applyAgvOverlayConfigFromGrid(cfg = {}) {
   agvOverlayConfig.scale_x = Number(cfg.agv_overlay_scale_x ?? 1) || 1;
@@ -2846,8 +3074,10 @@ async function loadGridConfig() {
   const cfg = await fetchJson(API.gridConfig);
   GRID_H = Number(cfg.display_rows) || DB_H;
   GRID_W = Number(cfg.display_cols) || DB_W;
+  mapLayoutMode = String(cfg.map_layout_mode || "grid") === "free" ? "free" : "grid";
   dispRows.value = GRID_H;
   dispCols.value = GRID_W;
+  if (mapLayoutModeSelect) mapLayoutModeSelect.value = mapLayoutMode;
   applyAgvOverlayConfigFromGrid(cfg);
   RUNTIME_AUTO_REFRESH_MS = Math.max(2000, Math.round((Number(cfg.runtime_refresh_seconds) || 5) * 1000));
   RUNTIME_SOCKET_RECONNECT_MS = Math.max(1000, Math.round((Number(cfg.runtime_reconnect_seconds) || 3) * 1000));
@@ -2894,7 +3124,13 @@ function applyRuntimeSnapshotData(snapshot, preferredOrderId = null) {
   renderOrderStatusQuery(null, null, debugConsoleEvents, true);
   renderDirectMoveSelection();
   const selectedLoc = getLocationAtGrid(selected.x, selected.y);
-  if (selectedLoc) fillCellForm(selectedLoc);
+  if (isMultiSelectionActive()) {
+    multiSelectedLocationIds = new Set(Array.from(multiSelectedLocationIds).filter(id => getLocationById(id)));
+    fillMultiCellForm();
+  } else if (selectedLoc) {
+    fillCellForm(selectedLoc);
+  }
+  setCellBulkControlsState();
   refreshRackReservationFieldsForSelection();
 
   draw();
@@ -2922,7 +3158,6 @@ function renderAreaOptions() {
   const current = cellArea.value;
   cellArea.innerHTML = `<option value="">Sin área</option>` + catalog.areas.map(a => `<option value="${a.id}">${a.code} - ${a.name}</option>`).join("");
   if ([...cellArea.options].some(o => o.value === current)) cellArea.value = current;
-
   const activeAreas = catalog.areas.filter(a => Number(a.is_active) === 1);
   const currentSource = fifoSourceArea.value;
   const currentDestination = fifoDestinationArea.value;
@@ -3041,9 +3276,15 @@ async function refreshReservationUiState() {
   await loadCatalog();
   renderRackOptions();
   const selectedLoc = getLocationAtGrid(selected.x, selected.y);
-  if (selectedLoc) fillCellForm(selectedLoc);
+  if (isMultiSelectionActive()) {
+    multiSelectedLocationIds = new Set(Array.from(multiSelectedLocationIds).filter(id => getLocationById(id)));
+    fillMultiCellForm();
+  } else if (selectedLoc) {
+    fillCellForm(selectedLoc);
+  }
+  setCellBulkControlsState();
   refreshRackReservationFieldsForSelection();
-  syncCellReservationFromRackSelection();
+  if (!isMultiSelectionActive()) syncCellReservationFromRackSelection();
   draw();
 }
 async function refreshBackground() {
@@ -3344,6 +3585,7 @@ async function executeDirectMoveRequest() {
   draw();
 }
 function fillCellForm(loc) {
+  setBulkSelectMode(false);
   selectedCellTitle.textContent = `Celda (${selected.x}, ${selected.y})`;
   cellX.value = selected.x;
   cellY.value = selected.y;
@@ -3368,13 +3610,128 @@ function fillCellForm(loc) {
   if (cellReservationTask) cellReservationTask.value = taskLabel;
   cellNote.value = loc?.note || "";
 }
-async function selectCell(x, y) {
-  selected = { x, y };
-  fillCellForm(locations[idx(x, y)]);
+function selectedLocations() {
+  return Array.from(multiSelectedLocationIds)
+    .map(id => getLocationById(id))
+    .filter(Boolean)
+    .sort((a, b) => (Number(a.y) - Number(b.y)) || (Number(a.x) - Number(b.x)));
+}
+function setSelectKeepOption(selectEl, enabled, label = "Sin cambio") {
+  if (!selectEl) return;
+  const existing = Array.from(selectEl.options).find(o => o.value === KEEP_VALUE);
+  if (enabled && !existing) {
+    selectEl.insertBefore(new Option(label, KEEP_VALUE), selectEl.firstChild);
+  } else if (!enabled && existing) {
+    existing.remove();
+  }
+}
+function setBulkSelectMode(enabled) {
+  [cellStatus, cellEnabled, cellVisible, cellReservationState].forEach(el => setSelectKeepOption(el, enabled));
+  setSelectKeepOption(cellArea, enabled);
+  if (enabled) {
+    [cellStatus, cellEnabled, cellVisible, cellArea, cellReservationState].forEach(el => { if (el) el.value = KEEP_VALUE; });
+  }
+}
+function isMultiSelectionActive() {
+  return multiSelectedLocationIds.size > 1;
+}
+function clearMultiSelection(redraw = true) {
+  multiSelectedLocationIds.clear();
+  setBulkSelectMode(false);
+  if (redraw) {
+    fillCellForm(getLocationAtGrid(selected.x, selected.y));
+    setCellBulkControlsState();
+    draw();
+  }
+}
+function fillMultiCellForm() {
+  const rows = selectedLocations();
+  if (rows.length <= 1) {
+    setBulkSelectMode(false);
+    if (rows.length === 1) {
+      selected = { x: Number(rows[0].x), y: Number(rows[0].y) };
+      fillCellForm(rows[0]);
+    }
+    return;
+  }
+  setBulkSelectMode(true);
+  selectedCellTitle.textContent = `${rows.length} celdas seleccionadas`;
+  cellX.value = "";
+  cellY.value = "";
+  cellCode.value = "";
+  cellRack.value = "";
+  cellReservationRack.value = "Varios";
+  cellReservationTask.value = "Varios";
+  cellNote.value = "";
+  renderRackOptions();
+  cellRack.value = "";
+}
+function setCellBulkControlsState() {
+  const multi = isMultiSelectionActive();
+  [cellX, cellY, cellCode, cellRack, cellReservationRack, cellReservationTask, cellNote].forEach(el => {
+    if (el) el.disabled = multi ? true : !adminToken;
+  });
+  [cellStatus, cellEnabled, cellVisible, cellArea, cellReservationState, btnSaveCell].forEach(el => {
+    if (el) el.disabled = !adminToken;
+  });
+}
+function setPrimarySelection(loc, { preserveMulti = false } = {}) {
+  if (!loc) return;
+  selected = { x: Number(loc.x), y: Number(loc.y) };
+  if (!preserveMulti) multiSelectedLocationIds.clear();
+  if (isMultiSelectionActive()) fillMultiCellForm();
+  else fillCellForm(loc);
+  setCellBulkControlsState();
   renderDirectMoveSelection();
   draw();
 }
+async function selectCell(x, y, options = {}) {
+  const loc = locations[idx(x, y)] || getLocationAtGrid(x, y);
+  setPrimarySelection(loc || { x, y }, options);
+}
+function toggleMultiSelectedLocation(loc) {
+  if (!loc?.id) return;
+  const id = Number(loc.id);
+  if (multiSelectedLocationIds.has(id)) multiSelectedLocationIds.delete(id);
+  else multiSelectedLocationIds.add(id);
+  if (!multiSelectedLocationIds.size) multiSelectedLocationIds.add(id);
+  setPrimarySelection(loc, { preserveMulti: true });
+}
+async function saveMultiSelectedCells() {
+  const rows = selectedLocations();
+  if (rows.length <= 1) return saveSelectedCell();
+  const patch = {};
+  if (cellStatus?.value !== KEEP_VALUE) patch.status = Number(cellStatus.value || 0);
+  if (cellEnabled?.value !== KEEP_VALUE) patch.enabled = Number(cellEnabled.value || 1);
+  if (cellVisible?.value !== KEEP_VALUE) patch.is_visible = Number(cellVisible.value || 1);
+  if (cellArea?.value !== KEEP_VALUE) patch.area_id = cellArea.value ? Number(cellArea.value) : null;
+  const changeReservation = cellReservationState?.value !== KEEP_VALUE;
+  if (!Object.keys(patch).length && !changeReservation) {
+    cellMsg.textContent = "Selecciona al menos un campo para cambiar.";
+    return;
+  }
+  for (const loc of rows) {
+    if (Object.keys(patch).length) {
+      const saved = await fetchJson(API.adminLocPatch(loc.x, loc.y), { method: "PATCH", headers: { "Content-Type": "application/json", ...fetchHeaders() }, body: JSON.stringify(patch) });
+      locations[idx(saved.x, saved.y)] = saved;
+    }
+    if (changeReservation && loc.rack_id) {
+      await fetchJson(API.adminRackReservation(loc.rack_id), { method: "PATCH", headers: { "Content-Type": "application/json", ...fetchHeaders() }, body: JSON.stringify({ reserved: Number(cellReservationState.value || 0) }) });
+    }
+  }
+  await loadLocations();
+  await refreshReservationUiState();
+  const ids = new Set(rows.map(loc => Number(loc.id)));
+  multiSelectedLocationIds = new Set(locations.filter(loc => loc && ids.has(Number(loc.id))).map(loc => Number(loc.id)));
+  fillMultiCellForm();
+  draw();
+  cellMsg.textContent = `${rows.length} celdas actualizadas.`;
+}
 async function saveSelectedCell() {
+  if (isMultiSelectionActive()) {
+    await saveMultiSelectedCells();
+    return;
+  }
   const targetReserved = Number(cellReservationState?.value || 0) === 1 ? 1 : 0;
   const intendedRackId = Number(cellRack?.value || 0);
   if (targetReserved === 1 && !intendedRackId) {
@@ -3398,6 +3755,23 @@ async function saveSelectedCell() {
   locations[idx(selected.x, selected.y)] = loc;
   await refreshReservationUiState();
   cellMsg.textContent = `Celda (${selected.x}, ${selected.y}) guardada.`;
+}
+async function saveFreeLocationLayout(loc) {
+  if (!loc?.id) return null;
+  const payload = {
+    free_enabled: 1,
+    free_x: Number(loc.free_x || 0),
+    free_y: Number(loc.free_y || 0),
+    free_w: Math.max(4, Number(loc.free_w || BASE_CELL)),
+    free_h: Math.max(4, Number(loc.free_h || BASE_CELL)),
+  };
+  const saved = await fetchJson(API.adminLocFreeLayout(loc.id), {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", ...fetchHeaders() },
+    body: JSON.stringify(payload),
+  });
+  locations[idx(saved.x, saved.y)] = saved;
+  return saved;
 }
 async function saveArea() {
   const payload = { code: areaCode.value.trim(), name: areaName.value.trim(), description: areaDescription.value.trim() || null, matter_area: areaMatterArea?.value?.trim() || null, color: areaColor.value || "#4f46e5", area_type: areaType.value.trim() || "almacen", is_active: Number(areaActive.value || 1), priority: Number(areaPriority.value || 0) };
@@ -3896,14 +4270,71 @@ async function saveRack() {
 }
 
 canvas.addEventListener("mousedown", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+  if (e.button === 0 && multiSelectMode && !operatorButtonPickMode && !operatorActionPickMode && !directMovePickMode) {
+    e.preventDefault();
+    multiSelectBox = { startX: mx, startY: my, endX: mx, endY: my };
+    draw();
+    return;
+  }
   if (e.button === 1 || e.button === 2) {
     e.preventDefault(); dragging = true; dragStart = { x: e.clientX, y: e.clientY, offX: cam.offX, offY: cam.offY }; return;
   }
   if (e.button !== 0) return;
-  const rect = canvas.getBoundingClientRect();
+  const additiveSelect = e.ctrlKey || e.metaKey;
+  if (isFreeLayoutMode()) {
+    const loc = hitTestFreeLocation(mx, my);
+    if (!loc) {
+      if (isMultiSelectionActive()) clearMultiSelection(true);
+      return;
+    }
+    const locAlreadySelected = multiSelectedLocationIds.has(Number(loc.id));
+    if (operatorButtonPickMode) {
+      setOperatorButtonCell(operatorButtonPickMode, loc);
+    } else if (operatorActionPickMode) {
+      setOperatorActionCell(operatorActionPickMode, loc);
+    } else if (directMovePickMode) {
+      setDirectMoveCell(directMovePickMode, loc);
+    }
+    if (!operatorButtonPickMode && !operatorActionPickMode && !directMovePickMode && additiveSelect) {
+      toggleMultiSelectedLocation(loc);
+    } else if (!operatorButtonPickMode && !operatorActionPickMode && !directMovePickMode && isMultiSelectionActive() && locAlreadySelected) {
+      setPrimarySelection(loc, { preserveMulti: true });
+    } else if (!operatorButtonPickMode && !operatorActionPickMode && !directMovePickMode && isMultiSelectionActive() && !locAlreadySelected) {
+      clearMultiSelection(false);
+      selectCell(Number(loc.x), Number(loc.y));
+    } else {
+      selectCell(Number(loc.x), Number(loc.y));
+    }
+    if (isFreeLayoutEditing()) {
+      const world = canvasToWorld(mx, my);
+      const freeRect = freeRectForLocation(loc);
+      const group = multiSelectedLocationIds.has(Number(loc.id)) && multiSelectedLocationIds.size > 1
+        ? selectedLocations()
+        : [loc];
+      freeLayoutDrag = {
+        locationId: Number(loc.id),
+        startWorldX: world.x,
+        startWorldY: world.y,
+        startX: freeRect.x,
+        startY: freeRect.y,
+        group: group.map(item => ({ id: Number(item.id), rect: freeRectForLocation(item) })),
+        moved: false,
+      };
+      suppressNextCanvasClick = true;
+      e.preventDefault();
+    }
+    return;
+  }
   const g = canvasToGrid(e.clientX - rect.left, e.clientY - rect.top);
-  if (!g) return;
+  if (!g) {
+    if (isMultiSelectionActive()) clearMultiSelection(true);
+    return;
+  }
   const loc = getLocationAtGrid(g.x, g.y);
+  const locAlreadySelected = loc ? multiSelectedLocationIds.has(Number(loc.id)) : false;
   if (operatorButtonPickMode) {
     if (loc) {
       setOperatorButtonCell(operatorButtonPickMode, loc);
@@ -3923,9 +4354,23 @@ canvas.addEventListener("mousedown", (e) => {
       directMsg.textContent = `La celda (${g.x}, ${g.y}) no está disponible en la base de datos.`;
     }
   }
-  selectCell(g.x, g.y);
+  if (!operatorButtonPickMode && !operatorActionPickMode && !directMovePickMode && additiveSelect && loc) {
+    toggleMultiSelectedLocation(loc);
+  } else if (!operatorButtonPickMode && !operatorActionPickMode && !directMovePickMode && isMultiSelectionActive() && locAlreadySelected) {
+    setPrimarySelection(loc, { preserveMulti: true });
+  } else if (!operatorButtonPickMode && !operatorActionPickMode && !directMovePickMode && isMultiSelectionActive() && !locAlreadySelected) {
+    clearMultiSelection(false);
+    selectCell(g.x, g.y);
+  } else {
+    selectCell(g.x, g.y);
+  }
 });
 canvas.addEventListener("click", (e) => {
+  if (suppressNextCanvasClick) {
+    suppressNextCanvasClick = false;
+    return;
+  }
+  if (isFreeLayoutMode()) return;
   if (e.button !== 0 || !operatorButtonPickMode) return;
   const rect = canvas.getBoundingClientRect();
   const g = canvasToGrid(e.clientX - rect.left, e.clientY - rect.top);
@@ -3939,6 +4384,40 @@ canvas.addEventListener("click", (e) => {
   }
 });
 window.addEventListener("mousemove", (e) => {
+  if (multiSelectBox) {
+    const rect = canvas.getBoundingClientRect();
+    multiSelectBox.endX = e.clientX - rect.left;
+    multiSelectBox.endY = e.clientY - rect.top;
+    draw();
+    return;
+  }
+  if (freeLayoutDrag) {
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    const world = canvasToWorld(mx, my);
+    const loc = getLocationById(freeLayoutDrag.locationId);
+    if (loc) {
+      const dx = world.x - freeLayoutDrag.startWorldX;
+      const dy = world.y - freeLayoutDrag.startWorldY;
+      const group = Array.isArray(freeLayoutDrag.group) && freeLayoutDrag.group.length ? freeLayoutDrag.group : [{ id: freeLayoutDrag.locationId, rect: { x: freeLayoutDrag.startX, y: freeLayoutDrag.startY, w: loc.free_w || BASE_CELL, h: loc.free_h || BASE_CELL } }];
+      for (const item of group) {
+        const groupLoc = getLocationById(item.id);
+        if (!groupLoc) continue;
+        groupLoc.free_enabled = 1;
+        groupLoc.free_x = item.rect.x + dx;
+        groupLoc.free_y = item.rect.y + dy;
+        groupLoc.free_w = item.rect.w;
+        groupLoc.free_h = item.rect.h;
+      }
+      freeLayoutDrag.moved = freeLayoutDrag.moved || Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5;
+      hoverPointer = { x: mx, y: my };
+      hoverCell = loc;
+      draw();
+      updateCellHoverTooltip();
+    }
+    return;
+  }
   if (dragging) {
     cam.offX = dragStart.offX + (e.clientX - dragStart.x);
     cam.offY = dragStart.offY + (e.clientY - dragStart.y);
@@ -3953,12 +4432,42 @@ window.addEventListener("mousemove", (e) => {
     return;
   }
   hoverPointer = { x: e.clientX - rect.left, y: e.clientY - rect.top };
-  const g = canvasToGrid(hoverPointer.x, hoverPointer.y);
-  hoverCell = g;
+  hoverCell = isFreeLayoutMode() ? hitTestFreeLocation(hoverPointer.x, hoverPointer.y) : canvasToGrid(hoverPointer.x, hoverPointer.y);
   updateCellHoverTooltip();
   draw();
 });
-window.addEventListener("mouseup", () => { dragging = false; });
+window.addEventListener("mouseup", () => {
+  if (multiSelectBox) {
+    const rows = locationsInsideSelectionBox(multiSelectBox);
+    multiSelectBox = null;
+    if (rows.length) {
+      multiSelectedLocationIds = new Set(rows.map(loc => Number(loc.id)));
+      setPrimarySelection(rows[0], { preserveMulti: true });
+      cellMsg.textContent = `${rows.length} celdas seleccionadas.`;
+    } else {
+      clearMultiSelection(true);
+      cellMsg.textContent = "No se encontraron celdas en el area seleccionada.";
+    }
+    draw();
+    return;
+  }
+  dragging = false;
+  if (freeLayoutDrag) {
+    const groupIds = Array.isArray(freeLayoutDrag.group) && freeLayoutDrag.group.length
+      ? freeLayoutDrag.group.map(item => Number(item.id))
+      : [Number(freeLayoutDrag.locationId)];
+    const didMove = freeLayoutDrag.moved;
+    freeLayoutDrag = null;
+    if (didMove) {
+      Promise.all(groupIds.map(id => {
+        const item = getLocationById(id);
+        return item ? saveFreeLocationLayout(item) : Promise.resolve(null);
+      }))
+        .then(() => { if (freeLayoutMsg) freeLayoutMsg.textContent = groupIds.length > 1 ? "Posiciones libres guardadas." : "Posicion libre guardada."; })
+        .catch((err) => { if (freeLayoutMsg) freeLayoutMsg.textContent = `Error: ${String(err)}`; });
+    }
+  }
+});
 canvas.addEventListener("mouseleave", () => { clearCellHoverTooltip(); draw(); });
 canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 canvas.addEventListener("wheel", (e) => {
@@ -4136,8 +4645,13 @@ function buildCellHoverHtml(loc) {
 }
 function updateCellHoverTooltip() {
   if (!cellHoverTooltip) return;
-  const loc = hoverCell ? getLocationAtGrid(hoverCell.x, hoverCell.y) : null;
-  if (!hoverCell || !loc || Number(loc.is_visible ?? 1) !== 1) {
+  const loc = isFreeLayoutMode()
+    ? hoverCell
+    : (hoverCell ? getLocationAtGrid(hoverCell.x, hoverCell.y) : null);
+  const visible = isFreeLayoutMode()
+    ? (Number(loc?.free_enabled || 0) === 1 || Number(loc?.is_visible ?? 1) === 1)
+    : Number(loc?.is_visible ?? 1) === 1;
+  if (!hoverCell || !loc || !visible) {
     cellHoverTooltip.classList.add('hidden');
     cellHoverTooltip.innerHTML = '';
     return;
@@ -4933,6 +5447,7 @@ function buildGeneralConfigPayload() {
   return {
     display_rows: Number(dispRows.value || GRID_H || 1),
     display_cols: Number(dispCols.value || GRID_W || 1),
+    map_layout_mode: mapLayoutModeSelect?.value === "free" ? "free" : "grid",
     agv_overlay_scale_x: Number(agvOverlayConfig.scale_x || 1),
     agv_overlay_scale_y: Number(agvOverlayConfig.scale_y || 1),
     agv_overlay_offset_x: Number(agvOverlayConfig.offset_x || 0),
@@ -4968,7 +5483,7 @@ btnSaveGeneralConfig?.addEventListener("click", async () => {
     await saveBgTransform();
     await loadGridConfig();
     await refreshBackground();
-    fitGridToScreen();
+    fitMapToScreen();
     draw();
     if (selected.x >= GRID_W || selected.y >= GRID_H) selectCell(0, 0);
     adminMsg.textContent = `Configuración general guardada. Vista actualizada a ${GRID_W}×${GRID_H}.`;
@@ -4978,6 +5493,40 @@ btnSaveGeneralConfig?.addEventListener("click", async () => {
 });
 btnHideConfiguredRange?.addEventListener("click", () => adminHideConfiguredRange().catch(err => rangeMsg.textContent = `Error: ${String(err)}`));
 btnShowConfiguredRange?.addEventListener("click", () => adminShowConfiguredRange().catch(err => rangeMsg.textContent = `Error: ${String(err)}`));
+mapLayoutModeSelect?.addEventListener("change", () => {
+  mapLayoutMode = mapLayoutModeSelect.value === "free" ? "free" : "grid";
+  hoverCell = null;
+  updateAddFreeCellAvailability();
+  fitMapToScreen();
+  draw();
+});
+freeLayoutEditEnabled?.addEventListener("change", () => {
+  updateAddFreeCellAvailability();
+  draw();
+});
+btnAddFreeCell?.addEventListener("click", async () => {
+  try {
+    if (!isFreeLayoutEditing()) {
+      if (freeLayoutMsg) freeLayoutMsg.textContent = "Activa modo Libre y Editar modo libre = Si para agregar celdas.";
+      updateAddFreeCellAvailability();
+      return;
+    }
+    const loc = await fetchJson(API.adminLocFreeCreate, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...fetchHeaders() },
+      body: JSON.stringify({ display_rows: GRID_H, display_cols: GRID_W }),
+    });
+    locations[idx(loc.x, loc.y)] = loc;
+    if (mapLayoutModeSelect) {
+      mapLayoutModeSelect.value = "free";
+      mapLayoutMode = "free";
+    }
+    await selectCell(Number(loc.x), Number(loc.y));
+    if (freeLayoutMsg) freeLayoutMsg.textContent = `Celda de cuadricula mostrada (${loc.x}, ${loc.y}).`;
+  } catch (err) {
+    if (freeLayoutMsg) freeLayoutMsg.textContent = `Error: ${String(err)}`;
+  }
+});
 btnUploadBg?.addEventListener("click", async () => {
   try {
     if (!bgFile?.files?.[0]) return;
@@ -5007,6 +5556,17 @@ btnChangePwd?.addEventListener("click", async () => {
   } catch (err) { adminMsg.textContent = `Error: ${String(err)}`; }
 });
 btnSaveCell?.addEventListener("click", () => saveSelectedCell().catch(err => cellMsg.textContent = `Error: ${String(err)}`));
+btnSelectCellsByArea?.addEventListener("click", () => {
+  multiSelectMode = !multiSelectMode;
+  if (btnSelectCellsByArea) {
+    btnSelectCellsByArea.textContent = multiSelectMode ? "Seleccion multiple activa" : "Seleccion multiple";
+    btnSelectCellsByArea.classList.toggle("primary", multiSelectMode);
+  }
+  cellMsg.textContent = multiSelectMode
+    ? "Seleccion multiple activa: clic izquierdo y arrastra para dibujar el area."
+    : "Seleccion multiple desactivada.";
+  draw();
+});
 btnNewArea?.addEventListener("click", clearAreaForm);
 btnSaveArea?.addEventListener("click", () => saveArea().catch(err => areaMsg.textContent = `Error: ${String(err)}`));
 btnDeleteArea?.addEventListener("click", () => deleteArea().catch(err => areaMsg.textContent = `Error: ${String(err)}`));
@@ -5143,7 +5703,7 @@ operatorActionMaterial?.addEventListener("change", syncOperatorActionStateFromIn
 operatorActionAreaSelect?.addEventListener("change", syncOperatorActionStateFromInputs);
 cellArea?.addEventListener("change", renderRackOptions);
 cellRack?.addEventListener("change", syncCellReservationFromRackSelection);
-btnCenterGrid?.addEventListener("click", () => { scheduleCanvasResize(); requestAnimationFrame(() => fitGridToScreen()); });
+btnCenterGrid?.addEventListener("click", () => { scheduleCanvasResize(); requestAnimationFrame(() => fitMapToScreen()); });
 btnRobotMonitorRefresh?.addEventListener('click', () => { refreshRobotMonitor({ force: true }).catch(() => {}); });
 window.addEventListener("resize", scheduleCanvasResize);
 window.addEventListener("orientationchange", scheduleCanvasResize);
@@ -5193,7 +5753,7 @@ if (operatorActionDynamicFields) operatorActionDynamicFields.addEventListener('i
     if (runtimeAutoRefreshHandle) clearInterval(runtimeAutoRefreshHandle);
     runtimeAutoRefreshHandle = null;
     connectRuntimeSocket();
-    fitGridToScreen();
+    fitMapToScreen();
     await refreshBackground();
     await loadPublicRcsMonitorConfig();
     if (robotMonitorEnabled) {

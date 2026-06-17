@@ -399,6 +399,7 @@ select, textarea{
 textarea{resize:vertical; min-height:72px}
 .row.two-col{display:grid; grid-template-columns:1fr 1fr; gap:10px; align-items:end}
 .row.two-col > div{display:flex; flex-direction:column; gap:6px}
+.button-column{display:flex; flex-direction:column; gap:6px}
 .list-box{display:flex; flex-direction:column; gap:8px; max-height:220px; overflow:auto; margin-top:8px}
 .list-item{
   text-align:left;

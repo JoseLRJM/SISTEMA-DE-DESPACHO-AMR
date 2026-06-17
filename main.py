@@ -150,6 +150,30 @@ class LocationPatchAdmin(BaseModel):
     rack_id: Optional[int] = Field(default=None)
 
 
+class LocationFreeLayoutPatch(BaseModel):
+    free_enabled: Optional[int] = Field(default=None, ge=0, le=1)
+    free_x: Optional[float] = Field(default=None, ge=-1000000.0, le=1000000.0)
+    free_y: Optional[float] = Field(default=None, ge=-1000000.0, le=1000000.0)
+    free_w: Optional[float] = Field(default=None, gt=1.0, le=1000000.0)
+    free_h: Optional[float] = Field(default=None, gt=1.0, le=1000000.0)
+
+
+class LocationFreeCreate(BaseModel):
+    code: Optional[str] = Field(default=None, max_length=64)
+    display_rows: Optional[int] = Field(default=None, ge=1, le=DB_GRID_H)
+    display_cols: Optional[int] = Field(default=None, ge=1, le=DB_GRID_W)
+    free_x: float = Field(default=0.0, ge=-1000000.0, le=1000000.0)
+    free_y: float = Field(default=0.0, ge=-1000000.0, le=1000000.0)
+    free_w: float = Field(default=22.0, gt=1.0, le=1000000.0)
+    free_h: float = Field(default=22.0, gt=1.0, le=1000000.0)
+
+
+class LocationFreeLayoutInitIn(BaseModel):
+    pitch: float = Field(default=24.0, gt=1.0, le=10000.0)
+    cell_size: float = Field(default=22.0, gt=1.0, le=10000.0)
+    only_missing: int = Field(default=1, ge=0, le=1)
+
+
 class LocationOut(BaseModel):
     id: int
     x: int
@@ -162,6 +186,11 @@ class LocationOut(BaseModel):
     note: Optional[str] = None
     area_id: Optional[int] = None
     rack_id: Optional[int] = None
+    free_enabled: int = 0
+    free_x: Optional[float] = None
+    free_y: Optional[float] = None
+    free_w: Optional[float] = None
+    free_h: Optional[float] = None
     area_name: Optional[str] = None
     rack_code: Optional[str] = None
     reservation_status: str = "No reservado"
@@ -183,6 +212,7 @@ class AdminChangePassword(BaseModel):
 class GridDisplayConfig(BaseModel):
     display_rows: int = Field(ge=1, le=DB_GRID_H)
     display_cols: int = Field(ge=1, le=DB_GRID_W)
+    map_layout_mode: str = Field(default="grid", max_length=16)
     agv_overlay_scale_x: float = Field(default=1.0, ge=-1000000.0, le=1000000.0)
     agv_overlay_scale_y: float = Field(default=1.0, ge=-1000000.0, le=1000000.0)
     agv_overlay_offset_x: float = Field(default=0.0, ge=-1000000.0, le=1000000.0)
@@ -194,6 +224,14 @@ class GridDisplayConfig(BaseModel):
     agv_icon_angle_mirror: int = Field(default=0, ge=0, le=1)
     runtime_refresh_seconds: float = Field(default=5.0, ge=2.0, le=120.0)
     runtime_reconnect_seconds: float = Field(default=3.0, ge=1.0, le=60.0)
+
+    @field_validator("map_layout_mode")
+    @classmethod
+    def validate_map_layout_mode(cls, value: str) -> str:
+        normalized = (value or "grid").strip().lower()
+        if normalized not in {"grid", "free"}:
+            raise ValueError("map_layout_mode debe ser grid o free")
+        return normalized
 
 
 class BackgroundOut(BaseModel):
@@ -801,6 +839,11 @@ def cleanup_legacy_schema():
             "note": "ALTER TABLE locations ADD COLUMN note VARCHAR(512);",
             "area_id": "ALTER TABLE locations ADD COLUMN area_id INTEGER;",
             "rack_id": "ALTER TABLE locations ADD COLUMN rack_id INTEGER;",
+            "free_enabled": "ALTER TABLE locations ADD COLUMN free_enabled INTEGER NOT NULL DEFAULT 0;",
+            "free_x": "ALTER TABLE locations ADD COLUMN free_x FLOAT;",
+            "free_y": "ALTER TABLE locations ADD COLUMN free_y FLOAT;",
+            "free_w": "ALTER TABLE locations ADD COLUMN free_w FLOAT;",
+            "free_h": "ALTER TABLE locations ADD COLUMN free_h FLOAT;",
         }
         for name, stmt in missing_sql.items():
             if name not in cols:
@@ -1257,7 +1300,7 @@ def _location_out(db, r: Location, area_by_id: Optional[dict] = None, rack_by_id
         id=r.id,
         x=r.x,
         y=r.y,
-        status=_derived_location_status(r.rack_id),
+        status=int(r.status or 0),
         is_visible=r.is_visible,
         updated_at=r.updated_at,
         code=r.code,
@@ -1265,6 +1308,11 @@ def _location_out(db, r: Location, area_by_id: Optional[dict] = None, rack_by_id
         note=r.note,
         area_id=r.area_id,
         rack_id=r.rack_id,
+        free_enabled=int(r.free_enabled or 0),
+        free_x=r.free_x,
+        free_y=r.free_y,
+        free_w=r.free_w,
+        free_h=r.free_h,
         area_name=area.name if area else None,
         rack_code=rack.code if rack else None,
         reservation_status=reservation["reservation_status"],
@@ -1310,7 +1358,10 @@ def _derived_location_status(rack_id: Optional[int]) -> int:
 
 
 def _sync_location_status(row: Location) -> Location:
-    row.status = _derived_location_status(row.rack_id)
+    if row.rack_id is not None:
+        row.status = 1
+    elif int(row.status or 0) not in (0, 1):
+        row.status = 0
     row.updated_at = datetime.utcnow()
     return row
 
@@ -1319,7 +1370,9 @@ def _sync_all_location_statuses(db):
     changed = False
     now = datetime.utcnow()
     for row in db.execute(select(Location)).scalars().all():
-        derived = _derived_location_status(row.rack_id)
+        derived = 1 if row.rack_id is not None else int(row.status or 0)
+        if derived not in (0, 1):
+            derived = 0
         if int(row.status or 0) != derived:
             row.status = derived
             row.updated_at = now
@@ -2681,6 +2734,7 @@ def get_grid_config():
     with SessionLocal() as db:
         rows = int(get_setting(db, "display_rows", str(DB_GRID_H)))
         cols = int(get_setting(db, "display_cols", str(DB_GRID_W)))
+        map_layout_mode = get_setting(db, "map_layout_mode", "grid")
         agv_overlay_scale_x = float(get_setting(db, "agv_overlay_scale_x", "1.0") or 1.0)
         agv_overlay_scale_y = float(get_setting(db, "agv_overlay_scale_y", "1.0") or 1.0)
         agv_overlay_offset_x = float(get_setting(db, "agv_overlay_offset_x", "0.0") or 0.0)
@@ -2695,6 +2749,7 @@ def get_grid_config():
     return GridDisplayConfig(
         display_rows=rows,
         display_cols=cols,
+        map_layout_mode=map_layout_mode,
         agv_overlay_scale_x=agv_overlay_scale_x,
         agv_overlay_scale_y=agv_overlay_scale_y,
         agv_overlay_offset_x=agv_overlay_offset_x,
@@ -2712,10 +2767,11 @@ def get_grid_config():
 @app.post("/api/admin/grid-config", response_model=GridDisplayConfig)
 def set_grid_config(payload: GridDisplayConfig, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
     require_admin(x_admin_token)
-    logger.info("Admin updating grid config rows=%s cols=%s", payload.display_rows, payload.display_cols)
+    logger.info("Admin updating grid config rows=%s cols=%s map_layout_mode=%s", payload.display_rows, payload.display_cols, payload.map_layout_mode)
     with SessionLocal() as db:
         set_setting(db, "display_rows", str(payload.display_rows))
         set_setting(db, "display_cols", str(payload.display_cols))
+        set_setting(db, "map_layout_mode", payload.map_layout_mode)
         set_setting(db, "agv_overlay_scale_x", str(payload.agv_overlay_scale_x))
         set_setting(db, "agv_overlay_scale_y", str(payload.agv_overlay_scale_y))
         set_setting(db, "agv_overlay_offset_x", str(payload.agv_overlay_offset_x))
@@ -5391,6 +5447,106 @@ def admin_delete_movement_order(order_id: int, x_admin_token: Optional[str] = He
         return {"ok": True, "order_id": order_id, "order_code": order_code, "message": f"Orden {order_code} borrada permanentemente del historial y del monitoreo."}
 
 
+def _first_available_location_xy(db, max_cols: int = DB_GRID_W, max_rows: int = DB_GRID_H) -> tuple[int, int]:
+    used = {
+        (int(row.x), int(row.y))
+        for row in db.execute(select(Location.x, Location.y)).all()
+    }
+    for y in range(max_rows):
+        for x in range(max_cols):
+            if (x, y) not in used:
+                return x, y
+    raise HTTPException(status_code=409, detail="No hay coordenadas internas disponibles dentro del rango configurado")
+
+
+@app.post("/api/admin/locations/free", response_model=LocationOut)
+def admin_create_free_location(body: LocationFreeCreate, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        max_rows = int(body.display_rows or get_setting(db, "display_rows", str(DB_GRID_H)))
+        max_cols = int(body.display_cols or get_setting(db, "display_cols", str(DB_GRID_W)))
+        max_rows = max(1, min(DB_GRID_H, max_rows))
+        max_cols = max(1, min(DB_GRID_W, max_cols))
+        r = db.execute(
+            select(Location)
+            .where(
+                Location.x >= 0,
+                Location.y >= 0,
+                Location.x < max_cols,
+                Location.y < max_rows,
+                Location.is_visible == 0,
+                Location.free_enabled == 0,
+                Location.rack_id.is_(None),
+                Location.area_id.is_(None),
+                Location.code.is_(None),
+            )
+            .order_by(Location.y.asc(), Location.x.asc())
+        ).scalars().first()
+        if not r:
+            x, y = _first_available_location_xy(db, max_cols=max_cols, max_rows=max_rows)
+            r = Location(x=x, y=y, status=0, is_visible=0, enabled=1)
+        r.code = (body.code or "").strip() or r.code
+        r.is_visible = 1
+        r.free_enabled = 0
+        r.free_x = None
+        r.free_y = None
+        r.free_w = None
+        r.free_h = None
+        _sync_location_status(r)
+        db.add(r)
+        db.commit()
+        db.refresh(r)
+        logger.info("Free-layout cell created location_id=%s x=%s y=%s free_x=%s free_y=%s", r.id, r.x, r.y, r.free_x, r.free_y)
+        return _location_out(db, r)
+
+
+@app.post("/api/admin/locations/free-layout/from-grid")
+def admin_init_free_layout_from_grid(body: LocationFreeLayoutInitIn, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    updated = 0
+    with SessionLocal() as db:
+        rows = db.execute(select(Location)).scalars().all()
+        for r in rows:
+            if int(r.is_visible or 0) != 1:
+                continue
+            if int(body.only_missing or 0) == 1 and int(r.free_enabled or 0) == 1 and r.free_x is not None and r.free_y is not None:
+                continue
+            r.free_enabled = 1
+            r.free_x = float(r.x) * float(body.pitch)
+            r.free_y = float(r.y) * float(body.pitch)
+            r.free_w = float(body.cell_size)
+            r.free_h = float(body.cell_size)
+            db.add(r)
+            updated += 1
+        db.commit()
+    logger.info("Free-layout initialized from grid updated=%s only_missing=%s", updated, body.only_missing)
+    return {"ok": True, "updated": updated}
+
+
+@app.patch("/api/admin/locations/{location_id}/free-layout", response_model=LocationOut)
+def admin_patch_location_free_layout(location_id: int, patch: LocationFreeLayoutPatch, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        r = db.get(Location, location_id)
+        if not r:
+            raise HTTPException(status_code=404, detail="UbicaciÃ³n no encontrada")
+        if patch.free_enabled is not None:
+            r.free_enabled = patch.free_enabled
+        if patch.free_x is not None:
+            r.free_x = patch.free_x
+        if patch.free_y is not None:
+            r.free_y = patch.free_y
+        if patch.free_w is not None:
+            r.free_w = patch.free_w
+        if patch.free_h is not None:
+            r.free_h = patch.free_h
+        db.add(r)
+        db.commit()
+        db.refresh(r)
+        logger.info("Free-layout cell patched location_id=%s free_enabled=%s free_x=%s free_y=%s free_w=%s free_h=%s", r.id, r.free_enabled, r.free_x, r.free_y, r.free_w, r.free_h)
+        return _location_out(db, r)
+
+
 @app.get("/api/admin/locations/{x}/{y}", response_model=LocationOut)
 def admin_get_location(x: int, y: int, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
     require_admin(x_admin_token)
@@ -5415,6 +5571,8 @@ def admin_patch_location(x: int, y: int, patch: LocationPatchAdmin, x_admin_toke
         _validate_foreign_keys(db, area_id, rack_id, ignore_xy=(x, y))
         if patch.is_visible is not None:
             r.is_visible = patch.is_visible
+        if patch.status is not None:
+            r.status = patch.status
         if patch.code is not None:
             r.code = patch.code.strip() or None
         if patch.enabled is not None:

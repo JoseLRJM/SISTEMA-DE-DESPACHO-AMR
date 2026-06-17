@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine
+from sqlalchemy import Column, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 from logging_config import configure_logging, configure_sqlalchemy_logging, get_logger
 
@@ -93,6 +93,11 @@ class Location(Base):
     note = Column(String(512), nullable=True)
     area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
     rack_id = Column(Integer, ForeignKey("racks.id"), nullable=True, unique=True)
+    free_enabled = Column(Integer, nullable=False, default=0)
+    free_x = Column(Float, nullable=True)
+    free_y = Column(Float, nullable=True)
+    free_w = Column(Float, nullable=True)
+    free_h = Column(Float, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("x", "y", name="uq_xy"),

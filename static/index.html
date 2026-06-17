@@ -128,6 +128,26 @@
 </div>
 </div>
 <div class="row two-col">
+<div>
+<label>Modo visual del mapa</label>
+<select disabled="" id="mapLayoutMode">
+<option value="grid">Cuadricula</option>
+<option value="free">Libre</option>
+</select>
+</div>
+<div>
+<label>Editar modo libre</label>
+<select disabled="" id="freeLayoutEditEnabled">
+<option value="0">No</option>
+<option value="1">Si</option>
+</select>
+</div>
+</div>
+<div class="row">
+<button class="btn" disabled="" id="btnAddFreeCell">Agregar celda libre</button>
+</div>
+<div class="small" id="freeLayoutMsg"></div>
+<div class="row two-col">
 <button class="btn danger" disabled="" id="btnHideConfiguredRange">Ocultar rango</button>
 <button class="btn" disabled="" id="btnShowConfiguredRange">Mostrar rango</button>
 </div>
@@ -233,6 +253,11 @@
 <div class="card" id="card-cell">
 <h3>Celda seleccionada</h3>
 <div class="small" id="selectedCellTitle">Celda (0, 0)</div>
+<div class="row">
+<div class="button-column">
+<button class="btn" disabled="" id="btnSelectCellsByArea">Seleccion multiple</button>
+</div>
+</div>
 <div class="row two-col">
 <div>
 <label>Fila</label>
