@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>PDA Escaneo QR</title>
+  <link rel="stylesheet" href="/static/pda.css?v=local" />
+</head>
+<body>
+  <main class="pda-shell">
+    <section class="pda-card pda-hero shared-mode">
+      <div>
+        <div class="eyebrow">PDA · Preview QR</div>
+        <h1>Escaneo PDA</h1>
+      </div>
+      <div id="statusBadge" class="status-badge ready">LISTO PARA ESCANEAR</div>
+    </section>
+
+    <section class="pda-card pda-mode-card shared-mode">
+      <div>
+        <div id="pdaModeBadge" class="pda-mode-badge">Modo operador</div>
+        <div class="pda-terminal-summary">
+          <span>Terminal: <b id="pdaModeTerminal">-</b></span>
+          <span>Scanner: <b id="pdaModeScanner">-</b></span>
+        </div>
+      </div>
+      <div class="pda-mode-actions">
+        <button id="btnPdaAdminAccess" class="operator-only secondary" type="button">Acceso administrador</button>
+        <button id="btnPdaExitDeveloper" class="developer-only secondary" type="button">Salir del modo desarrollador</button>
+      </div>
+    </section>
+
+    <section class="pda-card config-card developer-only">
+      <button class="config-toggle" id="btnToggleConfig" type="button">Configurar terminal</button>
+      <div class="config-body" id="configBody">
+        <label for="terminalCode">Terminal code</label>
+        <input id="terminalCode" autocomplete="off" placeholder="PDA_SW_44_03" type="text" />
+
+        <label for="terminalKey">API key</label>
+        <input id="terminalKey" autocomplete="off" placeholder="Dejar vac&iacute;o para conservar la clave actual" type="password" />
+        <p class="hint">La clave actual se conservar&aacute; si deja este campo vac&iacute;o.</p>
+        <div id="configMsg" class="config-message">Escribe el c&oacute;digo de terminal.</div>
+        <div class="config-actions">
+          <button id="btnSaveConfig" type="button">Validar y guardar</button>
+          <button id="btnCancelConfig" class="secondary" type="button">Cancelar</button>
+          <button id="btnClearConfig" class="secondary danger-lite" type="button">Quitar configuraci&oacute;n</button>
+        </div>
+        <p class="hint">La API key se guarda localmente en este navegador del PDA. No se muestra en pantalla.</p>
+      </div>
+    </section>
+
+    <section class="pda-card scan-card shared-mode">
+      <div class="developer-only">
+      <label for="scanMode">Modo de lectura</label>
+      <select id="scanMode" class="mode-select">
+        <option value="preview">Preview</option>
+        <option value="execute">Ejecutar</option>
+      </select>
+      <div id="executeWarning" class="execute-warning hidden">ADVERTENCIA: este modo crea &oacute;rdenes reales y puede despachar al RCS.</div>
+      </div>
+      <label for="qrInput">Lectura QR / código</label>
+      <input id="qrInput" class="scan-input" autocomplete="off" inputmode="text" placeholder="Escanea aquí" type="text" />
+      <button id="btnRefocus" class="big-secondary developer-only" type="button">Reenfocar lector</button>
+    </section>
+
+    <section class="pda-card qr-catalog-card developer-only">
+      <h2>QR configurado para visualizar</h2>
+      <p class="hint">Seleccionar un QR solo lo muestra. La operaci&oacute;n se procesa &uacute;nicamente cuando el lector escanea el c&oacute;digo.</p>
+
+      <label for="qrCatalogSelect">QR disponible</label>
+      <select id="qrCatalogSelect" disabled>
+        <option value="">Selecciona un QR</option>
+      </select>
+      <div id="qrCatalogMsg" class="config-message">Configura y valida la terminal para cargar el cat&aacute;logo.</div>
+
+      <div class="qr-catalog-preview">
+        <img id="qrCatalogImage" class="qr-catalog-image hidden" alt="QR configurado seleccionado" />
+      </div>
+
+      <div id="qrCatalogDetails" class="qr-catalog-details hidden">
+        <p class="qr-catalog-note">Este QR codifica exactamente el valor mostrado.</p>
+        <div class="qr-detail-row"><span>Alias</span><b id="qrCatalogAlias"></b></div>
+        <div class="qr-detail-row"><span>Valor QR</span><b id="qrCatalogValue"></b></div>
+        <div class="qr-detail-row"><span>Tipo</span><b id="qrCatalogType"></b></div>
+        <div class="qr-detail-row"><span>Coincidencia</span><b id="qrCatalogMatch"></b></div>
+        <div class="qr-detail-row"><span>Acci&oacute;n</span><b id="qrCatalogAction"></b></div>
+        <div class="qr-detail-row"><span>Material</span><b id="qrCatalogMaterial"></b></div>
+        <div class="qr-detail-row"><span>Origen</span><b id="qrCatalogSource"></b></div>
+        <div class="qr-detail-row"><span>Destino</span><b id="qrCatalogDestination"></b></div>
+        <div class="qr-detail-row"><span>Requiere scanner</span><b id="qrCatalogRequiresScanner"></b></div>
+      </div>
+
+      <button id="btnHideQrCatalog" class="secondary" type="button">Ocultar QR</button>
+    </section>
+
+    <section id="resultPanel" class="pda-card result-panel idle shared-mode">
+      <h2 id="resultTitle">Resultado</h2>
+      <div id="resultSummary" class="result-summary">Esperando lectura.</div>
+      <div id="resultSections" class="result-sections"></div>
+      <details id="resultDetails" class="result-details hidden developer-only">
+        <summary>Detalles t&eacute;cnicos</summary>
+        <pre id="resultJson"></pre>
+      </details>
+      <div class="result-grid legacy-result-grid">
+        <div><span>QR leído</span><b id="resQr">-</b></div>
+        <div><span>Terminal</span><b id="resTerminal">-</b></div>
+        <div><span>Scanner</span><b id="resScanner">-</b></div>
+        <div><span>Acción</span><b id="resAction">-</b></div>
+        <div><span>Alias</span><b id="resAlias">-</b></div>
+        <div><span>Tipo QR</span><b id="resType">-</b></div>
+        <div><span>Material</span><b id="resMaterial">-</b></div>
+        <div><span>Rack</span><b id="resRack">-</b></div>
+        <div><span>Origen</span><b id="resSource">-</b></div>
+        <div><span>Destino</span><b id="resDestination">-</b></div>
+        <div><span>Orden</span><b id="resOrder">-</b></div>
+        <div><span>Evento</span><b id="resEvent">-</b></div>
+        <div><span>Error</span><b id="resError">-</b></div>
+      </div>
+    </section>
+
+    <section class="pda-card shared-mode">
+      <div class="history-head">
+        <button id="pdaHistoryToggle" class="history-toggle" type="button" aria-expanded="false" aria-controls="pdaHistoryContent" aria-label="Desplegar historial">
+          <span>Historial <span id="pdaHistoryCount">(0)</span></span>
+          <span id="pdaHistoryToggleIcon" aria-hidden="true">▼</span>
+        </button>
+        <button id="btnClearHistory" class="secondary small-btn" type="button">Actualizar</button>
+      </div>
+      <div id="pdaHistoryContent" class="history-content" hidden>
+        <div id="localHistory" class="history-list">Sin lecturas en esta sesión.</div>
+      </div>
+    </section>
+  </main>
+
+  <div id="pdaActionModal" class="pda-modal hidden" role="dialog" aria-modal="true" aria-labelledby="pdaActionTitle">
+    <div class="pda-modal-card">
+      <h2 id="pdaActionTitle">Acciones de orden</h2>
+      <div id="pdaActionSummary" class="pda-action-summary"></div>
+      <div id="pdaActionConfirm" class="pda-action-confirm hidden"></div>
+      <div id="pdaActionError" class="pda-action-error hidden"></div>
+      <div id="pdaActionButtons" class="pda-action-buttons">
+        <button id="btnPdaCancelOrder" class="danger-lite" type="button">Cancelar</button>
+        <button id="btnPdaCancelReturnOrder" type="button">Cancelar / Devolver</button>
+        <button id="btnPdaCloseActionModal" class="secondary" type="button">Cerrar</button>
+      </div>
+      <div id="pdaActionConfirmButtons" class="pda-action-buttons hidden">
+        <button id="btnPdaConfirmCancel" class="danger-lite" type="button">Confirmar cancelaci&oacute;n</button>
+        <button id="btnPdaConfirmCancelReturn" type="button">Confirmar cancelaci&oacute;n y devoluci&oacute;n</button>
+        <button id="btnPdaBackAction" class="secondary" type="button">Volver</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="pdaAdminModal" class="pda-modal hidden" role="dialog" aria-modal="true" aria-labelledby="pdaAdminTitle">
+    <div class="pda-modal-card">
+      <h2 id="pdaAdminTitle">Acceso administrador</h2>
+      <label for="pdaAdminPassword">Contrase&ntilde;a administrativa</label>
+      <input id="pdaAdminPassword" autocomplete="off" type="password" />
+      <div id="pdaAdminError" class="pda-action-error hidden"></div>
+      <div class="pda-action-buttons">
+        <button id="btnPdaAdminLogin" type="button">Ingresar</button>
+        <button id="btnPdaCloseAdminModal" class="secondary" type="button">Cancelar</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/pda.js?v=local"></script>
+</body>
+</html>

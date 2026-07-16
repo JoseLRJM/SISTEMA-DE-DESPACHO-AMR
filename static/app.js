@@ -88,6 +88,16 @@ const API = {
   adminOperatorWindowButton: (id, idx) => `/api/admin/operator-windows/${id}/buttons/${idx}`,
   adminDeleteOperatorWindow: (id) => `/api/admin/operator-windows/${id}`,
   adminDeleteMovementOrder: (id) => `/api/admin/movement-orders/${id}`,
+  adminScannerStations: "/api/admin/scanner-stations",
+  adminScannerStation: (id) => `/api/admin/scanner-stations/${id}`,
+  adminQrActionRules: "/api/admin/qr-action-rules",
+  adminQrActionRule: (id) => `/api/admin/qr-action-rules/${id}`,
+  adminQrActionRuleImage: (id, size = 240) => `/api/admin/qr-action-rules/${id}/qr-image?size=${encodeURIComponent(size)}`,
+  adminScanTerminals: "/api/admin/scan-terminals",
+  adminScanTerminal: (id) => `/api/admin/scan-terminals/${id}`,
+  scanPreview: "/api/scan/preview",
+  scanExecute: "/api/scan/execute",
+  scanEvents: "/api/scan/events",
 };
 
 const DB_W = 100;
@@ -355,6 +365,100 @@ const btnNewRack = $("btnNewRack");
 const btnDeleteRack = $("btnDeleteRack");
 const racksList = $("racksList");
 const rackMsg = $("rackMsg");
+const scannerStationId = $("scannerStationId");
+const scannerCode = $("scannerCode");
+const scannerName = $("scannerName");
+const scannerDescription = $("scannerDescription");
+const scannerStationType = $("scannerStationType");
+const scannerDefaultAction = $("scannerDefaultAction");
+const scannerSourceArea = $("scannerSourceArea");
+const scannerDestinationArea = $("scannerDestinationArea");
+const scannerSourceCell = $("scannerSourceCell");
+const scannerDestinationCell = $("scannerDestinationCell");
+const scannerSourceCellSummary = $("scannerSourceCellSummary");
+const scannerDestinationCellSummary = $("scannerDestinationCellSummary");
+const scannerStorageArea = $("scannerStorageArea");
+const scannerEmptyRackArea = $("scannerEmptyRackArea");
+const scannerCancelReturnArea = $("scannerCancelReturnArea");
+const scannerCancelReturnAreaWarning = $("scannerCancelReturnAreaWarning");
+const scannerDefaultMaterial = $("scannerDefaultMaterial");
+const scannerAgvCode = $("scannerAgvCode");
+const scannerTaskTyp = $("scannerTaskTyp");
+const scannerPriority = $("scannerPriority");
+const scannerRequirePreview = $("scannerRequirePreview");
+const scannerAllowExecute = $("scannerAllowExecute");
+const scannerActive = $("scannerActive");
+const btnSaveScannerStation = $("btnSaveScannerStation");
+const btnNewScannerStation = $("btnNewScannerStation");
+const btnDisableScannerStation = $("btnDisableScannerStation");
+const scannerStationsList = $("scannerStationsList");
+const qrRuleId = $("qrRuleId");
+const qrValue = $("qrValue");
+const qrAlias = $("qrAlias");
+const qrDescription = $("qrDescription");
+const qrType = $("qrType");
+const qrMatchType = $("qrMatchType");
+const qrActionType = $("qrActionType");
+const qrMaterial = $("qrMaterial");
+const qrRack = $("qrRack");
+const qrSourceArea = $("qrSourceArea");
+const qrDestinationArea = $("qrDestinationArea");
+const qrSourceCell = $("qrSourceCell");
+const qrDestinationCell = $("qrDestinationCell");
+const qrSourceCellSummary = $("qrSourceCellSummary");
+const qrDestinationCellSummary = $("qrDestinationCellSummary");
+const qrPriority = $("qrPriority");
+const qrAgvCode = $("qrAgvCode");
+const qrTaskTyp = $("qrTaskTyp");
+const qrRequiresScanner = $("qrRequiresScanner");
+const qrActive = $("qrActive");
+const btnSaveQrRule = $("btnSaveQrRule");
+const btnNewQrRule = $("btnNewQrRule");
+const btnDisableQrRule = $("btnDisableQrRule");
+const qrRulesList = $("qrRulesList");
+const qrRulePreviewModal = $("qrRulePreviewModal");
+const qrRuleModalTitle = $("qrRuleModalTitle");
+const qrRuleModalAlias = $("qrRuleModalAlias");
+const qrRuleModalValue = $("qrRuleModalValue");
+const qrRuleModalImage = $("qrRuleModalImage");
+const qrRuleModalImageError = $("qrRuleModalImageError");
+const qrRuleModalMeta = $("qrRuleModalMeta");
+const qrRulePrintLabel = $("qrRulePrintLabel");
+const btnCloseQrRuleModal = $("btnCloseQrRuleModal");
+const btnCloseQrRuleModalX = $("btnCloseQrRuleModalX");
+const btnPrintQrRuleLabel = $("btnPrintQrRuleLabel");
+const btnRefreshScanEvents = $("btnRefreshScanEvents");
+const scanEventsList = $("scanEventsList");
+const scanEventDetailBox = $("scanEventDetailBox");
+const scanEventDetailJson = $("scanEventDetailJson");
+const qrAdminMsg = $("qrAdminMsg");
+const scanTerminalId = $("scanTerminalId");
+const scanTerminalCode = $("scanTerminalCode");
+const scanTerminalName = $("scanTerminalName");
+const scanTerminalDescription = $("scanTerminalDescription");
+const scanTerminalScannerStation = $("scanTerminalScannerStation");
+const scanTerminalApiKey = $("scanTerminalApiKey");
+const scanTerminalMode = $("scanTerminalMode");
+const scanTerminalAllowExecute = $("scanTerminalAllowExecute");
+const scanTerminalRequirePreview = $("scanTerminalRequirePreview");
+const scanTerminalActive = $("scanTerminalActive");
+const scanTerminalLastSeen = $("scanTerminalLastSeen");
+const scanTerminalLastIp = $("scanTerminalLastIp");
+const btnSaveScanTerminal = $("btnSaveScanTerminal");
+const btnNewScanTerminal = $("btnNewScanTerminal");
+const btnRefreshScanTerminals = $("btnRefreshScanTerminals");
+const btnDisableScanTerminal = $("btnDisableScanTerminal");
+const scanTerminalsList = $("scanTerminalsList");
+const scanQrScannerSelect = $("scanQrScannerSelect");
+const scanQrScannerManual = $("scanQrScannerManual");
+const scanQrScannerHelp = $("scanQrScannerHelp");
+const scanQrValue = $("scanQrValue");
+const btnScanQrPreview = $("btnScanQrPreview");
+const btnScanQrExecute = $("btnScanQrExecute");
+const scanQrResultPanel = $("scanQrResultPanel");
+const btnRefreshScanQrHistory = $("btnRefreshScanQrHistory");
+const scanQrHistoryList = $("scanQrHistoryList");
+const scanQrMsg = $("scanQrMsg");
 const fifoSourceArea = $("fifoSourceArea");
 const fifoDestinationArea = $("fifoDestinationArea");
 const fifoMaterial = $("fifoMaterial");
@@ -500,12 +604,14 @@ let selectedOrderResponsePayload = null;
 let debugConsoleEvents = [];
 const CARD_ORDER = [
   "card-workstation",
+  "card-scan-qr",
   "card-history",
   "card-cell",
   "card-areas",
   "card-materials",
   "card-racks",
   "card-operator-windows",
+  "card-qr-scanners",
   "card-general",
   "card-direct-move",
   "card-fifo",
@@ -517,8 +623,8 @@ const CARD_ORDER = [
   "card-admin-password",
   "card-admin-login",
 ];
-const NON_ADMIN_VISIBLE_CARD_IDS = new Set(["card-workstation", "card-history", "card-admin-login"]);
-const DEFAULT_EXPANDED_CARD_IDS = new Set(["card-workstation", "card-history", "card-admin-login"]);
+const NON_ADMIN_VISIBLE_CARD_IDS = new Set(["card-workstation", "card-scan-qr", "card-history", "card-admin-login"]);
+const DEFAULT_EXPANDED_CARD_IDS = new Set(["card-workstation", "card-scan-qr", "card-history", "card-admin-login"]);
 
 let isEditingOrderJson = false;
 let isEditingStatusQueryRequest = false;
@@ -541,6 +647,13 @@ let actionModalContext = { mode: null, orderId: null };
 let operatorButtonPickMode = null;
 let rackReservationOriginal = "0";
 const OPERATOR_LAST_POINT_KEY = "agv_operator_point_area_defaults_v1";
+let scannerStations = [];
+let qrActionRules = [];
+const qrRuleImageObjectUrls = new Map();
+let qrRuleModalImageObjectUrl = null;
+let scanEvents = [];
+let scanTerminals = [];
+let scanQrPreviewInFlight = false;
 
 const BASE_CELL = 22;
 const BASE_GAP = 2;
@@ -1132,12 +1245,14 @@ document.addEventListener('click', async (ev) => {
 
 const ACTION_CARD_ORDER = [
   "card-workstation",
+  "card-scan-qr",
   "card-history",
   "card-cell",
   "card-areas",
   "card-materials",
   "card-racks",
   "card-operator-windows",
+  "card-qr-scanners",
   "card-general",
   "card-direct-move",
   "card-fifo",
@@ -1149,18 +1264,18 @@ const ACTION_CARD_ORDER = [
   "card-admin-password",
   "card-admin-login",
 ];
-const PUBLIC_CARD_IDS = new Set(["card-workstation", "operatorActionPanel", "card-history", "card-admin-login"]);
+const PUBLIC_CARD_IDS = new Set(["card-workstation", "card-scan-qr", "operatorActionPanel", "card-history", "card-admin-login"]);
 const ACTION_TAB_STORAGE_KEY = "agv_side_panel_active_tab_v1";
 const ACTION_CARD_TABS = [
   {
     key: "operation",
     label: "Operaci\u00f3n",
-    cards: ["card-workstation", "card-history"],
+    cards: ["card-workstation", "card-scan-qr", "card-history"],
   },
   {
     key: "configuration",
     label: "Configuraci\u00f3n",
-    cards: ["card-cell", "card-areas", "card-materials", "card-racks", "card-operator-windows"],
+    cards: ["card-cell", "card-areas", "card-materials", "card-racks", "card-operator-windows", "card-qr-scanners"],
   },
   {
     key: "advanced",
@@ -1373,6 +1488,7 @@ function setActiveActionTab(tabId) {
     panel.hidden = !isActive;
   });
 
+  if (activeActionTabId === "operation") focusScanQrInput();
   scheduleCanvasResize();
 }
 
@@ -3010,7 +3126,8 @@ function setAdminUI(enabled) {
     "btnDirectPickSource", "btnDirectPickDestination", "btnDirectClearSelection", "directPriority", "directAgvCode", "directTaskTyp", "directComment", "btnExecuteDirectMove",
     "operatorWindowSelect", "operatorWindowPassword",
     "btnOperatorActionCancel", "btnOperatorActionConfirm", "btnOperatorActionPreview", "btnOperatorActionPanelClear", "btnOperatorActionPickSource", "btnOperatorActionPickDestination",
-    "operatorActionAreaSelect", "operatorActionMaterial", "operatorActionAgv", "operatorActionTaskTyp", "operatorCancelMode", "operatorCancelReturnArea"
+    "operatorActionAreaSelect", "operatorActionMaterial", "operatorActionAgv", "operatorActionTaskTyp", "operatorCancelMode", "operatorCancelReturnArea",
+    "scanQrScannerSelect", "scanQrScannerManual", "scanQrValue", "btnScanQrPreview", "btnScanQrExecute", "btnRefreshScanQrHistory"
   ]);
 
   const adminOnlyIds = new Set([
@@ -3018,7 +3135,8 @@ function setAdminUI(enabled) {
     "btnSelectCellsByArea",
     "mapLayoutMode", "freeLayoutEditEnabled", "btnAddFreeCell",
     "podPositionRack", "btnQueryPodPosition", "rcsPodPositionEndpoint", "rcsRackSyncQueryEndpoint", "rcsRackSyncBindEndpoint", "rcsRackSyncScheduleEnabled", "rcsRackSyncScheduleTime", "btnRackSyncPreview", "btnRackSyncQuery", "btnRackSyncBind", "btnRackSyncHistory",
-    "operatorButtonIndex", "operatorButtonActive", "operatorButtonLabel", "operatorButtonColor", "operatorButtonMode", "operatorButtonPriority", "operatorButtonSourceArea", "operatorButtonDestinationArea", "operatorButtonPointDestinationArea", "operatorButtonMaterial", "operatorButtonSourceCell", "operatorButtonDestinationCell", "btnOperatorButtonPickSource", "btnOperatorButtonPickDestination", "operatorButtonAgv", "operatorButtonTaskTyp", "operatorButtonComment", "btnSaveOperatorButton", "btnAddOperatorPointField"
+    "operatorButtonIndex", "operatorButtonActive", "operatorButtonLabel", "operatorButtonColor", "operatorButtonMode", "operatorButtonPriority", "operatorButtonSourceArea", "operatorButtonDestinationArea", "operatorButtonPointDestinationArea", "operatorButtonMaterial", "operatorButtonSourceCell", "operatorButtonDestinationCell", "btnOperatorButtonPickSource", "btnOperatorButtonPickDestination", "operatorButtonAgv", "operatorButtonTaskTyp", "operatorButtonComment", "btnSaveOperatorButton", "btnAddOperatorPointField",
+    "btnRefreshScanTerminals"
   ]);
 
   const disabledPlaceholderIds = new Set([
@@ -3110,6 +3228,7 @@ async function loadLocations() {
   locations = new Array(DB_W * DB_H).fill(null);
   for (const loc of rows) locations[idx(loc.x, loc.y)] = loc;
   renderOperatorCellOptions();
+  renderQrCatalogOptions();
 }
 async function loadCatalog() {
   catalog = await fetchJson(API.catalog);
@@ -3120,6 +3239,7 @@ async function loadCatalog() {
   renderAreaList();
   renderMaterialList();
   renderRackList();
+  renderQrCatalogOptions();
 }
 
 function applyRuntimeSnapshotData(snapshot, preferredOrderId = null) {
@@ -3256,6 +3376,885 @@ function renderRackList() {
   }).join("") || `<div class="small">Sin racks capturados.</div>`;
   racksList.querySelectorAll("[data-kind='rack']").forEach(btn => btn.addEventListener("click", () => loadRackForm(Number(btn.dataset.id))));
 }
+function buildAreaOptions(selectedValue = "") {
+  return `<option value="">Sin area</option>` + (catalog.areas || []).map(a => `<option value="${a.id}" ${String(selectedValue) === String(a.id) ? "selected" : ""}>${escapeHtml(a.code || "")} - ${escapeHtml(a.name || "")}</option>`).join("");
+}
+function scannerCancelReturnAreaLabel(area) {
+  if (!area) return "";
+  const parts = [
+    String(area.code || "").trim() || `ID ${area.id}`,
+    String(area.name || "").trim() || "Sin nombre",
+  ];
+  if (Number(area.is_active ?? 1) !== 1) parts.push("Inactiva");
+  const matterArea = String(area.matter_area || "").trim();
+  parts.push(matterArea ? `Matter Area: ${matterArea}` : "Sin Matter Area");
+  return parts.join(" — ");
+}
+function buildScannerCancelReturnAreaOptions(selectedValue = "", scanner = null) {
+  const selectedText = String(selectedValue || "");
+  const rows = catalog.areas || [];
+  const hasSelected = selectedText && rows.some(a => String(a.id) === selectedText);
+  const staleOption = selectedText && !hasSelected
+    ? `<option value="${escapeHtml(selectedText)}" selected>${escapeHtml(`Area configurada no disponible — ID ${selectedText}`)}</option>`
+    : "";
+  return `<option value="">Sin configurar</option>${staleOption}` + rows.map(a => `<option value="${a.id}" ${selectedText === String(a.id) ? "selected" : ""}>${escapeHtml(scannerCancelReturnAreaLabel(a))}</option>`).join("");
+}
+function scannerCancelReturnAreaFromScanner(scanner) {
+  if (!scanner || !scanner.cancel_return_area_id) return null;
+  const fromCatalog = (catalog.areas || []).find(a => Number(a.id) === Number(scanner.cancel_return_area_id));
+  if (fromCatalog) return fromCatalog;
+  if (scanner.cancel_return_area_code || scanner.cancel_return_area_name || scanner.cancel_return_area_matter_area || scanner.cancel_return_area_is_active != null) {
+    return {
+      id: scanner.cancel_return_area_id,
+      code: scanner.cancel_return_area_code || `ID ${scanner.cancel_return_area_id}`,
+      name: scanner.cancel_return_area_name || "",
+      matter_area: scanner.cancel_return_area_matter_area || "",
+      is_active: scanner.cancel_return_area_is_active ?? 1,
+      unavailable: true,
+    };
+  }
+  return null;
+}
+function scannerCancelReturnAreaListSummary(scanner) {
+  const areaId = scanner?.cancel_return_area_id;
+  if (!areaId) return `<small><b>Area de devolucion:</b> Sin configurar</small>`;
+  const area = scannerCancelReturnAreaFromScanner(scanner);
+  if (!area) return `<small><b>Area de devolucion:</b> Area configurada no disponible - ID ${escapeHtml(areaId)}</small>`;
+  const title = `${area.code || `ID ${areaId}`}${area.name ? ` - ${area.name}` : ""}`;
+  const matter = String(area.matter_area || "").trim();
+  const inactive = Number(area.is_active ?? 1) !== 1 ? `<small>Inactiva</small>` : "";
+  return `
+      <small><b>Area de devolucion:</b> ${escapeHtml(title)}</small>
+      ${inactive}
+      <small>${matter ? `Matter Area: ${escapeHtml(matter)}` : "Sin Matter Area"}</small>`;
+}
+function renderScannerCancelReturnAreaWarning(scanner = null) {
+  if (!scannerCancelReturnAreaWarning) return;
+  const areaId = scannerCancelReturnArea?.value ? Number(scannerCancelReturnArea.value) : null;
+  if (!areaId) {
+    scannerCancelReturnAreaWarning.classList.add("hidden");
+    scannerCancelReturnAreaWarning.classList.remove("warn");
+    scannerCancelReturnAreaWarning.innerHTML = "";
+    return;
+  }
+  const area = (catalog.areas || []).find(a => Number(a.id) === Number(areaId)) || scannerCancelReturnAreaFromScanner(scanner);
+  const messages = [];
+  if (!area) {
+    messages.push(`Area configurada no disponible — ID ${areaId}.`);
+  } else {
+    if (!String(area.matter_area || "").trim()) messages.push("Esta area no tiene Matter Area. Cancelar/Devolver desde el PDA no podra utilizarla hasta completar esa configuracion.");
+    if (Number(area.is_active ?? 1) !== 1) messages.push("El area seleccionada esta inactiva.");
+  }
+  scannerCancelReturnAreaWarning.classList.toggle("hidden", !messages.length);
+  scannerCancelReturnAreaWarning.classList.toggle("warn", !!messages.length);
+  scannerCancelReturnAreaWarning.innerHTML = messages.map(msg => `<div>${escapeHtml(msg)}</div>`).join("");
+}
+function buildMaterialOptions(selectedValue = "") {
+  return `<option value="">Sin material</option>` + (catalog.materials || []).map(m => `<option value="${m.id}" ${String(selectedValue) === String(m.id) ? "selected" : ""}>${escapeHtml(m.code || "")} - ${escapeHtml(m.name || "")}</option>`).join("");
+}
+function buildRackSelectOptions(selectedValue = "") {
+  return `<option value="">Sin rack</option>` + (catalog.racks || []).map(r => `<option value="${r.id}" ${String(selectedValue) === String(r.id) ? "selected" : ""}>${escapeHtml(r.code || "")}${r.name ? ` - ${escapeHtml(r.name)}` : ""}</option>`).join("");
+}
+function cellOptionLabel(loc) {
+  if (!loc) return "";
+  const code = String(loc.code || "").trim();
+  const area = (catalog.areas || []).find(a => Number(a.id) === Number(loc.area_id));
+  return `${code || `(${loc.x},${loc.y})`}${area ? ` - ${area.name || area.code}` : ""}`;
+}
+function isCoordinateOnlyText(value) {
+  const text = String(value || "").trim();
+  return /^\(?\s*\d+\s*,\s*\d+\s*\)?$/.test(text);
+}
+function hasOperationalLocationData(loc) {
+  if (!loc) return false;
+  const code = String(loc.code || "").trim();
+  const note = String(loc.note || "").trim();
+  const area = (catalog.areas || []).find(a => Number(a.id) === Number(loc.area_id));
+  const areaCode = String(area?.code || loc.area_code || "").trim();
+  const areaName = String(area?.name || loc.area_name || "").trim();
+  return (
+    (!!code && !isCoordinateOnlyText(code)) ||
+    (!!note && !isCoordinateOnlyText(note)) ||
+    (!!areaCode && !isCoordinateOnlyText(areaCode)) ||
+    (!!areaName && !isCoordinateOnlyText(areaName))
+  );
+}
+function isOperationalConfiguredLocation(loc) {
+  return !!loc && Number(loc.enabled ?? 1) === 1 && Number(loc.is_visible ?? 1) === 1 && hasOperationalLocationData(loc);
+}
+function buildCellOptions(selectedValue = "") {
+  const selectedText = String(selectedValue || "");
+  const rows = (locations || []).filter(isOperationalConfiguredLocation);
+  const hasSelected = selectedText && rows.some(loc => String(loc.id) === selectedText);
+  const selectedLoc = selectedText ? (locations || []).find(loc => loc && String(loc.id) === selectedText) : null;
+  const staleOption = selectedText && selectedLoc && !hasSelected
+    ? `<option value="${selectedLoc.id}" selected>${escapeHtml(cellOptionLabel(selectedLoc))} - no configurada / no operativa</option>`
+    : "";
+  return `<option value="">Sin celda</option>${staleOption}` + rows.map(loc => `<option value="${loc.id}" ${selectedText === String(loc.id) ? "selected" : ""}>${escapeHtml(cellOptionLabel(loc))}</option>`).join("");
+}
+function renderQrCellSummary(selectEl, targetEl) {
+  if (!targetEl) return;
+  const locId = selectEl?.value ? Number(selectEl.value) : null;
+  if (!locId) {
+    targetEl.classList.remove("warn");
+    targetEl.innerHTML = "No hay celda seleccionada.";
+    return;
+  }
+  const loc = (locations || []).find(row => row && Number(row.id) === Number(locId));
+  if (!loc) {
+    targetEl.classList.add("warn");
+    targetEl.innerHTML = "Esta celda no est&aacute; configurada u operativa. Selecciona otra celda.";
+    return;
+  }
+  const area = (catalog.areas || []).find(a => Number(a.id) === Number(loc.area_id));
+  const code = String(loc.code || "").trim() || `(${loc.x},${loc.y})`;
+  const note = String(loc.note || "").trim();
+  const areaText = area ? `${area.code || ""}${area.name ? ` - ${area.name}` : ""}`.trim() : (loc.area_name || "");
+  const isOperational = isOperationalConfiguredLocation(loc);
+  targetEl.classList.toggle("warn", !isOperational);
+  targetEl.innerHTML = `
+    ${!isOperational ? `<div><b>Esta celda no est&aacute; configurada u operativa. Selecciona otra celda.</b></div>` : ""}
+    <div><b>Celda seleccionada:</b></div>
+    <div>${escapeHtml(code)}${note ? ` - ${escapeHtml(note)}` : ""}</div>
+    <div><b>&Aacute;rea:</b> ${escapeHtml(areaText || "Sin area")}</div>
+    <div><b>Coordenadas:</b> (${escapeHtml(loc.x)},${escapeHtml(loc.y)})</div>
+  `;
+}
+function renderQrCellSummaries() {
+  renderQrCellSummary(scannerSourceCell, scannerSourceCellSummary);
+  renderQrCellSummary(scannerDestinationCell, scannerDestinationCellSummary);
+  renderQrCellSummary(qrSourceCell, qrSourceCellSummary);
+  renderQrCellSummary(qrDestinationCell, qrDestinationCellSummary);
+}
+function renderQrCatalogOptions() {
+  [scannerSourceArea, scannerDestinationArea, scannerStorageArea, scannerEmptyRackArea, qrSourceArea, qrDestinationArea].forEach((el) => {
+    if (!el) return;
+    const cur = el.value;
+    el.innerHTML = buildAreaOptions(cur);
+  });
+  if (scannerCancelReturnArea) {
+    const cur = scannerCancelReturnArea.value;
+    scannerCancelReturnArea.innerHTML = buildScannerCancelReturnAreaOptions(cur);
+    renderScannerCancelReturnAreaWarning();
+  }
+  [scannerDefaultMaterial, qrMaterial].forEach((el) => {
+    if (!el) return;
+    const cur = el.value;
+    el.innerHTML = buildMaterialOptions(cur);
+  });
+  if (qrRack) {
+    const cur = qrRack.value;
+    qrRack.innerHTML = buildRackSelectOptions(cur);
+  }
+  [scannerSourceCell, scannerDestinationCell, qrSourceCell, qrDestinationCell].forEach((el) => {
+    if (!el) return;
+    const cur = el.value;
+    el.innerHTML = buildCellOptions(cur);
+  });
+  renderQrCellSummaries();
+}
+function clearScannerStationForm() {
+  if (!scannerStationId) return;
+  scannerStationId.value = "";
+  scannerCode.value = "";
+  scannerName.value = "";
+  scannerDescription.value = "";
+  scannerStationType.value = "generic";
+  scannerDefaultAction.value = "preview_only";
+  scannerSourceArea.value = "";
+  scannerDestinationArea.value = "";
+  scannerSourceCell.value = "";
+  scannerDestinationCell.value = "";
+  scannerStorageArea.value = "";
+  scannerEmptyRackArea.value = "";
+  if (scannerCancelReturnArea) {
+    scannerCancelReturnArea.innerHTML = buildScannerCancelReturnAreaOptions("");
+    scannerCancelReturnArea.value = "";
+  }
+  renderScannerCancelReturnAreaWarning();
+  scannerDefaultMaterial.value = "";
+  scannerAgvCode.value = "";
+  scannerTaskTyp.value = "";
+  scannerPriority.value = 0;
+  scannerRequirePreview.value = "0";
+  scannerAllowExecute.value = "1";
+  scannerActive.value = "1";
+}
+function loadScannerStationForm(id) {
+  const item = scannerStations.find(x => Number(x.id) === Number(id));
+  if (!item) return;
+  scannerStationId.value = item.id;
+  scannerCode.value = item.scanner_code || "";
+  scannerName.value = item.name || "";
+  scannerDescription.value = item.description || "";
+  scannerStationType.value = item.station_type || "generic";
+  scannerDefaultAction.value = item.default_action || "preview_only";
+  scannerSourceArea.value = item.source_area_id || "";
+  scannerDestinationArea.value = item.destination_area_id || "";
+  scannerSourceCell.innerHTML = buildCellOptions(item.source_cell_id || "");
+  scannerDestinationCell.innerHTML = buildCellOptions(item.destination_cell_id || "");
+  scannerSourceCell.value = item.source_cell_id || "";
+  scannerDestinationCell.value = item.destination_cell_id || "";
+  renderQrCellSummaries();
+  scannerStorageArea.value = item.storage_area_id || "";
+  scannerEmptyRackArea.value = item.empty_rack_area_id || "";
+  if (scannerCancelReturnArea) {
+    scannerCancelReturnArea.innerHTML = buildScannerCancelReturnAreaOptions(item.cancel_return_area_id || "", item);
+    scannerCancelReturnArea.value = item.cancel_return_area_id || "";
+  }
+  renderScannerCancelReturnAreaWarning(item);
+  scannerDefaultMaterial.value = item.default_material_group_id || "";
+  scannerAgvCode.value = item.agv_code || "";
+  scannerTaskTyp.value = item.task_typ || "";
+  scannerPriority.value = item.priority ?? 0;
+  scannerRequirePreview.value = String(item.require_preview ?? 0);
+  scannerAllowExecute.value = String(item.allow_execute ?? 1);
+  scannerActive.value = String(item.is_active ?? 1);
+}
+function scannerStationPayload() {
+  return {
+    scanner_code: scannerCode.value.trim(),
+    name: scannerName.value.trim(),
+    description: scannerDescription.value.trim() || null,
+    station_type: scannerStationType.value || "generic",
+    default_action: scannerDefaultAction.value || "preview_only",
+    source_area_id: scannerSourceArea.value ? Number(scannerSourceArea.value) : null,
+    destination_area_id: scannerDestinationArea.value ? Number(scannerDestinationArea.value) : null,
+    source_cell_id: scannerSourceCell.value ? Number(scannerSourceCell.value) : null,
+    destination_cell_id: scannerDestinationCell.value ? Number(scannerDestinationCell.value) : null,
+    storage_area_id: scannerStorageArea.value ? Number(scannerStorageArea.value) : null,
+    empty_rack_area_id: scannerEmptyRackArea.value ? Number(scannerEmptyRackArea.value) : null,
+    cancel_return_area_id: scannerCancelReturnArea?.value ? Number(scannerCancelReturnArea.value) : null,
+    default_material_group_id: scannerDefaultMaterial.value ? Number(scannerDefaultMaterial.value) : null,
+    agv_code: scannerAgvCode.value.trim() || null,
+    task_typ: scannerTaskTyp.value.trim() || null,
+    priority: Number(scannerPriority.value || 0),
+    require_preview: Number(scannerRequirePreview.value || 0),
+    allow_execute: Number(scannerAllowExecute.value || 0),
+    is_active: Number(scannerActive.value || 0),
+  };
+}
+function renderScannerStationsList() {
+  if (!scannerStationsList) return;
+  scannerStationsList.innerHTML = scannerStations.map(s => `
+    <button type="button" class="list-item" data-scanner-id="${s.id}">
+      <b>${escapeHtml(s.scanner_code || "")}</b> ${escapeHtml(s.name || "")}
+      <small>${escapeHtml(s.station_type || "-")} - ${escapeHtml(s.default_action || "-")} - ${Number(s.is_active ?? 0) ? "activo" : "inactivo"}</small>
+      ${scannerCancelReturnAreaListSummary(s)}
+    </button>`).join("") || `<div class="small">Sin scanners configurados.</div>`;
+  scannerStationsList.querySelectorAll("[data-scanner-id]").forEach(btn => btn.addEventListener("click", () => loadScannerStationForm(Number(btn.dataset.scannerId))));
+}
+function buildScannerStationOptions(selectedValue = "") {
+  const selectedText = String(selectedValue || "");
+  return `<option value="">Selecciona scanner</option>` + (scannerStations || []).map(s => {
+    const inactive = Number(s.is_active ?? 0) === 1 ? "" : " - inactivo";
+    const label = `${s.scanner_code || ""}${s.name ? ` - ${s.name}` : ""}${inactive}`;
+    return `<option value="${s.id}" ${selectedText === String(s.id) ? "selected" : ""}>${escapeHtml(label)}</option>`;
+  }).join("");
+}
+function renderScanTerminalScannerOptions() {
+  if (!scanTerminalScannerStation) return;
+  const cur = scanTerminalScannerStation.value;
+  scanTerminalScannerStation.innerHTML = buildScannerStationOptions(cur);
+}
+async function loadScannerStations() {
+  if (!adminToken) return;
+  scannerStations = await fetchJson(API.adminScannerStations, { headers: fetchHeaders() });
+  renderScannerStationsList();
+  renderScanTerminalScannerOptions();
+  renderScanQrScannerOptions();
+}
+async function saveScannerStation() {
+  if (!adminToken) throw new Error("Admin bloqueado.");
+  const id = scannerStationId.value ? Number(scannerStationId.value) : null;
+  const url = id ? API.adminScannerStation(id) : API.adminScannerStations;
+  const method = id ? "PUT" : "POST";
+  if (btnSaveScannerStation) btnSaveScannerStation.disabled = true;
+  try {
+    await fetchJson(url, { method, headers: { "Content-Type": "application/json", ...fetchHeaders() }, body: JSON.stringify(scannerStationPayload()) });
+    await loadScannerStations();
+    if (qrAdminMsg) qrAdminMsg.textContent = "Scanner guardado.";
+  } finally {
+    if (btnSaveScannerStation) btnSaveScannerStation.disabled = !adminToken;
+  }
+}
+async function disableScannerStation() {
+  if (!adminToken) throw new Error("Admin bloqueado.");
+  const id = scannerStationId.value ? Number(scannerStationId.value) : null;
+  if (!id) throw new Error("Selecciona un scanner.");
+  const row = await fetchJson(API.adminScannerStation(id), { method: "DELETE", headers: fetchHeaders() });
+  await loadScannerStations();
+  loadScannerStationForm(row.id);
+  if (qrAdminMsg) qrAdminMsg.textContent = "Scanner desactivado.";
+}
+function clearQrRuleForm() {
+  if (!qrRuleId) return;
+  qrRuleId.value = "";
+  qrValue.value = "";
+  qrAlias.value = "";
+  qrDescription.value = "";
+  qrType.value = "material";
+  qrMatchType.value = "exact";
+  qrActionType.value = "fifo_request";
+  qrMaterial.value = "";
+  qrRack.value = "";
+  qrSourceArea.value = "";
+  qrDestinationArea.value = "";
+  qrSourceCell.value = "";
+  qrDestinationCell.value = "";
+  qrPriority.value = "";
+  qrAgvCode.value = "";
+  qrTaskTyp.value = "";
+  qrRequiresScanner.value = "1";
+  qrActive.value = "1";
+}
+function loadQrRuleForm(id) {
+  const item = qrActionRules.find(x => Number(x.id) === Number(id));
+  if (!item) return;
+  qrRuleId.value = item.id;
+  qrValue.value = item.qr_value || "";
+  qrAlias.value = item.qr_alias || "";
+  qrDescription.value = item.description || "";
+  qrType.value = item.qr_type || "generic";
+  qrMatchType.value = item.match_type || "exact";
+  qrActionType.value = item.action_type || "use_scanner_default";
+  qrMaterial.value = item.material_group_id || "";
+  qrRack.value = item.rack_id || "";
+  qrSourceArea.value = item.source_area_id || "";
+  qrDestinationArea.value = item.destination_area_id || "";
+  qrSourceCell.innerHTML = buildCellOptions(item.source_cell_id || "");
+  qrDestinationCell.innerHTML = buildCellOptions(item.destination_cell_id || "");
+  qrSourceCell.value = item.source_cell_id || "";
+  qrDestinationCell.value = item.destination_cell_id || "";
+  renderQrCellSummaries();
+  qrPriority.value = item.priority ?? "";
+  qrAgvCode.value = item.agv_code || "";
+  qrTaskTyp.value = item.task_typ || "";
+  qrRequiresScanner.value = String(item.requires_scanner_station ?? 1);
+  qrActive.value = String(item.is_active ?? 1);
+}
+function qrRulePayload() {
+  return {
+    qr_value: qrValue.value.trim(),
+    qr_alias: qrAlias.value.trim() || null,
+    description: qrDescription.value.trim() || null,
+    qr_type: qrType.value || "generic",
+    match_type: qrMatchType.value || "exact",
+    action_type: qrActionType.value || "use_scanner_default",
+    material_group_id: qrMaterial.value ? Number(qrMaterial.value) : null,
+    rack_id: qrRack.value ? Number(qrRack.value) : null,
+    source_area_id: qrSourceArea.value ? Number(qrSourceArea.value) : null,
+    destination_area_id: qrDestinationArea.value ? Number(qrDestinationArea.value) : null,
+    source_cell_id: qrSourceCell.value ? Number(qrSourceCell.value) : null,
+    destination_cell_id: qrDestinationCell.value ? Number(qrDestinationCell.value) : null,
+    priority: qrPriority.value === "" ? null : Number(qrPriority.value || 0),
+    task_typ: qrTaskTyp.value.trim() || null,
+    agv_code: qrAgvCode.value.trim() || null,
+    requires_scanner_station: Number(qrRequiresScanner.value || 0),
+    is_active: Number(qrActive.value || 0),
+  };
+}
+function revokeQrRuleThumbUrls() {
+  qrRuleImageObjectUrls.forEach(url => URL.revokeObjectURL(url));
+  qrRuleImageObjectUrls.clear();
+}
+function revokeQrRuleModalImageUrl() {
+  if (qrRuleModalImageObjectUrl) {
+    URL.revokeObjectURL(qrRuleModalImageObjectUrl);
+    qrRuleModalImageObjectUrl = null;
+  }
+}
+async function fetchQrRuleImageObjectUrl(ruleId, size) {
+  const res = await fetch(API.adminQrActionRuleImage(ruleId, size), {
+    cache: "no-store",
+    headers: fetchHeaders(),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch (_) {}
+    throw new Error((data && data.detail) || text || `HTTP ${res.status}`);
+  }
+  const blob = await res.blob();
+  return URL.createObjectURL(blob);
+}
+function qrRuleAliasTitle(q) {
+  return q?.qr_alias ? `${q.qr_alias}` : "QR configurado";
+}
+function qrRuleMaterialLabel(q) {
+  if (q?.material_group_name) return q.material_group_name;
+  if (q?.material_group_id) return `Material ID ${q.material_group_id}`;
+  return "-";
+}
+function qrRuleCellLabel(q, kind) {
+  const code = q?.[`${kind}_cell_code`];
+  const id = q?.[`${kind}_cell_id`];
+  return code || (id ? `Celda ID ${id}` : "-");
+}
+function qrRuleAreaLabel(q, kind) {
+  const name = q?.[`${kind}_area_name`];
+  const id = q?.[`${kind}_area_id`];
+  return name || (id ? `Área ID ${id}` : "-");
+}
+function renderQrRuleMetaHtml(q) {
+  const rows = [
+    ["Tipo QR", q?.qr_type || "-"],
+    ["Coincidencia", q?.match_type || "-"],
+    ["Acción", q?.action_type || "-"],
+    ["Material", qrRuleMaterialLabel(q)],
+    ["Rack", q?.rack_code || (q?.rack_id ? `Rack ID ${q.rack_id}` : "-")],
+    ["Origen", `${qrRuleAreaLabel(q, "source")} / ${qrRuleCellLabel(q, "source")}`],
+    ["Destino", `${qrRuleAreaLabel(q, "destination")} / ${qrRuleCellLabel(q, "destination")}`],
+    ["Scanner requerido", Number(q?.requires_scanner_station ?? 0) ? "Sí" : "No"],
+    ["Estado", Number(q?.is_active ?? 0) ? "Activo" : "Inactivo"],
+  ];
+  return rows.map(([label, value]) => `
+    <div class="qr-modal-meta-row">
+      <span>${escapeHtml(label)}</span>
+      <b>${escapeHtml(value)}</b>
+    </div>`).join("");
+}
+function renderQrRulePrintLabel(q, imageUrl = "") {
+  if (!qrRulePrintLabel || !q) return;
+  const origin = `${qrRuleAreaLabel(q, "source")} / ${qrRuleCellLabel(q, "source")}`;
+  const destination = `${qrRuleAreaLabel(q, "destination")} / ${qrRuleCellLabel(q, "destination")}`;
+  qrRulePrintLabel.innerHTML = `
+    <div class="qr-print-title">${escapeHtml(qrRuleAliasTitle(q))}</div>
+    ${imageUrl ? `<img class="qr-print-image" src="${imageUrl}" alt="QR ${escapeHtml(q.qr_value || "")}">` : `<div class="qr-print-missing">QR no disponible</div>`}
+    <div class="qr-print-value">${escapeHtml(q.qr_value || "")}</div>
+    <div class="qr-print-line">Acción: ${escapeHtml(q.action_type || "-")}</div>
+    <div class="qr-print-line">Material: ${escapeHtml(qrRuleMaterialLabel(q))}</div>
+    <div class="qr-print-line">Origen: ${escapeHtml(origin)}</div>
+    <div class="qr-print-line">Destino: ${escapeHtml(destination)}</div>
+  `;
+}
+async function hydrateQrRuleThumbnails() {
+  if (!qrRulesList || !adminToken) return;
+  const imgs = Array.from(qrRulesList.querySelectorAll("[data-qr-thumb-img]"));
+  for (const img of imgs) {
+    const ruleId = Number(img.dataset.qrThumbImg || 0);
+    if (!ruleId) continue;
+    const holder = img.closest(".qr-thumb-button");
+    const loading = holder?.querySelector(".qr-thumb-loading");
+    const error = holder?.querySelector(".qr-thumb-error");
+    try {
+      const objectUrl = await fetchQrRuleImageObjectUrl(ruleId, 120);
+      if (!document.body.contains(img)) {
+        URL.revokeObjectURL(objectUrl);
+        continue;
+      }
+      qrRuleImageObjectUrls.set(ruleId, objectUrl);
+      img.src = objectUrl;
+      img.classList.remove("hidden");
+      if (loading) loading.classList.add("hidden");
+      if (error) error.classList.add("hidden");
+    } catch (_) {
+      img.classList.add("hidden");
+      if (loading) loading.classList.add("hidden");
+      if (error) error.classList.remove("hidden");
+    }
+  }
+}
+async function openQrRulePreviewModal(ruleId) {
+  const q = qrActionRules.find(x => Number(x.id) === Number(ruleId));
+  if (!q || !qrRulePreviewModal) return;
+  revokeQrRuleModalImageUrl();
+  if (qrRuleModalTitle) qrRuleModalTitle.textContent = qrRuleAliasTitle(q);
+  if (qrRuleModalAlias) qrRuleModalAlias.textContent = q.qr_alias || "-";
+  if (qrRuleModalValue) qrRuleModalValue.textContent = q.qr_value || "";
+  if (qrRuleModalMeta) qrRuleModalMeta.innerHTML = renderQrRuleMetaHtml(q);
+  if (qrRuleModalImage) {
+    qrRuleModalImage.removeAttribute("src");
+    qrRuleModalImage.alt = `QR ${q.qr_value || ""}`;
+    qrRuleModalImage.classList.add("hidden");
+  }
+  if (qrRuleModalImageError) {
+    qrRuleModalImageError.textContent = "Cargando QR...";
+    qrRuleModalImageError.classList.remove("hidden");
+  }
+  if (btnPrintQrRuleLabel) btnPrintQrRuleLabel.disabled = true;
+  renderQrRulePrintLabel(q, "");
+  qrRulePreviewModal.classList.remove("hidden");
+  qrRulePreviewModal.style.display = "flex";
+  try {
+    qrRuleModalImageObjectUrl = await fetchQrRuleImageObjectUrl(ruleId, 500);
+    if (qrRuleModalImage) {
+      qrRuleModalImage.src = qrRuleModalImageObjectUrl;
+      qrRuleModalImage.classList.remove("hidden");
+    }
+    if (qrRuleModalImageError) qrRuleModalImageError.classList.add("hidden");
+    renderQrRulePrintLabel(q, qrRuleModalImageObjectUrl);
+    if (btnPrintQrRuleLabel) btnPrintQrRuleLabel.disabled = false;
+  } catch (err) {
+    if (qrRuleModalImageError) {
+      qrRuleModalImageError.textContent = `QR no disponible: ${String(err.message || err)}`;
+      qrRuleModalImageError.classList.remove("hidden");
+    }
+  }
+}
+function closeQrRulePreviewModal() {
+  if (!qrRulePreviewModal) return;
+  qrRulePreviewModal.classList.add("hidden");
+  qrRulePreviewModal.style.display = "";
+  revokeQrRuleModalImageUrl();
+  if (qrRuleModalImage) {
+    qrRuleModalImage.removeAttribute("src");
+    qrRuleModalImage.classList.add("hidden");
+  }
+}
+function renderQrRulesList() {
+  if (!qrRulesList) return;
+  revokeQrRuleThumbUrls();
+  qrRulesList.innerHTML = qrActionRules.map(q => `
+    <div class="list-item qr-rule-row" data-qr-rule-id="${q.id}" role="button" tabindex="0">
+      <button type="button" class="qr-thumb-button" data-qr-preview-id="${q.id}" title="Ver QR ${escapeHtml(q.qr_value || "")}" aria-label="Ver QR ${escapeHtml(q.qr_value || "")}">
+        <span class="qr-thumb-loading">QR</span>
+        <img class="qr-thumb-img hidden" data-qr-thumb-img="${q.id}" alt="QR ${escapeHtml(q.qr_value || "")}">
+        <span class="qr-thumb-error hidden">QR no disponible</span>
+      </button>
+      <div class="qr-rule-row-main">
+        <b>${escapeHtml(q.qr_value || "")}</b>
+        <span>${escapeHtml(q.qr_alias || "")}</span>
+        <small>${escapeHtml(q.qr_type || "-")} - ${escapeHtml(q.match_type || "-")} - ${escapeHtml(q.action_type || "-")} - ${Number(q.is_active ?? 0) ? "activo" : "inactivo"}</small>
+      </div>
+    </div>`).join("") || `<div class="small">Sin QR configurados.</div>`;
+  qrRulesList.querySelectorAll("[data-qr-rule-id]").forEach(row => {
+    row.addEventListener("click", (ev) => {
+      if (ev.target.closest("[data-qr-preview-id]")) return;
+      loadQrRuleForm(Number(row.dataset.qrRuleId));
+    });
+    row.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        loadQrRuleForm(Number(row.dataset.qrRuleId));
+      }
+    });
+  });
+  qrRulesList.querySelectorAll("[data-qr-preview-id]").forEach(btn => btn.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    openQrRulePreviewModal(Number(btn.dataset.qrPreviewId));
+  }));
+  hydrateQrRuleThumbnails();
+}
+async function loadQrActionRules() {
+  if (!adminToken) return;
+  qrActionRules = await fetchJson(API.adminQrActionRules, { headers: fetchHeaders() });
+  renderQrRulesList();
+}
+async function saveQrRule() {
+  if (!adminToken) throw new Error("Admin bloqueado.");
+  const id = qrRuleId.value ? Number(qrRuleId.value) : null;
+  const url = id ? API.adminQrActionRule(id) : API.adminQrActionRules;
+  const method = id ? "PUT" : "POST";
+  await fetchJson(url, { method, headers: { "Content-Type": "application/json", ...fetchHeaders() }, body: JSON.stringify(qrRulePayload()) });
+  await loadQrActionRules();
+  if (qrAdminMsg) qrAdminMsg.textContent = "QR guardado.";
+}
+async function disableQrRule() {
+  if (!adminToken) throw new Error("Admin bloqueado.");
+  const id = qrRuleId.value ? Number(qrRuleId.value) : null;
+  if (!id) throw new Error("Selecciona un QR.");
+  const row = await fetchJson(API.adminQrActionRule(id), { method: "DELETE", headers: fetchHeaders() });
+  await loadQrActionRules();
+  loadQrRuleForm(row.id);
+  if (qrAdminMsg) qrAdminMsg.textContent = "QR desactivado.";
+}
+function clearScanTerminalForm() {
+  if (!scanTerminalId) return;
+  scanTerminalId.value = "";
+  scanTerminalCode.value = "";
+  scanTerminalName.value = "";
+  scanTerminalDescription.value = "";
+  scanTerminalScannerStation.value = "";
+  scanTerminalApiKey.value = "";
+  scanTerminalMode.value = "preview";
+  scanTerminalAllowExecute.value = "0";
+  scanTerminalRequirePreview.value = "1";
+  scanTerminalActive.value = "1";
+  scanTerminalLastSeen.value = "-";
+  scanTerminalLastIp.value = "-";
+}
+function formatScanTerminalLastSeen(value) {
+  return value ? (toLocalInputValue(value).replace("T", " ") || String(value)) : "-";
+}
+function loadScanTerminalForm(id) {
+  const item = scanTerminals.find(x => Number(x.id) === Number(id));
+  if (!item) return;
+  scanTerminalId.value = item.id;
+  scanTerminalCode.value = item.terminal_code || "";
+  scanTerminalName.value = item.name || "";
+  scanTerminalDescription.value = item.description || "";
+  scanTerminalScannerStation.innerHTML = buildScannerStationOptions(item.scanner_station_id || "");
+  scanTerminalScannerStation.value = item.scanner_station_id || "";
+  scanTerminalApiKey.value = item.api_key || "";
+  scanTerminalMode.value = item.mode || "preview";
+  scanTerminalAllowExecute.value = String(item.allow_execute ?? 0);
+  scanTerminalRequirePreview.value = String(item.require_preview ?? 1);
+  scanTerminalActive.value = String(item.is_active ?? 1);
+  scanTerminalLastSeen.value = formatScanTerminalLastSeen(item.last_seen_at);
+  scanTerminalLastIp.value = item.last_ip || "-";
+}
+function scanTerminalPayload() {
+  return {
+    terminal_code: scanTerminalCode.value.trim(),
+    name: scanTerminalName.value.trim(),
+    description: scanTerminalDescription.value.trim() || null,
+    scanner_station_id: scanTerminalScannerStation.value ? Number(scanTerminalScannerStation.value) : null,
+    api_key: scanTerminalApiKey.value.trim() || null,
+    mode: scanTerminalMode.value || "preview",
+    allow_execute: Number(scanTerminalAllowExecute.value || 0),
+    require_preview: Number(scanTerminalRequirePreview.value || 0),
+    is_active: Number(scanTerminalActive.value || 0),
+  };
+}
+function renderScanTerminalsList() {
+  if (!scanTerminalsList) return;
+  scanTerminalsList.innerHTML = scanTerminals.map(t => `
+    <button type="button" class="list-item" data-scan-terminal-id="${t.id}">
+      <b>${escapeHtml(t.terminal_code || "")}</b> ${escapeHtml(t.name || "")}
+      <small>${escapeHtml(t.scanner_code || "sin scanner")} - ${escapeHtml(t.mode || "preview")} - ${Number(t.is_active ?? 0) ? "activo" : "inactivo"} - Last seen: ${escapeHtml(formatScanTerminalLastSeen(t.last_seen_at))} - Last IP: ${escapeHtml(t.last_ip || "-")}</small>
+    </button>`).join("") || `<div class="small">Sin terminales PDA configurados.</div>`;
+  scanTerminalsList.querySelectorAll("[data-scan-terminal-id]").forEach(btn => btn.addEventListener("click", () => loadScanTerminalForm(Number(btn.dataset.scanTerminalId))));
+}
+async function loadScanTerminals() {
+  if (!adminToken) return;
+  const selectedId = scanTerminalId?.value || "";
+  scanTerminals = await fetchJson(API.adminScanTerminals, { headers: fetchHeaders() });
+  renderScanTerminalsList();
+  if (selectedId && scanTerminals.some(t => String(t.id) === String(selectedId))) {
+    loadScanTerminalForm(Number(selectedId));
+  }
+}
+async function saveScanTerminal() {
+  if (!adminToken) throw new Error("Admin bloqueado.");
+  const id = scanTerminalId.value ? Number(scanTerminalId.value) : null;
+  const url = id ? API.adminScanTerminal(id) : API.adminScanTerminals;
+  const method = id ? "PUT" : "POST";
+  await fetchJson(url, { method, headers: { "Content-Type": "application/json", ...fetchHeaders() }, body: JSON.stringify(scanTerminalPayload()) });
+  await loadScanTerminals();
+  if (qrAdminMsg) qrAdminMsg.textContent = "Terminal PDA guardado.";
+}
+async function disableScanTerminal() {
+  if (!adminToken) throw new Error("Admin bloqueado.");
+  const id = scanTerminalId.value ? Number(scanTerminalId.value) : null;
+  if (!id) throw new Error("Selecciona un terminal.");
+  const row = await fetchJson(API.adminScanTerminal(id), { method: "DELETE", headers: fetchHeaders() });
+  await loadScanTerminals();
+  loadScanTerminalForm(row.id);
+  if (qrAdminMsg) qrAdminMsg.textContent = "Terminal PDA desactivado.";
+}
+function focusScanQrInput() {
+  if (!scanQrValue) return;
+  setTimeout(() => {
+    try {
+      scanQrValue.focus();
+      scanQrValue.select();
+    } catch (_) {}
+  }, 0);
+}
+function scanQrStationLabel(row) {
+  if (!row) return "";
+  const code = String(row.scanner_code || "").trim();
+  const name = String(row.name || "").trim();
+  return name ? `${code} - ${name}` : code;
+}
+function renderScanQrScannerOptions() {
+  if (!scanQrScannerSelect) return;
+  const current = scanQrScannerSelect.value;
+  const active = (scannerStations || []).filter(row => Number(row.is_active ?? 0) === 1 && String(row.scanner_code || "").trim());
+  if (!active.length) {
+    scanQrScannerSelect.innerHTML = `<option value="">Sin scanners activos cargados</option>`;
+    if (scanQrScannerHelp) scanQrScannerHelp.textContent = adminToken ? "No hay scanners activos cargados. Puedes capturar el codigo manual." : "Para cargar el select inicia admin, o captura el codigo manual.";
+    return;
+  }
+  scanQrScannerSelect.innerHTML = `<option value="">Selecciona scanner activo</option>` + active.map(row => `<option value="${escapeHtml(row.scanner_code || "")}">${escapeHtml(scanQrStationLabel(row))}</option>`).join("");
+  if ([...scanQrScannerSelect.options].some(opt => opt.value === current)) scanQrScannerSelect.value = current;
+  if (scanQrScannerHelp) scanQrScannerHelp.textContent = "Selecciona una estacion activa o captura un codigo manual como respaldo.";
+}
+async function loadScanQrScanners() {
+  if (!scanQrScannerSelect) return;
+  if (!adminToken) {
+    renderScanQrScannerOptions();
+    return;
+  }
+  try {
+    scannerStations = await fetchJson(API.adminScannerStations, { headers: fetchHeaders() });
+    renderScannerStationsList();
+    renderScanQrScannerOptions();
+  } catch (err) {
+    scanQrScannerSelect.innerHTML = `<option value="">No se pudo cargar catalogo</option>`;
+    if (scanQrScannerHelp) scanQrScannerHelp.textContent = `Usa scanner manual. Error: ${String(err)}`;
+  }
+}
+function currentScanQrScannerCode() {
+  const selectedCode = String(scanQrScannerSelect?.value || "").trim();
+  if (selectedCode) return selectedCode;
+  return String(scanQrScannerManual?.value || "").trim();
+}
+function entityLabel(entity, fallback = "-") {
+  if (!entity || typeof entity !== "object") return fallback;
+  const code = String(entity.code || entity.scanner_code || "").trim();
+  const name = String(entity.name || entity.qr_alias || "").trim();
+  if (code && name) return `${code} - ${name}`;
+  return code || name || fallback;
+}
+function cellPayloadLabel(cell) {
+  if (!cell || typeof cell !== "object" || !cell.id) return "-";
+  const code = String(cell.code || "").trim();
+  const coords = cell.x != null && cell.y != null ? `(${cell.x},${cell.y})` : "";
+  return code && coords ? `${code} ${coords}` : (code || coords || "-");
+}
+function previewDetailRow(label, value) {
+  return `<div><b>${escapeHtml(label)}:</b> ${escapeHtml(value == null || value === "" ? "-" : value)}</div>`;
+}
+function renderScanQrPreviewResult(result) {
+  if (!scanQrResultPanel) return;
+  const ok = !!result?.ok;
+  scanQrResultPanel.classList.toggle("ok", ok);
+  scanQrResultPanel.classList.toggle("error", !ok);
+  const scanner = result?.scanner || {};
+  const qr = result?.qr || {};
+  const source = result?.source || {};
+  const destination = result?.destination || {};
+  scanQrResultPanel.innerHTML = `
+    <div class="scan-preview-title">${ok ? "Preview correcto" : "Preview con error"}</div>
+    <div class="scan-preview-grid">
+      ${previewDetailRow("Status", ok ? "preview_ok" : "error")}
+      ${previewDetailRow("Mensaje", result?.message || "-")}
+      ${previewDetailRow("Accion", result?.action || "-")}
+      ${previewDetailRow("Scanner", entityLabel(scanner))}
+      ${previewDetailRow("QR leido", qr.qr_value || "-")}
+      ${previewDetailRow("Alias", qr.qr_alias || "-")}
+      ${previewDetailRow("Tipo QR", qr.qr_type || result?.parsed?.parsed_type || "-")}
+      ${previewDetailRow("Material", entityLabel(result?.material))}
+      ${previewDetailRow("Rack", entityLabel(result?.rack_selected))}
+      ${previewDetailRow("Origen", `${entityLabel(source.area)} / ${cellPayloadLabel(source.cell)}`)}
+      ${previewDetailRow("Destino", `${entityLabel(destination.area)} / ${cellPayloadLabel(destination.cell)}`)}
+      ${previewDetailRow("Orden", result?.movement_order_id || result?.existing_movement_order_id || "-")}
+      ${previewDetailRow("RCS", result?.dispatch_status || result?.rcs_status || result?.movement_order?.dispatch_status || "-")}
+      ${previewDetailRow("Evento", result?.scan_event_id || "-")}
+    </div>
+  `;
+}
+function renderScanQrHistory(events = scanEvents) {
+  if (!scanQrHistoryList) return;
+  const rowsData = Array.isArray(events) ? events.slice(0, 30) : [];
+  if (!rowsData.length) {
+    scanQrHistoryList.innerHTML = `<div class="small">Sin escaneos registrados.</div>`;
+    return;
+  }
+  const rows = rowsData.map(ev => `
+    <tr>
+      <td>${escapeHtml(toLocalInputValue(ev.created_at).replace("T", " ") || ev.created_at || "-")}</td>
+      <td>${escapeHtml(ev.terminal_code || "-")}</td>
+      <td>${escapeHtml(ev.scanner_code || "-")}</td>
+      <td>${escapeHtml(ev.qr_value || "-")}</td>
+      <td>${escapeHtml(ev.resolved_action || "-")}</td>
+      <td>${escapeHtml(ev.status || "-")}</td>
+      <td>${escapeHtml(ev.error_message || "-")}</td>
+      <td>${escapeHtml(ev.movement_order_id || "-")}</td>
+    </tr>`).join("");
+  scanQrHistoryList.innerHTML = `<table class="diagnosis-table"><thead><tr><th>Hora</th><th>Terminal</th><th>Scanner</th><th>QR</th><th>Accion</th><th>Status</th><th>Error</th><th>Orden</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+async function loadScanQrHistory({ quiet = false } = {}) {
+  scanEvents = await fetchJson(API.scanEvents);
+  renderScanQrHistory(scanEvents);
+  renderScanEvents();
+  if (!quiet && scanQrMsg) scanQrMsg.textContent = "Historial actualizado.";
+}
+async function runScanQrPreview(mode = "preview") {
+  if (scanQrPreviewInFlight) return;
+  const scannerCode = currentScanQrScannerCode();
+  const qrValueText = String(scanQrValue?.value || "").trim();
+  if (!scannerCode) {
+    if (scanQrMsg) scanQrMsg.textContent = "Selecciona o captura el codigo del scanner.";
+    focusScanQrInput();
+    return;
+  }
+  if (!qrValueText) {
+    if (scanQrMsg) scanQrMsg.textContent = "Escanea o captura un QR.";
+    focusScanQrInput();
+    return;
+  }
+  scanQrPreviewInFlight = true;
+  if (btnScanQrPreview) btnScanQrPreview.disabled = true;
+  if (btnScanQrExecute) btnScanQrExecute.disabled = true;
+  const isExecute = mode === "execute";
+  if (scanQrMsg) scanQrMsg.textContent = isExecute ? "Ejecutando FIFO..." : "Generando preview...";
+  try {
+    const result = await fetchJson(isExecute ? API.scanExecute : API.scanPreview, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scanner_code: scannerCode, qr_value: qrValueText, created_by: "operator" }),
+    });
+    renderScanQrPreviewResult(result);
+    if (scanQrMsg) scanQrMsg.textContent = result?.message || "Preview procesado.";
+    if (scanQrValue) scanQrValue.value = "";
+    await loadScanQrHistory({ quiet: true }).catch(err => {
+      if (scanQrMsg) scanQrMsg.textContent = `${result?.message || "Preview procesado."} No se pudo refrescar historial: ${String(err)}`;
+    });
+  } catch (err) {
+    renderScanQrPreviewResult({ ok: false, scanner: { scanner_code: scannerCode }, qr: { qr_value: qrValueText }, message: String(err) });
+    if (scanQrMsg) scanQrMsg.textContent = `Error: ${String(err)}`;
+  } finally {
+    scanQrPreviewInFlight = false;
+    if (btnScanQrPreview) btnScanQrPreview.disabled = false;
+    if (btnScanQrExecute) btnScanQrExecute.disabled = false;
+    focusScanQrInput();
+  }
+}
+function renderScanEvents() {
+  if (!scanEventsList) return;
+  if (!Array.isArray(scanEvents) || !scanEvents.length) {
+    scanEventsList.innerHTML = `<div class="small">Sin escaneos registrados.</div>`;
+    return;
+  }
+  const rows = scanEvents.map(ev => `
+    <tr>
+      <td>${escapeHtml(toLocalInputValue(ev.created_at).replace("T", " ") || ev.created_at || "-")}</td>
+      <td>${escapeHtml(ev.terminal_code || "-")}</td>
+      <td>${escapeHtml(ev.scanner_code || "-")}</td>
+      <td>${escapeHtml(ev.qr_value || "-")}</td>
+      <td>${escapeHtml(ev.resolved_action || "-")}</td>
+      <td>${escapeHtml(ev.rack_code || ev.rack_id || "-")}</td>
+      <td>${escapeHtml(ev.material_group_name || ev.material_group_id || "-")}</td>
+      <td>${escapeHtml(ev.movement_order_id || "-")}</td>
+      <td>${escapeHtml(ev.status || "-")}</td>
+      <td>${escapeHtml(ev.error_message || "-")}</td>
+      <td><button class="btn ghost" type="button" data-scan-event-detail="${ev.id}">JSON</button></td>
+    </tr>`).join("");
+  scanEventsList.innerHTML = `<table class="diagnosis-table"><thead><tr><th>Fecha/hora</th><th>Terminal</th><th>Scanner</th><th>QR leido</th><th>Accion</th><th>Rack</th><th>Material</th><th>Orden</th><th>Status</th><th>Error</th><th>Detalle</th></tr></thead><tbody>${rows}</tbody></table>`;
+  scanEventsList.querySelectorAll("[data-scan-event-detail]").forEach(btn => btn.addEventListener("click", () => showScanEventDetail(Number(btn.dataset.scanEventDetail))));
+}
+function showScanEventDetail(id) {
+  const item = scanEvents.find(x => Number(x.id) === Number(id));
+  if (!item || !scanEventDetailBox || !scanEventDetailJson) return;
+  scanEventDetailBox.classList.remove("hidden");
+  scanEventDetailJson.textContent = JSON.stringify({ request: item.request || {}, result: item.result || {}, event: item }, null, 2);
+}
+async function loadScanEvents() {
+  scanEvents = await fetchJson(API.scanEvents);
+  renderScanEvents();
+  if (qrAdminMsg) qrAdminMsg.textContent = "Historial actualizado.";
+}
+async function loadQrAdminData() {
+  renderQrCatalogOptions();
+  if (!adminToken) return;
+  await loadScannerStations();
+  await Promise.all([loadQrActionRules(), loadScanTerminals(), loadScanEvents()]);
+}
+function activateQrPanel(name) {
+  document.querySelectorAll("#card-qr-scanners .qr-tab").forEach(btn => btn.classList.toggle("active", btn.dataset.qrTab === name));
+  const panelMap = { stations: "qrPanelStations", rules: "qrPanelRules", terminals: "qrPanelTerminals", events: "qrPanelEvents" };
+  Object.entries(panelMap).forEach(([key, id]) => {
+    const panel = document.getElementById(id);
+    if (panel) panel.classList.toggle("active", key === name);
+  });
+  if (name === "terminals" && adminToken) {
+    loadScanTerminals().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; });
+  }
+}
+
 function clearAreaForm() {
   areaId.value = ""; areaCode.value = ""; areaName.value = ""; areaType.value = "almacen"; areaColor.value = "#4f46e5"; areaPriority.value = 0; areaActive.value = 1; if (areaMatterArea) areaMatterArea.value = ""; areaDescription.value = "";
 }
@@ -5564,12 +6563,13 @@ btnAdminLogin?.addEventListener("click", async () => {
     await loadCatalog();
     await loadCleanupHealth();
     await loadAdminOperatorWindows();
+    await loadQrAdminData();
     await loadBackupStatus();
     fillCellForm(locations[idx(selected.x, selected.y)]);
     repairActionTabsLayout();
   } catch (err) { adminMsg.textContent = `Error: ${String(err)}`; }
 });
-btnAdminLock?.addEventListener("click", () => { adminToken = null; restorePendingRestart = false; setAdminUI(false); clearAdminOperatorWindowForm(); if (cleanupHealthBadge) cleanupHealthBadge.classList.add("hidden"); adminMsg.textContent = "Admin bloqueado."; });
+btnAdminLock?.addEventListener("click", () => { adminToken = null; restorePendingRestart = false; setAdminUI(false); clearAdminOperatorWindowForm(); renderScanQrScannerOptions(); if (cleanupHealthBadge) cleanupHealthBadge.classList.add("hidden"); adminMsg.textContent = "Admin bloqueado."; });
 btnOpenDbBackupsModal?.addEventListener("click", () => openDbBackupsModal());
 btnCloseDbBackupsModal?.addEventListener("click", () => closeDbBackupsModal());
 btnDownloadDb?.addEventListener("click", () => downloadDatabaseBackup());
@@ -5618,7 +6618,17 @@ backupRestoreConfirmModal?.addEventListener("click", (ev) => {
 cleanupConfirmModal?.addEventListener("click", (ev) => {
   if (ev.target === cleanupConfirmModal) closeCleanupConfirmModal();
 });
+qrRulePreviewModal?.addEventListener("click", (ev) => {
+  if (ev.target === qrRulePreviewModal) closeQrRulePreviewModal();
+});
+btnCloseQrRuleModal?.addEventListener("click", closeQrRulePreviewModal);
+btnCloseQrRuleModalX?.addEventListener("click", closeQrRulePreviewModal);
+btnPrintQrRuleLabel?.addEventListener("click", () => window.print());
 document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape" && qrRulePreviewModal && !qrRulePreviewModal.classList.contains("hidden")) {
+    closeQrRulePreviewModal();
+    return;
+  }
   if (ev.key === "Escape" && backupRestoreConfirmModal && !backupRestoreConfirmModal.classList.contains("hidden")) {
     closeBackupRestoreConfirmModal();
     return;
@@ -5788,6 +6798,35 @@ btnDeleteMaterial?.addEventListener("click", () => deleteMaterial().catch(err =>
 btnNewRack?.addEventListener("click", clearRackForm);
 btnSaveRack?.addEventListener("click", () => saveRack().catch(err => rackMsg.textContent = `Error: ${String(err)}`));
 btnDeleteRack?.addEventListener("click", () => deleteRack().catch(err => rackMsg.textContent = `Error: ${String(err)}`));
+document.querySelectorAll("#card-qr-scanners .qr-tab").forEach(btn => btn.addEventListener("click", () => activateQrPanel(btn.dataset.qrTab || "stations")));
+btnNewScannerStation?.addEventListener("click", () => { clearScannerStationForm(); if (qrAdminMsg) qrAdminMsg.textContent = ""; });
+btnSaveScannerStation?.addEventListener("click", () => saveScannerStation().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
+btnDisableScannerStation?.addEventListener("click", () => disableScannerStation().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
+scannerCancelReturnArea?.addEventListener("change", () => renderScannerCancelReturnAreaWarning());
+btnNewQrRule?.addEventListener("click", () => { clearQrRuleForm(); if (qrAdminMsg) qrAdminMsg.textContent = ""; });
+btnSaveQrRule?.addEventListener("click", () => saveQrRule().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
+btnDisableQrRule?.addEventListener("click", () => disableQrRule().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
+btnNewScanTerminal?.addEventListener("click", () => { clearScanTerminalForm(); renderScanTerminalScannerOptions(); if (qrAdminMsg) qrAdminMsg.textContent = ""; });
+btnSaveScanTerminal?.addEventListener("click", () => saveScanTerminal().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
+btnRefreshScanTerminals?.addEventListener("click", () => loadScanTerminals().then(() => { if (qrAdminMsg) qrAdminMsg.textContent = "Terminales PDA actualizados."; }).catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
+btnDisableScanTerminal?.addEventListener("click", () => disableScanTerminal().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
+btnRefreshScanEvents?.addEventListener("click", () => loadScanEvents().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
+[scannerSourceCell, scannerDestinationCell, qrSourceCell, qrDestinationCell].forEach(el => el?.addEventListener("change", renderQrCellSummaries));
+btnScanQrPreview?.addEventListener("click", () => runScanQrPreview());
+btnScanQrExecute?.addEventListener("click", () => runScanQrPreview("execute"));
+scanQrValue?.addEventListener("keydown", (ev) => {
+  if (ev.key !== "Enter") return;
+  ev.preventDefault();
+  runScanQrPreview();
+});
+scanQrScannerSelect?.addEventListener("change", () => focusScanQrInput());
+scanQrScannerManual?.addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") {
+    ev.preventDefault();
+    focusScanQrInput();
+  }
+});
+btnRefreshScanQrHistory?.addEventListener("click", () => loadScanQrHistory().catch(err => { if (scanQrMsg) scanQrMsg.textContent = `Error: ${String(err)}`; }));
 rackReservationState?.addEventListener("change", () => {
   if (!rackStatus) return;
   rackStatus.value = Number(rackReservationState?.value || 0) === 1 ? "reserved" : "available";
@@ -5973,6 +7012,8 @@ if (operatorActionDynamicFields) operatorActionDynamicFields.addEventListener('i
     await loadGridConfig();
     await loadLocations();
     await loadCatalog();
+    await loadScanQrScanners().catch(err => { if (scanQrMsg) scanQrMsg.textContent = `No se pudo cargar scanners: ${String(err)}`; });
+    await loadScanQrHistory({ quiet: true }).catch(err => { if (scanQrMsg) scanQrMsg.textContent = `No se pudo cargar historial QR: ${String(err)}`; });
     await loadOperatorWindows();
     await loadMovementOrders();
     if (runtimeAutoRefreshHandle) clearInterval(runtimeAutoRefreshHandle);
@@ -5995,7 +7036,7 @@ if (operatorActionDynamicFields) operatorActionDynamicFields.addEventListener('i
 
 
 
-window.addEventListener("beforeunload", () => { cleanupRuntimeSocket(); });
+window.addEventListener("beforeunload", () => { cleanupRuntimeSocket(); revokeQrRuleThumbUrls(); revokeQrRuleModalImageUrl(); });
 
 
 renderRackCustomFieldEditor([]);

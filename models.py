@@ -293,3 +293,118 @@ class RackSyncEvent(Base):
     message = Column(String(512), nullable=True)
     payload_json = Column(Text, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class ScannerStation(Base):
+    __tablename__ = "scanner_stations"
+    __table_args__ = (
+        Index("ix_scanner_stations_scanner_code", "scanner_code"),
+        Index("ix_scanner_stations_is_active", "is_active"),
+    )
+    id = Column(Integer, primary_key=True)
+    scanner_code = Column(String(128), nullable=False, unique=True)
+    name = Column(String(128), nullable=False)
+    description = Column(String(512), nullable=True)
+    station_type = Column(String(64), nullable=False, default="generic")
+    default_action = Column(String(64), nullable=False, default="preview_only")
+    source_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
+    destination_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
+    source_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
+    destination_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
+    storage_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
+    empty_rack_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
+    cancel_return_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
+    default_material_group_id = Column(Integer, ForeignKey("material_groups.id"), nullable=True)
+    agv_code = Column(String(128), nullable=True)
+    task_typ = Column(String(64), nullable=True)
+    priority = Column(Integer, nullable=False, default=0)
+    require_preview = Column(Integer, nullable=False, default=0)
+    allow_execute = Column(Integer, nullable=False, default=1)
+    is_active = Column(Integer, nullable=False, default=1)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class QrActionRule(Base):
+    __tablename__ = "qr_action_rules"
+    __table_args__ = (
+        Index("ix_qr_action_rules_qr_value", "qr_value"),
+        Index("ix_qr_action_rules_is_active", "is_active"),
+        Index("ix_qr_action_rules_match_type", "match_type"),
+    )
+    id = Column(Integer, primary_key=True)
+    qr_value = Column(String(256), nullable=False)
+    qr_alias = Column(String(128), nullable=True)
+    description = Column(String(512), nullable=True)
+    qr_type = Column(String(64), nullable=False, default="generic")
+    match_type = Column(String(32), nullable=False, default="exact")
+    action_type = Column(String(64), nullable=False, default="use_scanner_default")
+    material_group_id = Column(Integer, ForeignKey("material_groups.id"), nullable=True)
+    rack_id = Column(Integer, ForeignKey("racks.id"), nullable=True)
+    source_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
+    destination_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
+    source_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
+    destination_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
+    priority = Column(Integer, nullable=True)
+    task_typ = Column(String(64), nullable=True)
+    agv_code = Column(String(128), nullable=True)
+    requires_scanner_station = Column(Integer, nullable=False, default=1)
+    is_active = Column(Integer, nullable=False, default=1)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class ScanTerminal(Base):
+    __tablename__ = "scan_terminals"
+    __table_args__ = (
+        Index("ix_scan_terminals_terminal_code", "terminal_code"),
+        Index("ix_scan_terminals_scanner_station_id", "scanner_station_id"),
+        Index("ix_scan_terminals_is_active", "is_active"),
+    )
+    id = Column(Integer, primary_key=True)
+    terminal_code = Column(String(128), nullable=False, unique=True)
+    name = Column(String(128), nullable=False)
+    description = Column(String(512), nullable=True)
+    scanner_station_id = Column(Integer, ForeignKey("scanner_stations.id"), nullable=False)
+    api_key = Column(String(256), nullable=True)
+    mode = Column(String(32), nullable=False, default="preview")
+    allow_execute = Column(Integer, nullable=False, default=0)
+    require_preview = Column(Integer, nullable=False, default=1)
+    is_active = Column(Integer, nullable=False, default=1)
+    last_seen_at = Column(DateTime, nullable=True)
+    last_ip = Column(String(64), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class ScanEvent(Base):
+    __tablename__ = "scan_events"
+    __table_args__ = (
+        Index("ix_scan_events_created_at", "created_at"),
+        Index("ix_scan_events_scanner_code", "scanner_code"),
+        Index("ix_scan_events_qr_value", "qr_value"),
+        Index("ix_scan_events_status", "status"),
+        Index("ix_scan_events_movement_order_id", "movement_order_id"),
+    )
+    id = Column(Integer, primary_key=True)
+    scanner_code = Column(String(128), nullable=True)
+    scanner_station_id = Column(Integer, ForeignKey("scanner_stations.id"), nullable=True)
+    terminal_id = Column(Integer, ForeignKey("scan_terminals.id"), nullable=True)
+    qr_value = Column(String(256), nullable=True)
+    qr_action_rule_id = Column(Integer, ForeignKey("qr_action_rules.id"), nullable=True)
+    parsed_type = Column(String(64), nullable=True)
+    resolved_action = Column(String(64), nullable=True)
+    rack_id = Column(Integer, ForeignKey("racks.id"), nullable=True)
+    material_group_id = Column(Integer, ForeignKey("material_groups.id"), nullable=True)
+    source_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
+    destination_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
+    source_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
+    destination_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
+    movement_order_id = Column(Integer, ForeignKey("movement_orders.id"), nullable=True)
+    mode = Column(String(32), nullable=False, default="preview")
+    status = Column(String(32), nullable=False, default="preview_ok")
+    error_message = Column(String(512), nullable=True)
+    request_json = Column(Text, nullable=True)
+    result_json = Column(Text, nullable=True)
+    created_by = Column(String(128), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)

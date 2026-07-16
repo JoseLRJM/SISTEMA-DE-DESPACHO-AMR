@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 import asyncio
 import contextlib
@@ -10,6 +10,7 @@ import random
 import re
 import json
 import hashlib
+import io
 import os
 import platform
 import secrets
@@ -30,6 +31,7 @@ from sqlalchemy import select, func, delete, text
 from logging_config import ensure_log_file, get_logger
 from rcs_client import RcsClient, RcsError, RcsTaskRequest, RcsTaskResponse
 from monitor_service import TaskMonitor, build_auto_status_query_payload, generate_req_code_ms, apply_remote_status_to_order
+from scanner_service import ScanPreviewError, execute_scan, preview_scan, resolve_scan_terminal, resolve_scanner_cancel_return_area, terminal_preview_scan
 
 from fifo_service import (
     build_fifo_preview_payload,
@@ -53,6 +55,10 @@ from models import (
     MaterialGroup,
     MovementOrder,
     Rack,
+    QrActionRule,
+    ScanEvent,
+    ScannerStation,
+    ScanTerminal,
     SessionLocal,
     Setting,
     OperatorWindow,
@@ -779,6 +785,270 @@ class DirectMoveRequestIn(BaseModel):
     created_by: Optional[str] = Field(default="operador", max_length=128)
 
 
+class ScanPreviewIn(BaseModel):
+    scanner_code: str = Field(min_length=1, max_length=128)
+    qr_value: str = Field(min_length=1, max_length=256)
+    created_by: Optional[str] = Field(default=None, max_length=128)
+
+
+class ScanTerminalRequestIn(BaseModel):
+    terminal_code: str = Field(min_length=1, max_length=128)
+    qr_value: str = Field(min_length=1, max_length=256)
+    mode: str = Field(default="preview", min_length=1, max_length=32)
+
+
+class ScanPreviewOut(BaseModel):
+    ok: bool
+    mode: str
+    status: Optional[str] = None
+    scanner: dict
+    qr: dict
+    action: Optional[str] = None
+    material: dict = {}
+    rack_selected: dict = {}
+    source: dict = {}
+    destination: dict = {}
+    parsed: dict = {}
+    message: str
+    scan_event_id: Optional[int] = None
+    terminal: dict = {}
+    terminal_code: Optional[str] = None
+    scanner_code: Optional[str] = None
+    qr_value: Optional[str] = None
+    movement_order_id: Optional[int] = None
+    movement_order: dict = {}
+    dispatch: dict = {}
+    rollback: dict = {}
+    dispatch_status: Optional[str] = None
+    rcs_status: Optional[str] = None
+    existing_scan_event_id: Optional[int] = None
+    existing_movement_order_id: Optional[int] = None
+
+
+class ScanEventOut(BaseModel):
+    id: int
+    scanner_code: Optional[str] = None
+    scanner_station_id: Optional[int] = None
+    scanner_station_name: Optional[str] = None
+    terminal_id: Optional[int] = None
+    terminal_code: Optional[str] = None
+    terminal_name: Optional[str] = None
+    qr_value: Optional[str] = None
+    qr_action_rule_id: Optional[int] = None
+    qr_alias: Optional[str] = None
+    parsed_type: Optional[str] = None
+    resolved_action: Optional[str] = None
+    rack_id: Optional[int] = None
+    rack_code: Optional[str] = None
+    material_group_id: Optional[int] = None
+    material_group_name: Optional[str] = None
+    source_cell_id: Optional[int] = None
+    destination_cell_id: Optional[int] = None
+    source_area_id: Optional[int] = None
+    destination_area_id: Optional[int] = None
+    movement_order_id: Optional[int] = None
+    mode: str
+    status: str
+    error_message: Optional[str] = None
+    request: dict = {}
+    result: dict = {}
+    created_by: Optional[str] = None
+    created_at: datetime
+
+
+VALID_SCANNER_STATION_TYPES = {"line_request", "storage_in", "empty_request", "full_rack_return", "direct_move", "generic"}
+VALID_SCANNER_ACTIONS = {"fifo_request", "store_rack", "request_empty", "return_full", "direct_move", "point_to_area", "preview_only"}
+VALID_QR_TYPES = {"material", "rack", "request", "move", "store", "generic"}
+VALID_QR_MATCH_TYPES = {"exact", "contains", "prefix", "regex"}
+VALID_QR_ACTION_TYPES = {"fifo_request", "store_rack", "request_empty", "return_full", "direct_move", "point_to_area", "use_scanner_default"}
+VALID_SCAN_TERMINAL_MODES = {"preview", "execute"}
+
+
+class ScannerStationIn(BaseModel):
+    scanner_code: str = Field(min_length=1, max_length=128)
+    name: str = Field(min_length=1, max_length=128)
+    description: Optional[str] = Field(default=None, max_length=512)
+    station_type: str = Field(default="generic", min_length=1, max_length=64)
+    default_action: str = Field(default="preview_only", min_length=1, max_length=64)
+    source_area_id: Optional[int] = None
+    destination_area_id: Optional[int] = None
+    source_cell_id: Optional[int] = None
+    destination_cell_id: Optional[int] = None
+    storage_area_id: Optional[int] = None
+    empty_rack_area_id: Optional[int] = None
+    cancel_return_area_id: Optional[int] = None
+    default_material_group_id: Optional[int] = None
+    agv_code: Optional[str] = Field(default=None, max_length=128)
+    task_typ: Optional[str] = Field(default=None, max_length=64)
+    priority: int = Field(default=0, ge=0, le=9999)
+    require_preview: int = Field(default=0, ge=0, le=1)
+    allow_execute: int = Field(default=1, ge=0, le=1)
+    is_active: int = Field(default=1, ge=0, le=1)
+
+
+class ScannerStationOut(ScannerStationIn):
+    id: int
+    source_area_name: Optional[str] = None
+    destination_area_name: Optional[str] = None
+    source_cell_code: Optional[str] = None
+    destination_cell_code: Optional[str] = None
+    storage_area_name: Optional[str] = None
+    empty_rack_area_name: Optional[str] = None
+    cancel_return_area_code: Optional[str] = None
+    cancel_return_area_name: Optional[str] = None
+    cancel_return_area_matter_area: Optional[str] = None
+    cancel_return_area_is_active: Optional[int] = None
+    default_material_group_name: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class QrActionRuleIn(BaseModel):
+    qr_value: str = Field(min_length=1, max_length=256)
+    qr_alias: Optional[str] = Field(default=None, max_length=128)
+    description: Optional[str] = Field(default=None, max_length=512)
+    qr_type: str = Field(default="generic", min_length=1, max_length=64)
+    match_type: str = Field(default="exact", min_length=1, max_length=32)
+    action_type: str = Field(default="use_scanner_default", min_length=1, max_length=64)
+    material_group_id: Optional[int] = None
+    rack_id: Optional[int] = None
+    source_area_id: Optional[int] = None
+    destination_area_id: Optional[int] = None
+    source_cell_id: Optional[int] = None
+    destination_cell_id: Optional[int] = None
+    priority: Optional[int] = Field(default=None, ge=0, le=9999)
+    task_typ: Optional[str] = Field(default=None, max_length=64)
+    agv_code: Optional[str] = Field(default=None, max_length=128)
+    requires_scanner_station: int = Field(default=1, ge=0, le=1)
+    is_active: int = Field(default=1, ge=0, le=1)
+
+
+class QrActionRuleOut(QrActionRuleIn):
+    id: int
+    material_group_name: Optional[str] = None
+    rack_code: Optional[str] = None
+    source_area_name: Optional[str] = None
+    destination_area_name: Optional[str] = None
+    source_cell_code: Optional[str] = None
+    destination_cell_code: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class PdaQrRuleOut(BaseModel):
+    id: int
+    qr_value: str
+    qr_alias: Optional[str] = None
+    description: Optional[str] = None
+    qr_type: str
+    match_type: str
+    action_type: str
+    is_active: bool
+    requires_scanner_station: bool
+    material_group_name: Optional[str] = None
+    source_area_name: Optional[str] = None
+    destination_area_name: Optional[str] = None
+
+
+class PdaScanHistoryItemOut(BaseModel):
+    scan_event_id: int
+    created_at: datetime
+    terminal_code: Optional[str] = None
+    scanner_code: Optional[str] = None
+    qr_value: Optional[str] = None
+    mode: str
+    scan_status: str
+    error_message: Optional[str] = None
+    movement_order_id: Optional[int] = None
+    order_code: Optional[str] = None
+    rack_id: Optional[int] = None
+    rack_code: Optional[str] = None
+    source_cell_id: Optional[int] = None
+    source_cell_code: Optional[str] = None
+    source_area_id: Optional[int] = None
+    source_area_code: Optional[str] = None
+    source_area_name: Optional[str] = None
+    destination_cell_id: Optional[int] = None
+    destination_cell_code: Optional[str] = None
+    destination_area_id: Optional[int] = None
+    destination_area_code: Optional[str] = None
+    destination_area_name: Optional[str] = None
+    status: Optional[str] = None
+    dispatch_status: Optional[str] = None
+    rcs_status: Optional[str] = None
+    rcs_message: Optional[str] = None
+    can_undo: bool = False
+    action_available: bool = False
+    action_unavailable_reason: Optional[str] = None
+    cancel_return_area_id: Optional[int] = None
+    cancel_return_area_code: Optional[str] = None
+    cancel_return_area_name: Optional[str] = None
+    cancel_return_area_matter_area: Optional[str] = None
+    cancel_return_area_is_active: Optional[int] = None
+
+
+class PdaMovementOrderCancelIn(BaseModel):
+    action: str = Field(min_length=1, max_length=32)
+
+    @field_validator("action")
+    @classmethod
+    def validate_action(cls, value: str):
+        normalized = (value or "").strip().lower()
+        if normalized not in {"cancel", "cancel_return"}:
+            raise ValueError("action debe ser cancel o cancel_return")
+        return normalized
+
+
+class PdaMovementOrderCancelOut(BaseModel):
+    success: bool
+    action: str
+    movement_order_id: int
+    status: str
+    dispatch_status: Optional[str] = None
+    rcs_status: Optional[str] = None
+    message: Optional[str] = None
+    can_undo: bool = False
+
+
+class ScanTerminalIn(BaseModel):
+    terminal_code: str = Field(min_length=1, max_length=128)
+    name: str = Field(min_length=1, max_length=128)
+    description: Optional[str] = Field(default=None, max_length=512)
+    scanner_station_id: int
+    api_key: Optional[str] = Field(default=None, max_length=256)
+    mode: str = Field(default="preview", min_length=1, max_length=32)
+    allow_execute: int = Field(default=0, ge=0, le=1)
+    require_preview: int = Field(default=1, ge=0, le=1)
+    is_active: int = Field(default=1, ge=0, le=1)
+
+
+class ScanTerminalOut(ScanTerminalIn):
+    id: int
+    scanner_code: Optional[str] = None
+    scanner_station_name: Optional[str] = None
+    last_seen_at: Optional[datetime] = None
+    last_ip: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ScanTerminalScannerConfigOut(BaseModel):
+    scanner_code: str
+    scanner_name: str
+    is_active: bool
+    allow_execute: bool
+
+
+class ScanTerminalConfigOut(BaseModel):
+    terminal_code: str
+    terminal_name: str
+    is_active: bool
+    mode: str
+    allow_execute: bool
+    require_preview: bool
+    scanner: ScanTerminalScannerConfigOut
+
+
 class MovementOrderOut(BaseModel):
     order_id: int
     order_code: str
@@ -985,6 +1255,19 @@ def cleanup_legacy_schema():
                 conn.exec_driver_sql("ALTER TABLE areas ADD COLUMN matter_area VARCHAR(128);")
 
         tables = [r[0] for r in conn.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table';").fetchall()]
+        if "scanner_stations" in tables:
+            try:
+                scanner_station_cols = [c[1] for c in conn.exec_driver_sql("PRAGMA table_info(scanner_stations);").fetchall()]
+                if "cancel_return_area_id" not in scanner_station_cols:
+                    conn.exec_driver_sql("ALTER TABLE scanner_stations ADD COLUMN cancel_return_area_id INTEGER NULL;")
+                    logger.info("SQLite migration added scanner_stations.cancel_return_area_id")
+                else:
+                    logger.info("SQLite migration scanner_stations.cancel_return_area_id already exists")
+            except Exception:
+                logger.exception("SQLite migration failed for scanner_stations.cancel_return_area_id")
+                raise
+
+        tables = [r[0] for r in conn.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table';").fetchall()]
         if "movement_orders" in tables:
             mo_cols = [c[1] for c in conn.exec_driver_sql("PRAGMA table_info(movement_orders);").fetchall()]
             movement_missing_sql = {
@@ -1051,6 +1334,12 @@ def cleanup_legacy_schema():
             rack_cols = [c[1] for c in conn.exec_driver_sql("PRAGMA table_info(racks);").fetchall()]
             if "rack_custom_fields_json" not in rack_cols:
                 conn.exec_driver_sql("ALTER TABLE racks ADD COLUMN rack_custom_fields_json TEXT;")
+
+        tables = [r[0] for r in conn.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table';").fetchall()]
+        if "scan_events" in tables:
+            scan_event_cols = [c[1] for c in conn.exec_driver_sql("PRAGMA table_info(scan_events);").fetchall()]
+            if "terminal_id" not in scan_event_cols:
+                conn.exec_driver_sql("ALTER TABLE scan_events ADD COLUMN terminal_id INTEGER;")
 
 
 
@@ -1691,6 +1980,492 @@ def _safe_json_loads_any(text_value: Optional[str]):
         return json.loads(text_value)
     except Exception:
         return {"raw": text_value}
+
+
+def _parse_scan_event_date(value: Optional[str]) -> Optional[datetime]:
+    text_value = (value or "").strip()
+    if not text_value:
+        return None
+    try:
+        return datetime.fromisoformat(text_value.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Fecha invalida: {value}")
+
+
+def _scan_event_out(db, row: ScanEvent) -> ScanEventOut:
+    station = db.execute(select(ScannerStation).where(ScannerStation.id == row.scanner_station_id)).scalar_one_or_none() if row.scanner_station_id else None
+    terminal = db.execute(select(ScanTerminal).where(ScanTerminal.id == row.terminal_id)).scalar_one_or_none() if getattr(row, "terminal_id", None) else None
+    rule = db.execute(select(QrActionRule).where(QrActionRule.id == row.qr_action_rule_id)).scalar_one_or_none() if row.qr_action_rule_id else None
+    rack = db.execute(select(Rack).where(Rack.id == row.rack_id)).scalar_one_or_none() if row.rack_id else None
+    material = db.execute(select(MaterialGroup).where(MaterialGroup.id == row.material_group_id)).scalar_one_or_none() if row.material_group_id else None
+    return ScanEventOut(
+        id=row.id,
+        scanner_code=row.scanner_code,
+        scanner_station_id=row.scanner_station_id,
+        scanner_station_name=station.name if station else None,
+        terminal_id=getattr(row, "terminal_id", None),
+        terminal_code=terminal.terminal_code if terminal else None,
+        terminal_name=terminal.name if terminal else None,
+        qr_value=row.qr_value,
+        qr_action_rule_id=row.qr_action_rule_id,
+        qr_alias=rule.qr_alias if rule else None,
+        parsed_type=row.parsed_type,
+        resolved_action=row.resolved_action,
+        rack_id=row.rack_id,
+        rack_code=rack.code if rack else None,
+        material_group_id=row.material_group_id,
+        material_group_name=material.name if material else None,
+        source_cell_id=row.source_cell_id,
+        destination_cell_id=row.destination_cell_id,
+        source_area_id=row.source_area_id,
+        destination_area_id=row.destination_area_id,
+        movement_order_id=row.movement_order_id,
+        mode=row.mode,
+        status=row.status,
+        error_message=row.error_message,
+        request=_safe_json_loads(row.request_json) or {},
+        result=_safe_json_loads(row.result_json) or {},
+        created_by=row.created_by,
+        created_at=row.created_at,
+    )
+
+
+def _movement_order_cell_code(cell: Optional[dict]) -> Optional[str]:
+    if not cell:
+        return None
+    code = str(cell.get("code") or "").strip()
+    if code:
+        return code
+    x = cell.get("x")
+    y = cell.get("y")
+    if x is not None and y is not None:
+        return f"({x},{y})"
+    return None
+
+
+def _pda_action_unavailable_reason(order_out: Optional[MovementOrderOut]) -> Optional[str]:
+    if not order_out:
+        return None
+    status = (order_out.status or "").strip().lower()
+    dispatch_status = (order_out.dispatch_status or "").strip().lower()
+    if status == "dispatch_error" or dispatch_status == "dispatch_error":
+        return "La tarea no fue aceptada por el RCS y el rollback local ya fue ejecutado."
+    if status == "completed":
+        return "La tarea ya fue completada."
+    if status in {"cancelled", "canceled"}:
+        return "La tarea ya fue cancelada."
+    if status == "undone":
+        return "La tarea ya fue devuelta."
+    if status == "forced_local_closed":
+        return "La tarea fue cerrada localmente."
+    if status == "cancel_requested_total":
+        return "La cancelacion de esta tarea ya esta en proceso."
+    if status == "cancel_requested_undo":
+        return "La cancelacion y devolucion de esta tarea ya esta en proceso."
+    if not order_out.can_undo:
+        return "Esta tarea no admite cancelacion en su estado actual."
+    return None
+
+
+def _utc_datetime_for_pda(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _pda_scan_history_item_out(
+    db,
+    row: ScanEvent,
+    order_by_id: Optional[dict] = None,
+    movement_lookup: Optional[dict] = None,
+    station: Optional[ScannerStation] = None,
+) -> PdaScanHistoryItemOut:
+    terminal = db.execute(select(ScanTerminal).where(ScanTerminal.id == row.terminal_id)).scalar_one_or_none() if getattr(row, "terminal_id", None) else None
+    order = order_by_id.get(row.movement_order_id) if order_by_id is not None and row.movement_order_id else None
+    if order is None and row.movement_order_id:
+        order = db.execute(select(MovementOrder).where(MovementOrder.id == row.movement_order_id)).scalar_one_or_none()
+
+    order_out = None
+    source_area = None
+    destination_area = None
+    cancel_return_area = None
+    if order is not None:
+        lookup = movement_lookup or {}
+        order_out = _movement_order_out(db, order, **lookup)
+        location_by_id = lookup.get("location_by_id") or {}
+        area_by_id = lookup.get("area_by_id") or {}
+        source_location = location_by_id.get(order.source_cell_id)
+        destination_location = location_by_id.get(order.destination_cell_id)
+        source_area_id = getattr(source_location, "area_id", None) or order.source_area_id
+        destination_area_id = getattr(destination_location, "area_id", None) or order.destination_area_id
+        source_area = area_by_id.get(source_area_id) if source_area_id else None
+        destination_area = area_by_id.get(destination_area_id) if destination_area_id else None
+
+    cancel_return_area_id = getattr(station, "cancel_return_area_id", None) if station else None
+    if cancel_return_area_id:
+        area_by_id = (movement_lookup or {}).get("area_by_id") or {}
+        cancel_return_area = area_by_id.get(cancel_return_area_id)
+        if cancel_return_area is None:
+            cancel_return_area = db.execute(select(Area).where(Area.id == cancel_return_area_id)).scalar_one_or_none()
+
+    unavailable_reason = _pda_action_unavailable_reason(order_out)
+
+    return PdaScanHistoryItemOut(
+        scan_event_id=row.id,
+        created_at=_utc_datetime_for_pda(row.created_at),
+        terminal_code=terminal.terminal_code if terminal else None,
+        scanner_code=row.scanner_code,
+        qr_value=row.qr_value,
+        mode=row.mode,
+        scan_status=row.status,
+        error_message=row.error_message,
+        movement_order_id=row.movement_order_id,
+        order_code=order_out.order_code if order_out else None,
+        rack_id=order_out.rack_id if order_out else None,
+        rack_code=order_out.rack_code if order_out else None,
+        source_cell_id=order_out.source_cell_id if order_out else None,
+        source_cell_code=_movement_order_cell_code(order_out.source_cell) if order_out else None,
+        source_area_id=source_area.id if source_area else None,
+        source_area_code=source_area.code if source_area else None,
+        source_area_name=source_area.name if source_area else None,
+        destination_cell_id=order_out.destination_cell_id if order_out else None,
+        destination_cell_code=_movement_order_cell_code(order_out.destination_cell) if order_out else None,
+        destination_area_id=destination_area.id if destination_area else None,
+        destination_area_code=destination_area.code if destination_area else None,
+        destination_area_name=destination_area.name if destination_area else None,
+        status=order_out.status if order_out else None,
+        dispatch_status=order_out.dispatch_status if order_out else None,
+        rcs_status=order_out.rcs_status if order_out else None,
+        rcs_message=order_out.rcs_message if order_out else None,
+        can_undo=bool(order_out.can_undo) if order_out else False,
+        action_available=bool(order_out and not unavailable_reason),
+        action_unavailable_reason=unavailable_reason,
+        cancel_return_area_id=cancel_return_area.id if cancel_return_area else cancel_return_area_id,
+        cancel_return_area_code=cancel_return_area.code if cancel_return_area else None,
+        cancel_return_area_name=cancel_return_area.name if cancel_return_area else None,
+        cancel_return_area_matter_area=cancel_return_area.matter_area if cancel_return_area else None,
+        cancel_return_area_is_active=int(cancel_return_area.is_active) if cancel_return_area else None,
+    )
+
+
+def _pda_cancel_response(db, action: str, row: MovementOrder) -> PdaMovementOrderCancelOut:
+    order_out = _movement_order_out(db, row)
+    return PdaMovementOrderCancelOut(
+        success=True,
+        action=action,
+        movement_order_id=order_out.order_id,
+        status=order_out.status,
+        dispatch_status=order_out.dispatch_status,
+        rcs_status=order_out.rcs_status,
+        message=order_out.rcs_message or order_out.comment or "Cancelacion procesada.",
+        can_undo=bool(order_out.can_undo),
+    )
+
+
+def _ensure_pda_order_can_cancel(db, row: MovementOrder):
+    order_out = _movement_order_out(db, row)
+    status = (row.status or "").strip().lower()
+    dispatch_status = (row.dispatch_status or "").strip().lower()
+    if status == "dispatch_error" or dispatch_status == "dispatch_error":
+        raise HTTPException(status_code=400, detail="La tarea no fue aceptada por el RCS y el rollback local ya fue ejecutado.")
+    if status in {"cancel_requested_total", "cancel_requested_undo"}:
+        raise HTTPException(status_code=409, detail="La cancelacion de esta orden ya esta en proceso.")
+    if status == "completed":
+        raise HTTPException(status_code=400, detail="La orden ya esta completada y no puede cancelarse desde PDA.")
+    if status in {"cancelled", "canceled", "undone", "forced_local_closed"}:
+        raise HTTPException(status_code=400, detail="La orden ya esta cerrada y no puede cancelarse desde PDA.")
+    if not order_out.can_undo:
+        raise HTTPException(status_code=400, detail="La orden no esta en un estado cancelable.")
+
+
+def _validate_choice(value: str, valid_values: set[str], label: str) -> str:
+    normalized = (value or "").strip()
+    if normalized not in valid_values:
+        raise HTTPException(status_code=400, detail=f"{label} invalido")
+    return normalized
+
+
+def _require_area(db, area_id: Optional[int], label: str) -> Optional[Area]:
+    if not area_id:
+        return None
+    row = db.execute(select(Area).where(Area.id == area_id)).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=400, detail=f"{label} no encontrada")
+    return row
+
+
+def _require_scanner_cancel_return_area(db, area_id: Optional[int]) -> Optional[Area]:
+    if not area_id:
+        return None
+    row = db.execute(select(Area).where(Area.id == area_id)).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=400, detail="El área configurada para regresar material al cancelar no existe.")
+    return row
+
+
+def _require_location(db, cell_id: Optional[int], label: str) -> Optional[Location]:
+    if not cell_id:
+        return None
+    row = db.execute(select(Location).where(Location.id == cell_id)).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=400, detail=f"{label} no encontrada")
+    return row
+
+
+def _require_material_group(db, material_group_id: Optional[int], label: str = "Material") -> Optional[MaterialGroup]:
+    if not material_group_id:
+        return None
+    row = db.execute(select(MaterialGroup).where(MaterialGroup.id == material_group_id)).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=400, detail=f"{label} no encontrado")
+    return row
+
+
+def _require_rack(db, rack_id: Optional[int]) -> Optional[Rack]:
+    if not rack_id:
+        return None
+    row = db.execute(select(Rack).where(Rack.id == rack_id)).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=400, detail="Rack no encontrado")
+    return row
+
+
+def _cell_code(row: Optional[Location]) -> Optional[str]:
+    if not row:
+        return None
+    return (row.code or "").strip() or f"({row.x}, {row.y})"
+
+
+def _scanner_station_out(db, row: ScannerStation, area_by_id: Optional[dict] = None) -> ScannerStationOut:
+    def area_for(area_id):
+        if not area_id:
+            return None
+        if area_by_id is not None:
+            return area_by_id.get(area_id)
+        return db.execute(select(Area).where(Area.id == area_id)).scalar_one_or_none()
+
+    source_area = area_for(row.source_area_id)
+    destination_area = area_for(row.destination_area_id)
+    storage_area = area_for(row.storage_area_id)
+    empty_rack_area = area_for(row.empty_rack_area_id)
+    cancel_return_area_id = getattr(row, "cancel_return_area_id", None)
+    cancel_return_area = area_for(cancel_return_area_id)
+    source_cell = db.execute(select(Location).where(Location.id == row.source_cell_id)).scalar_one_or_none() if row.source_cell_id else None
+    destination_cell = db.execute(select(Location).where(Location.id == row.destination_cell_id)).scalar_one_or_none() if row.destination_cell_id else None
+    material = db.execute(select(MaterialGroup).where(MaterialGroup.id == row.default_material_group_id)).scalar_one_or_none() if row.default_material_group_id else None
+    return ScannerStationOut(
+        id=row.id,
+        scanner_code=row.scanner_code,
+        name=row.name,
+        description=row.description,
+        station_type=row.station_type,
+        default_action=row.default_action,
+        source_area_id=row.source_area_id,
+        source_area_name=source_area.name if source_area else None,
+        destination_area_id=row.destination_area_id,
+        destination_area_name=destination_area.name if destination_area else None,
+        source_cell_id=row.source_cell_id,
+        source_cell_code=_cell_code(source_cell),
+        destination_cell_id=row.destination_cell_id,
+        destination_cell_code=_cell_code(destination_cell),
+        storage_area_id=row.storage_area_id,
+        storage_area_name=storage_area.name if storage_area else None,
+        empty_rack_area_id=row.empty_rack_area_id,
+        empty_rack_area_name=empty_rack_area.name if empty_rack_area else None,
+        cancel_return_area_id=cancel_return_area_id,
+        cancel_return_area_code=cancel_return_area.code if cancel_return_area else None,
+        cancel_return_area_name=cancel_return_area.name if cancel_return_area else None,
+        cancel_return_area_matter_area=cancel_return_area.matter_area if cancel_return_area else None,
+        cancel_return_area_is_active=int(cancel_return_area.is_active) if cancel_return_area else None,
+        default_material_group_id=row.default_material_group_id,
+        default_material_group_name=material.name if material else None,
+        agv_code=row.agv_code,
+        task_typ=row.task_typ,
+        priority=int(row.priority or 0),
+        require_preview=int(row.require_preview or 0),
+        allow_execute=int(row.allow_execute or 0),
+        is_active=int(row.is_active or 0),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+def _scanner_stations_out(db, rows: List[ScannerStation]) -> List[ScannerStationOut]:
+    area_ids = sorted({
+        int(area_id)
+        for row in rows
+        for area_id in (
+            row.source_area_id,
+            row.destination_area_id,
+            row.storage_area_id,
+            row.empty_rack_area_id,
+            getattr(row, "cancel_return_area_id", None),
+        )
+        if area_id
+    })
+    area_by_id = {}
+    if area_ids:
+        area_rows = db.execute(select(Area).where(Area.id.in_(area_ids))).scalars().all()
+        area_by_id = {row.id: row for row in area_rows}
+    return [_scanner_station_out(db, row, area_by_id=area_by_id) for row in rows]
+
+
+def _qr_action_rule_out(db, row: QrActionRule) -> QrActionRuleOut:
+    material = db.execute(select(MaterialGroup).where(MaterialGroup.id == row.material_group_id)).scalar_one_or_none() if row.material_group_id else None
+    rack = db.execute(select(Rack).where(Rack.id == row.rack_id)).scalar_one_or_none() if row.rack_id else None
+    source_area = db.execute(select(Area).where(Area.id == row.source_area_id)).scalar_one_or_none() if row.source_area_id else None
+    destination_area = db.execute(select(Area).where(Area.id == row.destination_area_id)).scalar_one_or_none() if row.destination_area_id else None
+    source_cell = db.execute(select(Location).where(Location.id == row.source_cell_id)).scalar_one_or_none() if row.source_cell_id else None
+    destination_cell = db.execute(select(Location).where(Location.id == row.destination_cell_id)).scalar_one_or_none() if row.destination_cell_id else None
+    return QrActionRuleOut(
+        id=row.id,
+        qr_value=row.qr_value,
+        qr_alias=row.qr_alias,
+        description=row.description,
+        qr_type=row.qr_type,
+        match_type=row.match_type,
+        action_type=row.action_type,
+        material_group_id=row.material_group_id,
+        material_group_name=material.name if material else None,
+        rack_id=row.rack_id,
+        rack_code=rack.code if rack else None,
+        source_area_id=row.source_area_id,
+        source_area_name=source_area.name if source_area else None,
+        destination_area_id=row.destination_area_id,
+        destination_area_name=destination_area.name if destination_area else None,
+        source_cell_id=row.source_cell_id,
+        source_cell_code=_cell_code(source_cell),
+        destination_cell_id=row.destination_cell_id,
+        destination_cell_code=_cell_code(destination_cell),
+        priority=row.priority,
+        task_typ=row.task_typ,
+        agv_code=row.agv_code,
+        requires_scanner_station=int(row.requires_scanner_station or 0),
+        is_active=int(row.is_active or 0),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+def _pda_qr_rule_out(db, row: QrActionRule) -> PdaQrRuleOut:
+    material = db.execute(select(MaterialGroup).where(MaterialGroup.id == row.material_group_id)).scalar_one_or_none() if row.material_group_id else None
+    source_area = db.execute(select(Area).where(Area.id == row.source_area_id)).scalar_one_or_none() if row.source_area_id else None
+    destination_area = db.execute(select(Area).where(Area.id == row.destination_area_id)).scalar_one_or_none() if row.destination_area_id else None
+    return PdaQrRuleOut(
+        id=row.id,
+        qr_value=str(row.qr_value or "").strip(),
+        qr_alias=row.qr_alias,
+        description=row.description,
+        qr_type=row.qr_type or "generic",
+        match_type=row.match_type or "exact",
+        action_type=row.action_type or "use_scanner_default",
+        is_active=int(row.is_active or 0) == 1,
+        requires_scanner_station=int(row.requires_scanner_station or 0) == 1,
+        material_group_name=material.name if material else None,
+        source_area_name=source_area.name if source_area else None,
+        destination_area_name=destination_area.name if destination_area else None,
+    )
+
+
+def _available_pda_qr_rules_stmt():
+    return (
+        select(QrActionRule)
+        .where(QrActionRule.is_active == 1)
+        .where(func.trim(func.coalesce(QrActionRule.qr_value, "")) != "")
+        .order_by(
+            func.lower(func.coalesce(QrActionRule.qr_alias, "")),
+            func.lower(QrActionRule.qr_value),
+            QrActionRule.id,
+        )
+    )
+
+
+def _generate_qr_png_buffer(qr_value: str, size: int = 240) -> io.BytesIO:
+    value = str(qr_value or "").strip()
+    if not value:
+        raise HTTPException(status_code=400, detail="La regla QR no tiene valor para generar imagen")
+    safe_size = max(80, min(int(size or 240), 1000))
+
+    import qrcode
+    from PIL import Image
+    from qrcode.constants import ERROR_CORRECT_M
+
+    qr = qrcode.QRCode(error_correction=ERROR_CORRECT_M, box_size=10, border=4)
+    qr.add_data(value)
+    qr.make(fit=True)
+    image = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    resample = getattr(getattr(Image, "Resampling", Image), "NEAREST")
+    image = image.resize((safe_size, safe_size), resample=resample)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
+
+
+def _scan_terminal_out(db, row: ScanTerminal) -> ScanTerminalOut:
+    station = db.execute(select(ScannerStation).where(ScannerStation.id == row.scanner_station_id)).scalar_one_or_none() if row.scanner_station_id else None
+    return ScanTerminalOut(
+        id=row.id,
+        terminal_code=row.terminal_code,
+        name=row.name,
+        description=row.description,
+        scanner_station_id=row.scanner_station_id,
+        scanner_code=station.scanner_code if station else None,
+        scanner_station_name=station.name if station else None,
+        api_key=row.api_key,
+        mode=row.mode,
+        allow_execute=int(row.allow_execute or 0),
+        require_preview=int(row.require_preview or 0),
+        is_active=int(row.is_active or 0),
+        last_seen_at=row.last_seen_at,
+        last_ip=row.last_ip,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+def _validate_scanner_station_body(db, body: ScannerStationIn) -> tuple[str, str]:
+    station_type = _validate_choice(body.station_type, VALID_SCANNER_STATION_TYPES, "station_type")
+    default_action = _validate_choice(body.default_action, VALID_SCANNER_ACTIONS, "default_action")
+    _require_area(db, body.source_area_id, "Area origen")
+    _require_area(db, body.destination_area_id, "Area destino")
+    _require_area(db, body.storage_area_id, "Area de almacenamiento")
+    _require_area(db, body.empty_rack_area_id, "Area de rack vacio")
+    _require_scanner_cancel_return_area(db, body.cancel_return_area_id)
+    _require_location(db, body.source_cell_id, "Celda origen")
+    _require_location(db, body.destination_cell_id, "Celda destino")
+    _require_material_group(db, body.default_material_group_id)
+    return station_type, default_action
+
+
+def _validate_qr_action_rule_body(db, body: QrActionRuleIn) -> tuple[str, str, str]:
+    qr_type = _validate_choice(body.qr_type, VALID_QR_TYPES, "qr_type")
+    match_type = _validate_choice(body.match_type, VALID_QR_MATCH_TYPES, "match_type")
+    action_type = _validate_choice(body.action_type, VALID_QR_ACTION_TYPES, "action_type")
+    if match_type == "regex":
+        try:
+            re.compile(body.qr_value)
+        except re.error as exc:
+            raise HTTPException(status_code=400, detail=f"Regex invalido: {exc}")
+    _require_material_group(db, body.material_group_id)
+    _require_rack(db, body.rack_id)
+    _require_area(db, body.source_area_id, "Area origen")
+    _require_area(db, body.destination_area_id, "Area destino")
+    _require_location(db, body.source_cell_id, "Celda origen")
+    _require_location(db, body.destination_cell_id, "Celda destino")
+    if action_type == "fifo_request" and not body.material_group_id and not body.qr_value.strip().upper().startswith("MAT:"):
+        raise HTTPException(status_code=400, detail="fifo_request requiere material_group_id o un qr_value con prefijo MAT:")
+    return qr_type, match_type, action_type
+
+
+def _validate_scan_terminal_body(db, body: ScanTerminalIn) -> str:
+    mode = _validate_choice(body.mode, VALID_SCAN_TERMINAL_MODES, "mode")
+    station = db.execute(select(ScannerStation).where(ScannerStation.id == body.scanner_station_id)).scalar_one_or_none()
+    if not station:
+        raise HTTPException(status_code=400, detail="Scanner / estacion asociada no encontrada")
+    return mode
 
 
 _LOG_SENSITIVE_KEYWORDS = ("password", "token", "authorization", "auth_header", "secret", "api_key", "apikey")
@@ -3392,6 +4167,34 @@ def root():
     except Exception:
         logger.exception("Failed to render versioned index.html build_id=%s path=%s", build_id, index_path)
         return FileResponse(index_path, headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"})
+
+
+def _render_pda_page(terminal_code: str = ""):
+    pda_path = os.path.join(_app_root(), "static", "pda.html")
+    build_id = _software_build_id()
+    terminal_json = json.dumps((terminal_code or "").strip())
+    bootstrap_script = f"<script>window.PDA_TERMINAL_CODE_FROM_PATH={terminal_json};window.APP_BUILD_ID={json.dumps(build_id)};</script>"
+    headers = {"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache", "Expires": "0"}
+    try:
+        with open(pda_path, "r", encoding="utf-8") as f:
+            html = f.read()
+        html = re.sub(r'href="/static/pda\.css(?:\?v=[^"]*)?"', f'href="/static/pda.css?v={build_id}"', html)
+        html = re.sub(r'src="/static/pda\.js(?:\?v=[^"]*)?"', f'src="/static/pda.js?v={build_id}"', html)
+        html = html.replace("</head>", f"{bootstrap_script}</head>")
+        return HTMLResponse(html, headers=headers)
+    except Exception:
+        logger.exception("Failed to render PDA page build_id=%s path=%s", build_id, pda_path)
+        return FileResponse(pda_path, headers=headers)
+
+
+@app.get("/pda")
+def pda_root():
+    return _render_pda_page("")
+
+
+@app.get("/pda/{terminal_code}")
+def pda_terminal(terminal_code: str):
+    return _render_pda_page(terminal_code)
 
 
 @app.get("/api/logs/download")
@@ -5190,6 +5993,12 @@ def admin_login(body: AdminLogin):
     return {"token": token, "expires_hours": 8}
 
 
+@app.get("/api/admin/session")
+def admin_session(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    return {"authenticated": True}
+
+
 @app.post("/api/admin/change-password")
 def admin_change_password(body: AdminChangePassword, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
     require_admin(x_admin_token)
@@ -5859,6 +6668,661 @@ def validate_fifo_request(body: FifoRequestIn):
         logger.info("FIFO validate source_area_id=%s destination_area_id=%s material_group_id=%s priority=%s", body.source_area_id, body.destination_area_id, body.material_group_id, body.priority)
         selection = resolve_fifo_request(db, body.source_area_id, body.destination_area_id, body.material_group_id, body.priority)
         return FifoPreviewOut(**build_fifo_preview_payload(selection))
+
+
+@app.post("/api/scan/preview", response_model=ScanPreviewOut)
+def scan_preview(body: ScanPreviewIn):
+    with SessionLocal() as db:
+        logger.info("Scan preview scanner_code=%s created_by=%s", body.scanner_code, body.created_by or "-")
+        return ScanPreviewOut(**preview_scan(db, body.scanner_code, body.qr_value, body.created_by))
+
+
+@app.post("/api/scan/execute", response_model=ScanPreviewOut)
+def scan_execute(body: ScanPreviewIn):
+    with SessionLocal() as db:
+        logger.info("Scan execute scanner_code=%s created_by=%s", body.scanner_code, body.created_by or "-")
+        result = execute_scan(
+            db,
+            body.scanner_code,
+            body.qr_value,
+            body.created_by,
+            dispatch_func=_dispatch_movement_order,
+            rollback_func=_rollback_unsuccessful_order_dispatch,
+            audit_rack_func=_audit_rack_reservation_change,
+        )
+        return ScanPreviewOut(**result)
+
+
+def _terminal_config_http_error(exc: ScanPreviewError) -> HTTPException:
+    raw = str(getattr(exc, "message", "") or "")
+    normalized = raw.strip().lower()
+    if "terminal_code requerido" in normalized:
+        return HTTPException(status_code=400, detail="terminal_code requerido")
+    if "terminal_code no registrado" in normalized:
+        return HTTPException(status_code=404, detail="Terminal no encontrada.")
+    if "terminal inactivo" in normalized:
+        return HTTPException(status_code=403, detail="Terminal inactiva.")
+    if "x-terminal-key invalido" in normalized or "x-terminal-key inválido" in normalized:
+        return HTTPException(status_code=401, detail="X-Terminal-Key inválido.")
+    if "scanner asociado" in normalized:
+        return HTTPException(status_code=409, detail="Scanner asociado no disponible.")
+    return HTTPException(status_code=400, detail=raw or "Terminal no disponible.")
+
+
+@app.get("/api/scan/terminal-config/{terminal_code}", response_model=ScanTerminalConfigOut)
+def scan_terminal_config(terminal_code: str, x_terminal_key: Optional[str] = Header(default=None, alias="X-Terminal-Key")):
+    normalized_code = str(terminal_code or "").strip()
+    if not normalized_code:
+        raise HTTPException(status_code=400, detail="terminal_code requerido")
+    with SessionLocal() as db:
+        try:
+            terminal, station = resolve_scan_terminal(db, normalized_code, x_terminal_key)
+        except ScanPreviewError as exc:
+            http_exc = _terminal_config_http_error(exc)
+            logger.info(
+                "Scan terminal config rejected terminal_code=%s status=%s reason=%s",
+                normalized_code,
+                http_exc.status_code,
+                http_exc.detail,
+            )
+            raise http_exc
+        logger.info("Scan terminal config ok terminal_code=%s scanner_code=%s", terminal.terminal_code, station.scanner_code)
+        return ScanTerminalConfigOut(
+            terminal_code=terminal.terminal_code,
+            terminal_name=terminal.name,
+            is_active=int(terminal.is_active or 0) == 1,
+            mode=terminal.mode or "preview",
+            allow_execute=int(terminal.allow_execute or 0) == 1,
+            require_preview=int(terminal.require_preview or 0) == 1,
+            scanner=ScanTerminalScannerConfigOut(
+                scanner_code=station.scanner_code,
+                scanner_name=station.name,
+                is_active=int(station.is_active or 0) == 1,
+                allow_execute=int(station.allow_execute or 0) == 1,
+            ),
+        )
+
+
+@app.get("/api/scan/available-qr-rules/{terminal_code}", response_model=List[PdaQrRuleOut])
+def scan_available_qr_rules(terminal_code: str, x_terminal_key: Optional[str] = Header(default=None, alias="X-Terminal-Key")):
+    normalized_code = str(terminal_code or "").strip()
+    if not normalized_code:
+        raise HTTPException(status_code=400, detail="terminal_code requerido")
+    with SessionLocal() as db:
+        try:
+            terminal, station = resolve_scan_terminal(db, normalized_code, x_terminal_key)
+        except ScanPreviewError as exc:
+            http_exc = _terminal_config_http_error(exc)
+            logger.info(
+                "PDA QR catalog rejected terminal_code=%s status=%s reason=%s",
+                normalized_code,
+                http_exc.status_code,
+                http_exc.detail,
+            )
+            raise http_exc
+
+        rows = db.execute(_available_pda_qr_rules_stmt()).scalars().all()
+        logger.info(
+            "PDA QR catalog ok terminal_code=%s scanner_code=%s count=%s",
+            terminal.terminal_code,
+            station.scanner_code,
+            len(rows),
+        )
+        return [_pda_qr_rule_out(db, row) for row in rows]
+
+
+@app.get("/api/scan/available-qr-rules/{terminal_code}/{qr_action_rule_id}/image")
+def scan_available_qr_rule_image(
+    terminal_code: str,
+    qr_action_rule_id: int,
+    size: int = 240,
+    x_terminal_key: Optional[str] = Header(default=None, alias="X-Terminal-Key"),
+):
+    normalized_code = str(terminal_code or "").strip()
+    if not normalized_code:
+        raise HTTPException(status_code=400, detail="terminal_code requerido")
+    with SessionLocal() as db:
+        try:
+            terminal, station = resolve_scan_terminal(db, normalized_code, x_terminal_key)
+        except ScanPreviewError as exc:
+            http_exc = _terminal_config_http_error(exc)
+            logger.info(
+                "PDA QR image rejected terminal_code=%s rule_id=%s status=%s reason=%s",
+                normalized_code,
+                qr_action_rule_id,
+                http_exc.status_code,
+                http_exc.detail,
+            )
+            raise http_exc
+
+        row = db.execute(
+            _available_pda_qr_rules_stmt().where(QrActionRule.id == qr_action_rule_id)
+        ).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Regla QR no disponible para esta terminal")
+
+        logger.info(
+            "PDA QR image ok terminal_code=%s scanner_code=%s rule_id=%s",
+            terminal.terminal_code,
+            station.scanner_code,
+            row.id,
+        )
+        return StreamingResponse(
+            _generate_qr_png_buffer(row.qr_value, size),
+            media_type="image/png",
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
+
+
+@app.get("/api/scan/terminal/{terminal_code}/history", response_model=List[PdaScanHistoryItemOut])
+def scan_terminal_history(
+    terminal_code: str,
+    limit: int = 20,
+    x_terminal_key: Optional[str] = Header(default=None, alias="X-Terminal-Key"),
+):
+    normalized_code = str(terminal_code or "").strip()
+    if not normalized_code:
+        raise HTTPException(status_code=400, detail="terminal_code requerido")
+    safe_limit = max(1, min(int(limit or 20), 50))
+    with SessionLocal() as db:
+        try:
+            terminal, station = resolve_scan_terminal(db, normalized_code, x_terminal_key)
+        except ScanPreviewError as exc:
+            http_exc = _terminal_config_http_error(exc)
+            logger.info(
+                "PDA_HISTORY_REQUEST terminal_code=%s terminal_id=- scanner_code=- result_count=0 error=%s",
+                normalized_code,
+                http_exc.detail,
+            )
+            raise http_exc
+
+        rows = db.execute(
+            select(ScanEvent)
+            .where(ScanEvent.terminal_id == terminal.id)
+            .order_by(ScanEvent.created_at.desc(), ScanEvent.id.desc())
+            .limit(safe_limit)
+        ).scalars().all()
+        order_ids = sorted({row.movement_order_id for row in rows if row.movement_order_id})
+        order_by_id = {}
+        movement_lookup = {}
+        if order_ids:
+            orders = db.execute(select(MovementOrder).where(MovementOrder.id.in_(order_ids))).scalars().all()
+            order_by_id = {row.id: row for row in orders}
+            movement_lookup = _build_movement_order_lookup_maps(db, orders)
+            area_by_id = movement_lookup.setdefault("area_by_id", {})
+            location_by_id = movement_lookup.get("location_by_id") or {}
+            extra_area_ids = {
+                getattr(location, "area_id", None)
+                for location in location_by_id.values()
+                if getattr(location, "area_id", None)
+            }
+            cancel_return_area_id = getattr(station, "cancel_return_area_id", None)
+            if cancel_return_area_id:
+                extra_area_ids.add(cancel_return_area_id)
+            missing_area_ids = sorted(area_id for area_id in extra_area_ids if area_id not in area_by_id)
+            if missing_area_ids:
+                area_rows = db.execute(select(Area).where(Area.id.in_(missing_area_ids))).scalars().all()
+                area_by_id.update({row.id: row for row in area_rows})
+        elif getattr(station, "cancel_return_area_id", None):
+            area = db.execute(select(Area).where(Area.id == station.cancel_return_area_id)).scalar_one_or_none()
+            movement_lookup = {"area_by_id": {area.id: area} if area else {}}
+        result = [_pda_scan_history_item_out(db, row, order_by_id, movement_lookup, station) for row in rows]
+        logger.info(
+            "PDA_HISTORY_REQUEST terminal_code=%s terminal_id=%s scanner_code=%s result_count=%s",
+            terminal.terminal_code,
+            terminal.id,
+            station.scanner_code,
+            len(result),
+        )
+        return result
+
+
+@app.post("/api/scan/terminal/{terminal_code}/movement-orders/{order_id}/cancel", response_model=PdaMovementOrderCancelOut)
+def scan_terminal_cancel_movement_order(
+    terminal_code: str,
+    order_id: int,
+    body: PdaMovementOrderCancelIn,
+    x_terminal_key: Optional[str] = Header(default=None, alias="X-Terminal-Key"),
+):
+    normalized_code = str(terminal_code or "").strip()
+    if not normalized_code:
+        raise HTTPException(status_code=400, detail="terminal_code requerido")
+    with SessionLocal() as db:
+        terminal = None
+        station = None
+        scan_event = None
+        return_area_id = None
+        matter_area = ""
+        try:
+            try:
+                terminal, station = resolve_scan_terminal(db, normalized_code, x_terminal_key)
+            except ScanPreviewError as exc:
+                raise _terminal_config_http_error(exc)
+
+            row = db.execute(select(MovementOrder).where(MovementOrder.id == order_id)).scalar_one_or_none()
+            if not row:
+                raise HTTPException(status_code=404, detail="Orden no encontrada")
+
+            scan_event = db.execute(
+                select(ScanEvent)
+                .where(ScanEvent.terminal_id == terminal.id)
+                .where(ScanEvent.movement_order_id == order_id)
+                .order_by(ScanEvent.created_at.desc(), ScanEvent.id.desc())
+            ).scalars().first()
+            if not scan_event:
+                raise HTTPException(status_code=403, detail="La orden no pertenece al historial de esta terminal PDA.")
+
+            _ensure_pda_order_can_cancel(db, row)
+
+            action = body.action
+            if action == "cancel_return":
+                resolved_return_area = resolve_scanner_cancel_return_area(db, station)
+                return_area_id = resolved_return_area["return_area_id"]
+                matter_area = resolved_return_area["matter_area"]
+                row = _execute_cancel_for_order(
+                    db,
+                    row,
+                    "1",
+                    matter_area,
+                    undo_on_accept=True,
+                    source="pda",
+                    actor=f"pda:{terminal.terminal_code}",
+                )
+            else:
+                row = _execute_cancel_for_order(
+                    db,
+                    row,
+                    "0",
+                    "",
+                    undo_on_accept=False,
+                    source="pda",
+                    actor=f"pda:{terminal.terminal_code}",
+                )
+            response = _pda_cancel_response(db, action, row)
+            logger.info(
+                "PDA_CANCEL_REQUEST terminal_code=%s scanner_code=%s scan_event_id=%s movement_order_id=%s action=%s return_area_id=%s matter_area=%s result_status=%s rcs_status=%s error=-",
+                terminal.terminal_code,
+                station.scanner_code,
+                scan_event.id,
+                order_id,
+                action,
+                return_area_id or "-",
+                matter_area or "",
+                response.status,
+                response.rcs_status or "-",
+            )
+            return response
+        except ScanPreviewError as exc:
+            logger.info(
+                "PDA_CANCEL_REQUEST terminal_code=%s scanner_code=%s scan_event_id=%s movement_order_id=%s action=%s return_area_id=%s matter_area=%s result_status=- rcs_status=- error=%s",
+                normalized_code,
+                station.scanner_code if station else "-",
+                scan_event.id if scan_event else "-",
+                order_id,
+                getattr(body, "action", "-"),
+                return_area_id or "-",
+                matter_area or "",
+                exc.message,
+            )
+            raise HTTPException(status_code=400, detail=exc.message)
+        except HTTPException as exc:
+            logger.info(
+                "PDA_CANCEL_REQUEST terminal_code=%s scanner_code=%s scan_event_id=%s movement_order_id=%s action=%s return_area_id=%s matter_area=%s result_status=- rcs_status=- error=%s",
+                normalized_code,
+                station.scanner_code if station else "-",
+                scan_event.id if scan_event else "-",
+                order_id,
+                getattr(body, "action", "-"),
+                return_area_id or "-",
+                matter_area or "",
+                exc.detail,
+            )
+            raise
+
+
+@app.post("/api/scan/terminal", response_model=ScanPreviewOut)
+def scan_terminal(body: ScanTerminalRequestIn, request: Request, x_terminal_key: Optional[str] = Header(default=None, alias="X-Terminal-Key")):
+    with SessionLocal() as db:
+        client_ip = request.client.host if request.client else None
+        logger.info("Scan terminal preview terminal_code=%s mode=%s client_ip=%s", body.terminal_code, body.mode, client_ip or "-")
+        try:
+            return ScanPreviewOut(**terminal_preview_scan(
+                db,
+                body.terminal_code,
+                body.qr_value,
+                body.mode,
+                x_terminal_key,
+                client_ip,
+                dispatch_func=_dispatch_movement_order,
+                rollback_func=_rollback_unsuccessful_order_dispatch,
+                audit_rack_func=_audit_rack_reservation_change,
+            ))
+        except ScanPreviewError as exc:
+            raise HTTPException(status_code=400, detail=exc.message)
+
+
+@app.get("/api/scan/events", response_model=List[ScanEventOut])
+def list_scan_events(
+    scanner_code: Optional[str] = None,
+    qr_value: Optional[str] = None,
+    status: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    movement_order_id: Optional[int] = None,
+):
+    with SessionLocal() as db:
+        stmt = select(ScanEvent)
+        if scanner_code:
+            stmt = stmt.where(ScanEvent.scanner_code == scanner_code.strip())
+        if qr_value:
+            stmt = stmt.where(ScanEvent.qr_value == qr_value.strip())
+        if status:
+            stmt = stmt.where(ScanEvent.status == status.strip())
+        parsed_from = _parse_scan_event_date(date_from)
+        parsed_to = _parse_scan_event_date(date_to)
+        if parsed_from:
+            stmt = stmt.where(ScanEvent.created_at >= parsed_from)
+        if parsed_to:
+            stmt = stmt.where(ScanEvent.created_at <= parsed_to)
+        if movement_order_id:
+            stmt = stmt.where(ScanEvent.movement_order_id == movement_order_id)
+        rows = db.execute(stmt.order_by(ScanEvent.created_at.desc(), ScanEvent.id.desc()).limit(200)).scalars().all()
+        return [_scan_event_out(db, row) for row in rows]
+
+
+@app.get("/api/admin/scanner-stations", response_model=List[ScannerStationOut])
+def admin_list_scanner_stations(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        rows = db.execute(select(ScannerStation).order_by(ScannerStation.scanner_code.asc())).scalars().all()
+        return _scanner_stations_out(db, rows)
+
+
+@app.post("/api/admin/scanner-stations", response_model=ScannerStationOut)
+def admin_create_scanner_station(body: ScannerStationIn, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        scanner_code = body.scanner_code.strip()
+        if db.execute(select(ScannerStation).where(ScannerStation.scanner_code == scanner_code)).scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Ya existe un scanner con ese codigo")
+        station_type, default_action = _validate_scanner_station_body(db, body)
+        now = datetime.utcnow()
+        row = ScannerStation(
+            scanner_code=scanner_code,
+            name=body.name.strip(),
+            description=(body.description or "").strip() or None,
+            station_type=station_type,
+            default_action=default_action,
+            source_area_id=body.source_area_id,
+            destination_area_id=body.destination_area_id,
+            source_cell_id=body.source_cell_id,
+            destination_cell_id=body.destination_cell_id,
+            storage_area_id=body.storage_area_id,
+            empty_rack_area_id=body.empty_rack_area_id,
+            cancel_return_area_id=body.cancel_return_area_id,
+            default_material_group_id=body.default_material_group_id,
+            agv_code=(body.agv_code or "").strip() or None,
+            task_typ=(body.task_typ or "").strip() or None,
+            priority=int(body.priority or 0),
+            require_preview=int(body.require_preview or 0),
+            allow_execute=int(body.allow_execute or 0),
+            is_active=int(body.is_active),
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        logger.info("Scanner station created scanner_id=%s scanner_code=%s", row.id, row.scanner_code)
+        return _scanner_station_out(db, row)
+
+
+@app.put("/api/admin/scanner-stations/{scanner_station_id}", response_model=ScannerStationOut)
+def admin_update_scanner_station(scanner_station_id: int, body: ScannerStationIn, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        row = db.execute(select(ScannerStation).where(ScannerStation.id == scanner_station_id)).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scanner no encontrado")
+        scanner_code = body.scanner_code.strip()
+        dup = db.execute(select(ScannerStation).where(ScannerStation.scanner_code == scanner_code, ScannerStation.id != scanner_station_id)).scalar_one_or_none()
+        if dup:
+            raise HTTPException(status_code=400, detail="Ya existe un scanner con ese codigo")
+        station_type, default_action = _validate_scanner_station_body(db, body)
+        row.scanner_code = scanner_code
+        row.name = body.name.strip()
+        row.description = (body.description or "").strip() or None
+        row.station_type = station_type
+        row.default_action = default_action
+        row.source_area_id = body.source_area_id
+        row.destination_area_id = body.destination_area_id
+        row.source_cell_id = body.source_cell_id
+        row.destination_cell_id = body.destination_cell_id
+        row.storage_area_id = body.storage_area_id
+        row.empty_rack_area_id = body.empty_rack_area_id
+        row.cancel_return_area_id = body.cancel_return_area_id
+        row.default_material_group_id = body.default_material_group_id
+        row.agv_code = (body.agv_code or "").strip() or None
+        row.task_typ = (body.task_typ or "").strip() or None
+        row.priority = int(body.priority or 0)
+        row.require_preview = int(body.require_preview or 0)
+        row.allow_execute = int(body.allow_execute or 0)
+        row.is_active = int(body.is_active or 0)
+        row.updated_at = datetime.utcnow()
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        logger.info("Scanner station updated scanner_id=%s scanner_code=%s", row.id, row.scanner_code)
+        return _scanner_station_out(db, row)
+
+
+@app.delete("/api/admin/scanner-stations/{scanner_station_id}", response_model=ScannerStationOut)
+def admin_delete_scanner_station(scanner_station_id: int, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        row = db.execute(select(ScannerStation).where(ScannerStation.id == scanner_station_id)).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scanner no encontrado")
+        row.is_active = 0
+        row.updated_at = datetime.utcnow()
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        logger.info("Scanner station deactivated scanner_id=%s scanner_code=%s", row.id, row.scanner_code)
+        return _scanner_station_out(db, row)
+
+
+@app.get("/api/admin/qr-action-rules", response_model=List[QrActionRuleOut])
+def admin_list_qr_action_rules(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        rows = db.execute(select(QrActionRule).order_by(QrActionRule.qr_value.asc(), QrActionRule.id.asc())).scalars().all()
+        return [_qr_action_rule_out(db, row) for row in rows]
+
+
+@app.get("/api/admin/qr-action-rules/{qr_action_rule_id}/qr-image")
+def admin_qr_action_rule_image(
+    qr_action_rule_id: int,
+    size: int = 240,
+    x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
+):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        row = db.execute(select(QrActionRule).where(QrActionRule.id == qr_action_rule_id)).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Regla QR no encontrada")
+        buffer = _generate_qr_png_buffer(row.qr_value, size)
+        return StreamingResponse(
+            buffer,
+            media_type="image/png",
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
+
+
+@app.post("/api/admin/qr-action-rules", response_model=QrActionRuleOut)
+def admin_create_qr_action_rule(body: QrActionRuleIn, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        qr_value = body.qr_value.strip()
+        qr_type, match_type, action_type = _validate_qr_action_rule_body(db, body)
+        now = datetime.utcnow()
+        row = QrActionRule(
+            qr_value=qr_value,
+            qr_alias=(body.qr_alias or "").strip() or None,
+            description=(body.description or "").strip() or None,
+            qr_type=qr_type,
+            match_type=match_type,
+            action_type=action_type,
+            material_group_id=body.material_group_id,
+            rack_id=body.rack_id,
+            source_area_id=body.source_area_id,
+            destination_area_id=body.destination_area_id,
+            source_cell_id=body.source_cell_id,
+            destination_cell_id=body.destination_cell_id,
+            priority=body.priority,
+            task_typ=(body.task_typ or "").strip() or None,
+            agv_code=(body.agv_code or "").strip() or None,
+            requires_scanner_station=int(body.requires_scanner_station or 0),
+            is_active=int(body.is_active),
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        logger.info("QR action rule created qr_rule_id=%s qr_value=%s", row.id, row.qr_value)
+        return _qr_action_rule_out(db, row)
+
+
+@app.put("/api/admin/qr-action-rules/{qr_action_rule_id}", response_model=QrActionRuleOut)
+def admin_update_qr_action_rule(qr_action_rule_id: int, body: QrActionRuleIn, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        row = db.execute(select(QrActionRule).where(QrActionRule.id == qr_action_rule_id)).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Regla QR no encontrada")
+        qr_type, match_type, action_type = _validate_qr_action_rule_body(db, body)
+        row.qr_value = body.qr_value.strip()
+        row.qr_alias = (body.qr_alias or "").strip() or None
+        row.description = (body.description or "").strip() or None
+        row.qr_type = qr_type
+        row.match_type = match_type
+        row.action_type = action_type
+        row.material_group_id = body.material_group_id
+        row.rack_id = body.rack_id
+        row.source_area_id = body.source_area_id
+        row.destination_area_id = body.destination_area_id
+        row.source_cell_id = body.source_cell_id
+        row.destination_cell_id = body.destination_cell_id
+        row.priority = body.priority
+        row.task_typ = (body.task_typ or "").strip() or None
+        row.agv_code = (body.agv_code or "").strip() or None
+        row.requires_scanner_station = int(body.requires_scanner_station or 0)
+        row.is_active = int(body.is_active or 0)
+        row.updated_at = datetime.utcnow()
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        logger.info("QR action rule updated qr_rule_id=%s qr_value=%s", row.id, row.qr_value)
+        return _qr_action_rule_out(db, row)
+
+
+@app.delete("/api/admin/qr-action-rules/{qr_action_rule_id}", response_model=QrActionRuleOut)
+def admin_delete_qr_action_rule(qr_action_rule_id: int, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        row = db.execute(select(QrActionRule).where(QrActionRule.id == qr_action_rule_id)).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Regla QR no encontrada")
+        row.is_active = 0
+        row.updated_at = datetime.utcnow()
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        logger.info("QR action rule deactivated qr_rule_id=%s qr_value=%s", row.id, row.qr_value)
+        return _qr_action_rule_out(db, row)
+
+
+@app.get("/api/admin/scan-terminals", response_model=List[ScanTerminalOut])
+def admin_list_scan_terminals(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        rows = db.execute(select(ScanTerminal).order_by(ScanTerminal.terminal_code.asc(), ScanTerminal.id.asc())).scalars().all()
+        return [_scan_terminal_out(db, row) for row in rows]
+
+
+@app.post("/api/admin/scan-terminals", response_model=ScanTerminalOut)
+def admin_create_scan_terminal(body: ScanTerminalIn, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        terminal_code = body.terminal_code.strip()
+        if db.execute(select(ScanTerminal).where(ScanTerminal.terminal_code == terminal_code)).scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Ya existe un terminal con ese codigo")
+        mode = _validate_scan_terminal_body(db, body)
+        now = datetime.utcnow()
+        row = ScanTerminal(
+            terminal_code=terminal_code,
+            name=body.name.strip(),
+            description=(body.description or "").strip() or None,
+            scanner_station_id=body.scanner_station_id,
+            api_key=(body.api_key or "").strip() or None,
+            mode=mode,
+            allow_execute=int(body.allow_execute or 0),
+            require_preview=int(body.require_preview or 0),
+            is_active=int(body.is_active),
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        logger.info("Scan terminal created terminal_id=%s terminal_code=%s", row.id, row.terminal_code)
+        return _scan_terminal_out(db, row)
+
+
+@app.put("/api/admin/scan-terminals/{terminal_id}", response_model=ScanTerminalOut)
+def admin_update_scan_terminal(terminal_id: int, body: ScanTerminalIn, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        row = db.execute(select(ScanTerminal).where(ScanTerminal.id == terminal_id)).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Terminal no encontrado")
+        terminal_code = body.terminal_code.strip()
+        dup = db.execute(select(ScanTerminal).where(ScanTerminal.terminal_code == terminal_code, ScanTerminal.id != terminal_id)).scalar_one_or_none()
+        if dup:
+            raise HTTPException(status_code=400, detail="Ya existe un terminal con ese codigo")
+        mode = _validate_scan_terminal_body(db, body)
+        row.terminal_code = terminal_code
+        row.name = body.name.strip()
+        row.description = (body.description or "").strip() or None
+        row.scanner_station_id = body.scanner_station_id
+        row.api_key = (body.api_key or "").strip() or None
+        row.mode = mode
+        row.allow_execute = int(body.allow_execute or 0)
+        row.require_preview = int(body.require_preview or 0)
+        row.is_active = int(body.is_active or 0)
+        row.updated_at = datetime.utcnow()
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        logger.info("Scan terminal updated terminal_id=%s terminal_code=%s", row.id, row.terminal_code)
+        return _scan_terminal_out(db, row)
+
+
+@app.delete("/api/admin/scan-terminals/{terminal_id}", response_model=ScanTerminalOut)
+def admin_delete_scan_terminal(terminal_id: int, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        row = db.execute(select(ScanTerminal).where(ScanTerminal.id == terminal_id)).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Terminal no encontrado")
+        row.is_active = 0
+        row.updated_at = datetime.utcnow()
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        logger.info("Scan terminal deactivated terminal_id=%s terminal_code=%s", row.id, row.terminal_code)
+        return _scan_terminal_out(db, row)
 
 
 @app.post("/api/fifo/execute", response_model=MovementOrderOut)
@@ -8484,10 +9948,31 @@ def operator_preview_window_button(window_id: int, button_index: int, body: Oper
         return _preview_window_button(db, row, button_row, body)
 
 
-def _rollback_unsuccessful_order_dispatch(db, order: MovementOrder, error_message: Optional[str] = None) -> None:
+def _rollback_unsuccessful_order_dispatch(db, order: MovementOrder, error_message: Optional[str] = None) -> dict:
     now = datetime.utcnow()
     message = (error_message or order.rcs_message or "Dispatch error").strip()
     previous_status = order.status or ""
+    rack_before = db.execute(select(Rack).where(Rack.id == order.rack_id)).scalar_one_or_none() if order.rack_id else None
+    source_cell = db.execute(select(Location).where(Location.id == order.source_cell_id)).scalar_one_or_none() if order.source_cell_id else None
+    destination_cell = db.execute(select(Location).where(Location.id == order.destination_cell_id)).scalar_one_or_none() if order.destination_cell_id else None
+    rollback_result = {
+        "executed": True,
+        "movement_order_id": order.id,
+        "order_code": order.order_code,
+        "previous_status": previous_status,
+        "new_status": "dispatch_error",
+        "rack_id": order.rack_id,
+        "rack_status_before": rack_before.status if rack_before else None,
+        "rack_status_after": None,
+        "released_racks": [],
+        "source_cell_id": order.source_cell_id,
+        "source_cell_status": source_cell.status if source_cell else None,
+        "source_cell_rack_id": source_cell.rack_id if source_cell else None,
+        "destination_cell_id": order.destination_cell_id,
+        "destination_cell_status": destination_cell.status if destination_cell else None,
+        "destination_cell_rack_id": destination_cell.rack_id if destination_cell else None,
+        "error_message": message,
+    }
     order.status = "dispatch_error"
     order.dispatch_status = "error"
     order.rcs_status = "error"
@@ -8513,16 +9998,31 @@ def _rollback_unsuccessful_order_dispatch(db, order: MovementOrder, error_messag
         if released:
             released_racks.append({"rack_id": rack.id, "old_status": old_status, "new_status": rack.status})
 
+    rollback_result["released_racks"] = released_racks
     db.commit()
     db.refresh(order)
+    rack_after = db.execute(select(Rack).where(Rack.id == order.rack_id)).scalar_one_or_none() if order.rack_id else None
+    rollback_result["rack_status_after"] = rack_after.status if rack_after else None
     logger.warning(
-        "Preserved unsuccessful dispatch order_id=%s order_code=%s status=%s released_racks=%s error=%s",
+        "ROLLBACK_DISPATCH_ERROR executed=true movement_order_id=%s order_code=%s rack_id=%s previous_status=%s new_status=%s dispatch_status=%s rcs_status=%s rcs_message=%s released_racks=%s source_cell_id=%s source_cell_status=%s source_cell_rack_id=%s destination_cell_id=%s destination_cell_status=%s destination_cell_rack_id=%s rack_status_after=%s",
         order.id,
         order.order_code,
+        order.rack_id,
+        previous_status,
         order.status,
-        released_racks,
+        order.dispatch_status,
+        order.rcs_status,
         message,
+        released_racks,
+        rollback_result["source_cell_id"],
+        rollback_result["source_cell_status"],
+        rollback_result["source_cell_rack_id"],
+        rollback_result["destination_cell_id"],
+        rollback_result["destination_cell_status"],
+        rollback_result["destination_cell_rack_id"],
+        rollback_result["rack_status_after"],
     )
+    return rollback_result
 
 
 @app.post('/api/operator-windows/{window_id}/buttons/{button_index}/execute', response_model=MovementOrderOut)

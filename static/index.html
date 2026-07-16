@@ -115,6 +115,37 @@
 <div class="small" id="operatorWindowMsg"></div>
 </div>
 </div>
+<div class="card" id="card-scan-qr">
+<h3>Escaneo QR</h3>
+<div class="small">Pantalla operativa de vista previa. No ejecuta &oacute;rdenes ni mueve robots.</div>
+<div class="row two-col">
+<div>
+<label>Scanner / estaci&oacute;n</label>
+<select id="scanQrScannerSelect">
+<option value="">Selecciona scanner activo</option>
+</select>
+<div class="small" id="scanQrScannerHelp">Si el cat&aacute;logo no carga, captura el c&oacute;digo manualmente.</div>
+</div>
+<div>
+<label>Scanner manual</label>
+<input id="scanQrScannerManual" placeholder="LINEA_SW_44_03" type="text"/>
+</div>
+</div>
+<div class="row">
+<label>QR a leer</label>
+<input autocomplete="off" id="scanQrValue" placeholder="Escanea o escribe el QR y presiona Enter" type="text"/>
+<button class="btn preview-accent" id="btnScanQrPreview" type="button">Preview</button>
+<button class="btn danger" id="btnScanQrExecute" type="button">Ejecutar FIFO</button>
+</div>
+<div class="scan-preview-panel" id="scanQrResultPanel">
+<div class="small">Escanea un QR para ver la vista previa.</div>
+</div>
+<div class="row scan-qr-history-actions">
+<button class="btn ghost" id="btnRefreshScanQrHistory" type="button">Refrescar historial</button>
+</div>
+<div class="diagnosis-table-wrap scan-qr-history-wrap" id="scanQrHistoryList">Sin datos.</div>
+<div class="small" id="scanQrMsg"></div>
+</div>
 <div class="card" id="card-general">
 <h3>Configuración general</h3>
 <div class="row two-col">
@@ -510,6 +541,134 @@
 </div>
 <div class="small" id="operatorWindowAdminMsg"></div>
 </div>
+<div class="card" id="card-qr-scanners">
+<h3>QR / Esc&aacute;neres</h3>
+<div class="qr-tabs">
+<button class="btn qr-tab active" data-qr-tab="stations" type="button">Estaciones / Scanners</button>
+<button class="btn qr-tab" data-qr-tab="rules" type="button">C&oacute;digos QR configurados</button>
+<button class="btn qr-tab" data-qr-tab="terminals" type="button">Terminales PDA</button>
+<button class="btn qr-tab" data-qr-tab="events" type="button">Historial de escaneos</button>
+</div>
+<div class="qr-panel active" id="qrPanelStations">
+<div class="qr-help">Configura aqu&iacute; D&Oacute;NDE se escanea. Ejemplo: LINEA_SW_44_03, ALMACEN_ENTRADA_1. No pongas aqu&iacute; el n&uacute;mero de parte del QR.</div>
+<input id="scannerStationId" type="hidden"/>
+<div class="row two-col">
+<div><label>C&oacute;digo del scanner / estaci&oacute;n</label><input disabled="" id="scannerCode" placeholder="LINEA_SW_44_03" type="text"/></div>
+<div><label>Nombre</label><input disabled="" id="scannerName" type="text"/></div>
+</div>
+<div class="row"><label>Descripci&oacute;n</label><textarea disabled="" id="scannerDescription" rows="2"></textarea></div>
+<div class="row two-col">
+<div><label>Tipo de estaci&oacute;n</label><select disabled="" id="scannerStationType"><option value="line_request">line_request</option><option value="storage_in">storage_in</option><option value="empty_request">empty_request</option><option value="full_rack_return">full_rack_return</option><option value="direct_move">direct_move</option><option value="generic">generic</option></select></div>
+<div><label>Acci&oacute;n default</label><select disabled="" id="scannerDefaultAction"><option value="fifo_request">fifo_request</option><option value="store_rack">store_rack</option><option value="request_empty">request_empty</option><option value="return_full">return_full</option><option value="direct_move">direct_move</option><option value="point_to_area">point_to_area</option><option value="preview_only">preview_only</option></select></div>
+</div>
+<div class="row two-col">
+<div><label>&Aacute;rea origen</label><select disabled="" id="scannerSourceArea"><option value="">Sin &aacute;rea</option></select></div>
+<div><label>&Aacute;rea destino</label><select disabled="" id="scannerDestinationArea"><option value="">Sin &aacute;rea</option></select></div>
+</div>
+<div class="row two-col">
+<div><label>Celda origen</label><select disabled="" id="scannerSourceCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="scannerSourceCellSummary">No hay celda seleccionada.</div></div>
+<div><label>Celda destino</label><select disabled="" id="scannerDestinationCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="scannerDestinationCellSummary">No hay celda seleccionada.</div></div>
+</div>
+<div class="row two-col">
+<div><label>&Aacute;rea almacenamiento</label><select disabled="" id="scannerStorageArea"><option value="">Sin &aacute;rea</option></select></div>
+<div><label>&Aacute;rea racks vac&iacute;os</label><select disabled="" id="scannerEmptyRackArea"><option value="">Sin &aacute;rea</option></select></div>
+</div>
+<div class="row">
+<div><label>&Aacute;rea para regresar material al cancelar</label><select disabled="" id="scannerCancelReturnArea"><option value="">Sin configurar</option></select><div class="small">Se utilizar&aacute; para Cancelar/Devolver desde el PDA. El &aacute;rea debe tener Matter Area configurado.</div><div class="qr-cell-summary hidden" id="scannerCancelReturnAreaWarning"></div></div>
+</div>
+<div class="row two-col">
+<div><label>Material default</label><select disabled="" id="scannerDefaultMaterial"><option value="">Sin material</option></select></div>
+<div><label>Prioridad</label><input disabled="" id="scannerPriority" min="0" type="number" value="0"/></div>
+</div>
+<div class="row two-col">
+<div><label>AGV code</label><input disabled="" id="scannerAgvCode" type="text"/></div>
+<div><label>Task type</label><input disabled="" id="scannerTaskTyp" type="text"/></div>
+</div>
+<div class="row two-col">
+<div><label>Require preview</label><select disabled="" id="scannerRequirePreview"><option value="0">No</option><option value="1">S&iacute;</option></select></div>
+<div><label>Allow execute</label><select disabled="" id="scannerAllowExecute"><option value="1">S&iacute;</option><option value="0">No</option></select></div>
+</div>
+<div class="row two-col">
+<div><label>Activo</label><select disabled="" id="scannerActive"><option value="1">S&iacute;</option><option value="0">No</option></select></div>
+<div></div>
+</div>
+<div class="row"><button class="btn primary" disabled="" id="btnSaveScannerStation" type="button">Guardar scanner</button><button class="btn ghost" disabled="" id="btnNewScannerStation" type="button">Nuevo</button><button class="btn danger" disabled="" id="btnDisableScannerStation" type="button">Desactivar</button></div>
+<div class="list-box qr-list" id="scannerStationsList"></div>
+</div>
+<div class="qr-panel" id="qrPanelRules">
+<div class="qr-help">Configura aqu&iacute; QU&Eacute; se escanea. Ejemplo: 17L998-9010, 17L991-9060. Este valor debe coincidir con el texto le&iacute;do del QR.</div>
+<input id="qrRuleId" type="hidden"/>
+<div class="row two-col">
+<div><label>Valor exacto le&iacute;do del QR</label><input disabled="" id="qrValue" placeholder="17L998-9010" type="text"/></div>
+<div><label>Alias</label><input disabled="" id="qrAlias" placeholder="WIPER LH" type="text"/></div>
+</div>
+<div class="row"><label>Descripci&oacute;n</label><textarea disabled="" id="qrDescription" rows="2"></textarea></div>
+<div class="row two-col">
+<div><label>Tipo de QR</label><select disabled="" id="qrType"><option value="material">material</option><option value="rack">rack</option><option value="request">request</option><option value="move">move</option><option value="store">store</option><option value="generic">generic</option></select></div>
+<div><label>Tipo coincidencia</label><select disabled="" id="qrMatchType"><option value="exact">exact</option><option value="contains">contains</option><option value="prefix">prefix</option><option value="regex">regex</option></select></div>
+</div>
+<div class="row two-col">
+<div><label>Acci&oacute;n</label><select disabled="" id="qrActionType"><option value="fifo_request">fifo_request</option><option value="store_rack">store_rack</option><option value="request_empty">request_empty</option><option value="return_full">return_full</option><option value="direct_move">direct_move</option><option value="point_to_area">point_to_area</option><option value="use_scanner_default">use_scanner_default</option></select></div>
+<div><label>Material asociado</label><select disabled="" id="qrMaterial"><option value="">Sin material</option></select></div>
+</div>
+<div class="row two-col">
+<div><label>Rack asociado</label><select disabled="" id="qrRack"><option value="">Sin rack</option></select></div>
+<div><label>Prioridad</label><input disabled="" id="qrPriority" min="0" type="number"/></div>
+</div>
+<div class="row two-col">
+<div><label>&Aacute;rea origen</label><select disabled="" id="qrSourceArea"><option value="">Sin &aacute;rea</option></select></div>
+<div><label>&Aacute;rea destino</label><select disabled="" id="qrDestinationArea"><option value="">Sin &aacute;rea</option></select></div>
+</div>
+<div class="row two-col">
+<div><label>Celda origen</label><select disabled="" id="qrSourceCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="qrSourceCellSummary">No hay celda seleccionada.</div></div>
+<div><label>Celda destino</label><select disabled="" id="qrDestinationCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="qrDestinationCellSummary">No hay celda seleccionada.</div></div>
+</div>
+<div class="row two-col">
+<div><label>AGV code</label><input disabled="" id="qrAgvCode" type="text"/></div>
+<div><label>Task type</label><input disabled="" id="qrTaskTyp" type="text"/></div>
+</div>
+<div class="row two-col">
+<div><label>Requiere scanner</label><select disabled="" id="qrRequiresScanner"><option value="1">S&iacute;</option><option value="0">No</option></select></div>
+<div><label>Activo</label><select disabled="" id="qrActive"><option value="1">S&iacute;</option><option value="0">No</option></select></div>
+</div>
+<div class="row"><button class="btn primary" disabled="" id="btnSaveQrRule" type="button">Guardar QR</button><button class="btn ghost" disabled="" id="btnNewQrRule" type="button">Nuevo</button><button class="btn danger" disabled="" id="btnDisableQrRule" type="button">Desactivar</button></div>
+<div class="list-box qr-list" id="qrRulesList"></div>
+</div>
+<div class="qr-panel" id="qrPanelTerminals">
+<div class="qr-help">Configura aqu&iacute; el PDA f&iacute;sico que enviar&aacute; lecturas por HTTP POST. El terminal se asocia a una estaci&oacute;n/scanner l&oacute;gica.</div>
+<div class="qr-execute-warning">Advertencia: en modo execute este PDA puede crear &oacute;rdenes reales y despachar al RCS.</div>
+<input id="scanTerminalId" type="hidden"/>
+<div class="row two-col">
+<div><label>C&oacute;digo terminal</label><input disabled="" id="scanTerminalCode" placeholder="PDA_SW_44_03" type="text"/></div>
+<div><label>Nombre</label><input disabled="" id="scanTerminalName" placeholder="PDA L&iacute;nea SW-44-03" type="text"/></div>
+</div>
+<div class="row"><label>Descripci&oacute;n</label><textarea disabled="" id="scanTerminalDescription" rows="2"></textarea></div>
+<div class="row two-col">
+<div><label>Scanner / estaci&oacute;n asociada</label><select disabled="" id="scanTerminalScannerStation"><option value="">Selecciona scanner</option></select></div>
+<div><label>API key opcional</label><input disabled="" id="scanTerminalApiKey" placeholder="CLAVE" type="text"/></div>
+</div>
+<div class="row two-col">
+<div><label>Modo</label><select disabled="" id="scanTerminalMode"><option value="preview">preview</option><option value="execute">execute</option></select></div>
+<div><label>Allow execute</label><select disabled="" id="scanTerminalAllowExecute"><option value="0">No</option><option value="1">S&iacute;</option></select></div>
+</div>
+<div class="row two-col">
+<div><label>Require preview</label><select disabled="" id="scanTerminalRequirePreview"><option value="1">S&iacute;</option><option value="0">No</option></select></div>
+<div><label>Activo</label><select disabled="" id="scanTerminalActive"><option value="1">S&iacute;</option><option value="0">No</option></select></div>
+</div>
+<div class="row two-col">
+<div><label>Last seen</label><input disabled="" id="scanTerminalLastSeen" type="text"/></div>
+<div><label>Last IP</label><input disabled="" id="scanTerminalLastIp" type="text"/></div>
+</div>
+<div class="row"><button class="btn primary" disabled="" id="btnSaveScanTerminal" type="button">Guardar terminal</button><button class="btn ghost" disabled="" id="btnNewScanTerminal" type="button">Nuevo</button><button class="btn ghost" disabled="" id="btnRefreshScanTerminals" type="button">Refrescar terminales</button><button class="btn danger" disabled="" id="btnDisableScanTerminal" type="button">Desactivar</button></div>
+<div class="list-box qr-list" id="scanTerminalsList"></div>
+</div>
+<div class="qr-panel" id="qrPanelEvents">
+<div class="row"><button class="btn" id="btnRefreshScanEvents" type="button">Refrescar historial</button></div>
+<div class="diagnosis-table-wrap qr-events-wrap" id="scanEventsList">Sin datos.</div>
+<div class="list-box json-box hidden" id="scanEventDetailBox"><pre class="json-pre" id="scanEventDetailJson">Sin detalle.</pre></div>
+</div>
+<div class="small" id="qrAdminMsg"></div>
+</div>
 <div class="card" id="card-direct-move">
 <h3>Solicitar movimiento</h3>
 <div class="row two-col">
@@ -868,6 +1027,35 @@ reqCode automático · reqTime automático · mapShortName configurable y habili
 </div>
 </aside>
 </main>
+<div class="modal hidden" id="qrRulePreviewModal">
+<div class="modal-card qr-modal-card">
+<div class="modal-header qr-modal-header">
+<div>
+<h3 id="qrRuleModalTitle">QR configurado</h3>
+<div class="small">Valor exacto le&iacute;do del QR: <b id="qrRuleModalValue"></b></div>
+</div>
+<button class="btn ghost" id="btnCloseQrRuleModalX" type="button" aria-label="Cerrar">X</button>
+</div>
+<div class="modal-body qr-modal-body">
+<div class="qr-modal-layout">
+<div class="qr-modal-image-wrap">
+<img class="qr-modal-image hidden" id="qrRuleModalImage" alt="QR configurado"/>
+<div class="qr-modal-image-error" id="qrRuleModalImageError">Cargando QR...</div>
+</div>
+<div class="qr-modal-info">
+<div class="small">Alias</div>
+<div class="qr-modal-alias" id="qrRuleModalAlias">-</div>
+<div class="qr-modal-meta" id="qrRuleModalMeta"></div>
+</div>
+</div>
+<div class="qr-print-label" id="qrRulePrintLabel"></div>
+</div>
+<div class="row qr-modal-actions">
+<button class="btn ghost" id="btnCloseQrRuleModal" type="button">Cerrar</button>
+<button class="btn primary" id="btnPrintQrRuleLabel" type="button">Imprimir etiqueta</button>
+</div>
+</div>
+</div>
 <div class="modal hidden" id="dbBackupsModal">
 <div class="modal-card db-backups-modal-card">
 <div class="modal-header">
