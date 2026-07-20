@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from datetime import datetime
@@ -162,19 +163,24 @@ def build_auto_status_query_payload(task_codes: list[str], req_time: str | None 
         value = str(code or "").strip()
         if value and value not in unique_codes:
             unique_codes.append(value)
-    return {
+    payload = {
         "reqCode": generate_req_code_ms(),
-        "reqTime": req_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "clientCode": "",
-        "tokenCode": "",
-        "agvCode": "",
         "taskCodes": unique_codes,
     }
+    if req_time:
+        payload["reqTime"] = req_time
+    return payload
 
 
 def _normalize_remote_status(value: str) -> str:
     raw = str(value or "").strip().lower()
     status_map = {
+        "0": "failed",
+        "sending exception": "failed",
+        "sending_exception": "failed",
+        "1": "dispatched",
+        "created": "dispatched",
+        "2": "in_progress",
         "9": "completed",
         "completed": "completed",
         "complete": "completed",
@@ -184,6 +190,14 @@ def _normalize_remote_status(value: str) -> str:
         "5": "cancelled",
         "canceled": "cancelled",
         "cancelled": "cancelled",
+        "3": "dispatched",
+        "sending": "dispatched",
+        "4": "canceling",
+        "canceling": "canceling",
+        "6": "in_progress",
+        "resending": "in_progress",
+        "10": "failed",
+        "interrupted": "failed",
         "executing": "in_progress",
         "running": "in_progress",
         "in_progress": "in_progress",
@@ -201,6 +215,54 @@ def _normalize_remote_status(value: str) -> str:
         "terminated": "failed",
     }
     return status_map.get(raw, raw)
+
+
+def _task_status_items_by_code(response) -> dict[str, dict]:
+    items_by_code: dict[str, dict] = {}
+    for item in response.task_statuses or []:
+        code = str(item.get("taskCode") or item.get("task_code") or "").strip()
+        if code:
+            items_by_code[code] = item
+    return items_by_code
+
+
+def _task_code_from_error_message(message: str, known_task_codes: list[str] | None = None) -> str:
+    text = str(message or "").strip()
+    if not text:
+        return ""
+    for code in known_task_codes or []:
+        value = str(code or "").strip()
+        if value and value in text:
+            return value
+    match = re.search(r"task\s*code\s*\.?\s*:?\s*([A-Za-z0-9_./:-]+)", text, flags=re.IGNORECASE)
+    if not match:
+        match = re.search(r"taskcode\s*\.?\s*:?\s*([A-Za-z0-9_./:-]+)", text, flags=re.IGNORECASE)
+    return match.group(1).strip(" .,:;") if match else ""
+
+
+def _single_task_response_item(response, task_code: str) -> dict | None:
+    code = str(task_code or "").strip()
+    if not code:
+        return None
+    items_by_code = _task_status_items_by_code(response)
+    if code in items_by_code:
+        return items_by_code[code]
+    if len(response.task_statuses or []) == 1:
+        item = dict((response.task_statuses or [])[0])
+        response_code = str(item.get("taskCode") or "").strip()
+        if not response_code:
+            item["taskCode"] = code
+            return item
+        if response_code == code:
+            return item
+    if response.task_status:
+        return {
+            "taskCode": code,
+            "taskStatus": response.task_status,
+            "message": response.message,
+            "raw": response.raw,
+        }
+    return None
 
 
 def _mark_order_terminal_without_move(db, order: MovementOrder, terminal_status: str, *, source: str = "monitor_remote", auto_commit: bool = True):
@@ -240,7 +302,7 @@ def apply_remote_status_to_order(db, row: MovementOrder, task_status: str, *, so
     normalized = _normalize_remote_status(task_status)
     if not normalized:
         return row
-    logger.info("Applying remote status order_id=%s order_code=%s remote_status=%s", row.id, row.order_code, normalized)
+    logger.info("Applying remote status order_id=%s order_code=%s remote_status=%s raw_status=%s", row.id, row.order_code, normalized, task_status)
 
     if normalized == "completed":
         if row.status == "cancel_requested_undo":
@@ -314,12 +376,255 @@ def apply_remote_status_to_order(db, row: MovementOrder, task_status: str, *, so
                 db.commit()
         return row
 
+    if normalized == "canceling":
+        row.rcs_status = "canceling"
+        row.updated_at = datetime.utcnow()
+        db.add(row)
+        if auto_commit:
+            db.commit()
+        return row
+
     if normalized == "failed":
         _mark_order_terminal_without_move(db, row, "failed", source=source, auto_commit=auto_commit)
         row = db.execute(select(MovementOrder).where(MovementOrder.id == row.id)).scalar_one()
         return row
 
     return row
+
+
+def _record_status_query_for_order(
+    db,
+    row: MovementOrder,
+    *,
+    request_payload: dict,
+    response_payload: dict,
+    req_code: str,
+    message: str,
+    now: datetime,
+    normalized_status: str = "",
+    update_message: bool = True,
+):
+    from main import _append_status_query_log
+
+    row.req_code = req_code or row.req_code
+    row.status_query_request_json = json.dumps(request_payload, ensure_ascii=False)
+    row.status_query_response_json = json.dumps(response_payload or {}, ensure_ascii=False)
+    row.status_query_checked_at = now
+    row.rcs_last_update = now
+    if normalized_status:
+        row.rcs_status = normalized_status
+    if update_message and message:
+        row.rcs_message = message
+    row.updated_at = now
+    _append_status_query_log(db, row, kind="status_query", request_payload=request_payload, response_payload=response_payload or {}, message=message or "", arrived_at=now)
+    db.add(row)
+
+
+def _apply_matched_task_status(db, row: MovementOrder, *, item: dict, request_payload: dict, response, now: datetime, source: str) -> tuple[int, str] | None:
+    response_task_code = str(item.get("taskCode") or item.get("task_code") or "").strip()
+    order_task_code = str(row.remote_task_code or "").strip()
+    raw_status = str(item.get("taskStatus") or item.get("task_status") or "").strip()
+    normalized_status = _normalize_remote_status(raw_status)
+    logger.info(
+        "TASK_STATUS_RAW movement_order_id=%s remote_task_code=%s raw_taskStatus=%s normalized_status=%s agvCode=%s taskTyp=%s",
+        row.id,
+        order_task_code,
+        raw_status,
+        normalized_status,
+        item.get("agvCode") or item.get("agv_code") or "",
+        item.get("taskTyp") or item.get("task_type") or "",
+    )
+    if response_task_code != order_task_code:
+        logger.warning(
+            "TASK_STATUS_SKIP_MISMATCH movement_order_id=%s order_remote_task_code=%s response_taskCode=%s reason=taskCode mismatch",
+            row.id,
+            order_task_code,
+            response_task_code,
+        )
+        return None
+    logger.info(
+        "TASK_STATUS_APPLY movement_order_id=%s order_remote_task_code=%s response_taskCode=%s raw_taskStatus=%s normalized_status=%s",
+        row.id,
+        order_task_code,
+        response_task_code,
+        raw_status,
+        normalized_status,
+    )
+    response_payload = item.get("raw") if isinstance(item.get("raw"), dict) else (response.raw or {})
+    message = str(item.get("message") or response.message or "")
+    _record_status_query_for_order(
+        db,
+        row,
+        request_payload=request_payload,
+        response_payload=response_payload,
+        req_code=response.reqCode or request_payload.get("reqCode") or "",
+        message=message,
+        now=now,
+        normalized_status=normalized_status,
+        update_message=True,
+    )
+    return (row.id, normalized_status) if normalized_status else None
+
+
+def _apply_touched_remote_statuses(db, touched_rows: list[tuple[int, str]]):
+    for row_id, task_status in touched_rows:
+        row = db.execute(select(MovementOrder).where(MovementOrder.id == row_id)).scalar_one()
+        row = apply_remote_status_to_order(db, row, task_status, auto_commit=False)
+        row.rcs_status = task_status or row.rcs_status
+        row.updated_at = datetime.utcnow()
+        db.add(row)
+
+
+def _run_single_status_query(db, *, client, task_code: str, rows_for_code: list[MovementOrder], source: str) -> list[tuple[int, str]]:
+    single_payload = build_auto_status_query_payload(task_codes=[task_code])
+    single_now = datetime.utcnow()
+    touched_rows: list[tuple[int, str]] = []
+    try:
+        logger.info("QUERY_TASK_STATUS_FALLBACK_SINGLE taskCode=%s", task_code)
+        single_response = client.query_task_status_with_payload(single_payload)
+        single_item = _single_task_response_item(single_response, task_code)
+        raw_single_status = str((single_item or {}).get("taskStatus") or (single_item or {}).get("task_status") or "").strip()
+        logger.info(
+            "QUERY_TASK_STATUS_FALLBACK_SINGLE taskCode=%s code=%s message=%s taskStatus=%s",
+            task_code,
+            single_response.code,
+            single_response.message,
+            raw_single_status,
+        )
+        if single_response.ok and single_item:
+            for row in rows_for_code:
+                applied = _apply_matched_task_status(db, row, item=single_item, request_payload=single_payload, response=single_response, now=single_now, source=source)
+                if applied:
+                    touched_rows.append(applied)
+        else:
+            error_payload = single_response.raw or {"code": single_response.code, "message": single_response.message}
+            for row in rows_for_code:
+                _record_status_query_for_order(
+                    db,
+                    row,
+                    request_payload=single_payload,
+                    response_payload=error_payload,
+                    req_code=single_response.reqCode or single_payload.get("reqCode") or "",
+                    message=single_response.message or "",
+                    now=single_now,
+                    normalized_status="failed",
+                    update_message=True,
+                )
+    except Exception as single_exc:
+        logger.warning("QUERY_TASK_STATUS_FALLBACK_SINGLE taskCode=%s code=- message=%s taskStatus=-", task_code, single_exc)
+        error_payload = {"error": str(single_exc)}
+        for row in rows_for_code:
+            _record_status_query_for_order(
+                db,
+                row,
+                request_payload=single_payload,
+                response_payload=error_payload,
+                req_code=single_payload.get("reqCode") or "",
+                message=str(single_exc),
+                now=single_now,
+                normalized_status="failed",
+                update_message=True,
+            )
+    return touched_rows
+
+
+def _run_status_query_batch_safely(
+    db,
+    *,
+    client,
+    task_codes: list[str],
+    task_map: dict[str, list[MovementOrder]],
+    debug_base_url: str,
+    debug_endpoint: str,
+    apply_delay_seconds: float,
+) -> int:
+    from main import _append_debug_console_event
+
+    request_payload = build_auto_status_query_payload(task_codes=task_codes)
+    now = datetime.utcnow()
+    touched_rows: list[tuple[int, str]] = []
+    try:
+        logger.info(
+            "QUERY_TASK_STATUS_BATCH_REQUEST reqCode=%s taskCodes_count=%s taskCodes=%s",
+            request_payload.get("reqCode"),
+            len(task_codes),
+            task_codes,
+        )
+        _append_debug_console_event(db, direction="sent", module="task_monitor", base_url=debug_base_url, endpoint=debug_endpoint, payload=request_payload, message=f"Consulta automatica de {len(task_codes)} tareas activas")
+        response = client.query_task_status_with_payload(request_payload)
+        _append_debug_console_event(db, direction="received", module="task_monitor", base_url=debug_base_url, endpoint=debug_endpoint, payload=response.raw, message=response.message or "Respuesta del monitor")
+        items_by_code = _task_status_items_by_code(response)
+        logger.info(
+            "QUERY_TASK_STATUS_BATCH_RESPONSE code=%s message=%s data_count=%s found_taskCodes=%s",
+            response.code,
+            response.message,
+            len(response.task_statuses or []),
+            list(items_by_code.keys()),
+        )
+        if response.ok:
+            for task_code, rows_for_code in task_map.items():
+                item = items_by_code.get(task_code)
+                if item is None and len(task_codes) == 1:
+                    item = _single_task_response_item(response, task_code)
+                if not item:
+                    for row in rows_for_code:
+                        logger.warning(
+                            "TASK_STATUS_SKIP_MISMATCH movement_order_id=%s order_remote_task_code=%s response_taskCode=- reason=no exact taskCode in batch response",
+                            row.id,
+                            row.remote_task_code,
+                        )
+                        _record_status_query_for_order(
+                            db,
+                            row,
+                            request_payload=request_payload,
+                            response_payload=response.raw or {},
+                            req_code=response.reqCode or request_payload.get("reqCode") or "",
+                            message="",
+                            now=now,
+                            update_message=False,
+                        )
+                    continue
+                for row in rows_for_code:
+                    applied = _apply_matched_task_status(db, row, item=item, request_payload=request_payload, response=response, now=now, source="task_monitor")
+                    if applied:
+                        touched_rows.append(applied)
+        else:
+            failed_task_code = _task_code_from_error_message(response.message, task_codes)
+            logger.warning(
+                "QUERY_TASK_STATUS_BATCH_RESPONSE code=%s message=%s failed_taskCode=%s action=fallback_single",
+                response.code,
+                response.message,
+                failed_task_code or "-",
+            )
+            for task_code, rows_for_code in task_map.items():
+                if failed_task_code and task_code == failed_task_code:
+                    error_payload = response.raw or {"code": response.code, "message": response.message}
+                    for row in rows_for_code:
+                        _record_status_query_for_order(
+                            db,
+                            row,
+                            request_payload=request_payload,
+                            response_payload=error_payload,
+                            req_code=response.reqCode or request_payload.get("reqCode") or "",
+                            message=response.message or "",
+                            now=now,
+                            normalized_status="failed",
+                            update_message=True,
+                        )
+                    continue
+                touched_rows.extend(_run_single_status_query(db, client=client, task_code=task_code, rows_for_code=rows_for_code, source="task_monitor"))
+    except Exception as exc:
+        logger.error("Task monitor batch failed, using individual fallback: %s", exc)
+        _append_debug_console_event(db, direction="received", module="task_monitor", base_url=debug_base_url, endpoint=debug_endpoint, payload={"error": str(exc)}, message=str(exc))
+        for task_code, rows_for_code in task_map.items():
+            touched_rows.extend(_run_single_status_query(db, client=client, task_code=task_code, rows_for_code=rows_for_code, source="task_monitor"))
+
+    db.commit()
+    _apply_touched_remote_statuses(db, touched_rows)
+    db.commit()
+    time.sleep(apply_delay_seconds)
+    logger.info("Task monitor completed active task check count=%s touched=%s", len(task_codes), len(touched_rows))
+    return len(task_codes)
 
 
 def check_active_tasks(
@@ -368,6 +673,15 @@ def check_active_tasks(
 
             client = _get_rcs_client_with_overrides(db, base_url=base_url_override, query_endpoint=endpoint_override)
             debug_base_url, debug_endpoint = _resolve_rcs_target(db, base_url=base_url_override, endpoint=endpoint_override, mode="query")
+            return _run_status_query_batch_safely(
+                db,
+                client=client,
+                task_codes=task_codes,
+                task_map=task_map,
+                debug_base_url=debug_base_url,
+                debug_endpoint=debug_endpoint,
+                apply_delay_seconds=apply_delay_seconds,
+            )
             request_payload = build_auto_status_query_payload(task_codes=task_codes)
             now = datetime.utcnow()
             try:

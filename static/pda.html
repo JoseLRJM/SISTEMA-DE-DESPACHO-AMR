@@ -151,6 +151,18 @@
     </div>
   </div>
 
+  <div id="pdaExecuteConfirmModal" class="pda-modal hidden" role="dialog" aria-modal="true" aria-labelledby="pdaExecuteConfirmTitle" tabindex="-1">
+    <div class="pda-modal-card pda-execute-confirm-card">
+      <h2 id="pdaExecuteConfirmTitle">Confirmar env&iacute;o de tarea</h2>
+      <div id="pdaExecuteConfirmSummary" class="pda-action-summary"></div>
+      <div id="pdaExecuteConfirmError" class="pda-action-error hidden"></div>
+      <div class="pda-action-buttons pda-execute-confirm-buttons">
+        <button id="btnPdaExecuteConfirm" class="execute-confirm-button" type="button">Confirmar y enviar tarea</button>
+        <button id="btnPdaExecuteCancel" class="secondary" type="button">Cancelar</button>
+      </div>
+    </div>
+  </div>
+
   <div id="pdaAdminModal" class="pda-modal hidden" role="dialog" aria-modal="true" aria-labelledby="pdaAdminTitle">
     <div class="pda-modal-card">
       <h2 id="pdaAdminTitle">Acceso administrador</h2>

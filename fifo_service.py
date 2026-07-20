@@ -9,6 +9,7 @@ from sqlalchemy import or_, select
 
 from logging_config import get_logger
 from models import Area, Location, MaterialGroup, MovementOrder, Rack, apply_rack_reservation_status
+from qr_transition_service import apply_transition_for_completed_order
 
 ACTIVE_RACK_STATUSES = {"available", "disponible"}
 INACTIVE_RACK_STATUSES = {"reserved", "moving", "error", "blocked", "reservado", "moviendo", "bloqueado"}
@@ -130,6 +131,48 @@ def _find_fifo_candidate(db, source_area: Area, material_group: MaterialGroup) -
     raise HTTPException(status_code=400, detail="No hay material disponible para ese grupo en el área origen")
 
 
+def _find_any_available_fifo_candidate(db, source_area: Area, source_cell_id: Optional[int] = None) -> tuple[Rack, Location]:
+    if source_cell_id:
+        cell = db.execute(select(Location).where(Location.id == source_cell_id)).scalar_one_or_none()
+        if not cell or int(cell.enabled or 0) != 1:
+            raise HTTPException(status_code=400, detail="Celda origen no encontrada o no habilitada")
+        if cell.area_id != source_area.id:
+            raise HTTPException(status_code=400, detail="La celda origen no pertenece al area origen configurada")
+        if cell.rack_id is None:
+            raise HTTPException(status_code=400, detail="No hay racks disponibles en el origen configurado.")
+        rack = db.execute(select(Rack).where(Rack.id == cell.rack_id)).scalar_one_or_none()
+        if not rack:
+            raise HTTPException(status_code=400, detail="No hay racks disponibles en el origen configurado.")
+        status = _normalize_rack_status(rack.status)
+        if status in INACTIVE_RACK_STATUSES or (status and status not in ACTIVE_RACK_STATUSES):
+            raise HTTPException(status_code=400, detail="No hay racks disponibles en el origen configurado.")
+        return rack, cell
+
+    rows = (
+        db.execute(
+            select(Rack, Location)
+            .join(Location, Location.rack_id == Rack.id)
+            .where(Location.area_id == source_area.id)
+            .where(Location.rack_id.is_not(None))
+            .where(Location.enabled == 1)
+            .order_by(Rack.fifo_entered_at.asc().nullslast(), Rack.code.asc(), Location.y.asc(), Location.x.asc())
+        )
+        .all()
+    )
+
+    for rack, cell in rows:
+        status = _normalize_rack_status(rack.status)
+        if status in INACTIVE_RACK_STATUSES:
+            continue
+        if status and status not in ACTIVE_RACK_STATUSES:
+            continue
+        if cell.area_id != source_area.id:
+            continue
+        return rack, cell
+
+    raise HTTPException(status_code=400, detail="No hay racks disponibles en el origen configurado.")
+
+
 def _reserved_destination_cell_ids(db) -> set[int]:
     rows = (
         db.execute(
@@ -166,6 +209,30 @@ def resolve_fifo_request(db, source_area_id: int, destination_area_id: int, mate
     source_area, destination_area, material_group = _validate_request(db, source_area_id, destination_area_id, material_group_id)
     rack, source_cell = _find_fifo_candidate(db, source_area, material_group)
     destination_cell = _find_destination_cell(db, destination_area)
+    return FifoSelection(
+        rack=rack,
+        source_cell=source_cell,
+        destination_cell=destination_cell,
+        source_area=source_area,
+        destination_area=destination_area,
+        material_group=material_group,
+    )
+
+
+def resolve_fifo_request_any_available(db, source_area_id: int, destination_area_id: int, priority: Optional[str] = None, source_cell_id: Optional[int] = None) -> FifoSelection:
+    _normalize_priority(priority)
+    source_area = db.execute(select(Area).where(Area.id == source_area_id)).scalar_one_or_none()
+    if not source_area or int(source_area.is_active or 0) != 1:
+        raise HTTPException(status_code=400, detail="Area origen no encontrada o inactiva")
+    destination_area = db.execute(select(Area).where(Area.id == destination_area_id)).scalar_one_or_none()
+    if not destination_area or int(destination_area.is_active or 0) != 1:
+        raise HTTPException(status_code=400, detail="Area destino no encontrada o inactiva")
+    if source_area.id == destination_area.id:
+        raise HTTPException(status_code=400, detail="El area origen y destino no pueden ser iguales")
+    rack, source_cell = _find_any_available_fifo_candidate(db, source_area, source_cell_id=source_cell_id)
+    destination_cell = _find_destination_cell(db, destination_area)
+    material_group = db.execute(select(MaterialGroup).where(MaterialGroup.id == rack.material_group_id)).scalar_one_or_none() if rack.material_group_id else None
+    material_group = material_group or _ensure_default_material_group(db)
     return FifoSelection(
         rack=rack,
         source_cell=source_cell,
@@ -400,6 +467,68 @@ def execute_fifo_request(
     return order, selection
 
 
+def execute_fifo_request_any_available(
+    db,
+    source_area_id: int,
+    destination_area_id: int,
+    priority: Optional[str] = None,
+    comment: Optional[str] = None,
+    created_by: Optional[str] = None,
+    agv_code: Optional[str] = None,
+    task_typ: Optional[str] = None,
+    source_cell_id: Optional[int] = None,
+) -> tuple[MovementOrder, FifoSelection]:
+    normalized_priority = _normalize_priority(priority)
+    selection = resolve_fifo_request_any_available(db, source_area_id, destination_area_id, normalized_priority, source_cell_id=source_cell_id)
+
+    rack = db.execute(select(Rack).where(Rack.id == selection.rack.id)).scalar_one()
+    source_cell = db.execute(select(Location).where(Location.id == selection.source_cell.id)).scalar_one()
+    destination_cell = db.execute(select(Location).where(Location.id == selection.destination_cell.id)).scalar_one()
+
+    if _normalize_rack_status(rack.status) not in ACTIVE_RACK_STATUSES:
+        raise HTTPException(status_code=409, detail="El rack FIFO seleccionado ya no esta disponible")
+    if source_cell.rack_id != rack.id or int(source_cell.enabled or 0) != 1:
+        raise HTTPException(status_code=409, detail="La celda origen ya no es valida")
+    if destination_cell.rack_id is not None or int(destination_cell.enabled or 0) != 1:
+        raise HTTPException(status_code=409, detail="La celda destino ya no esta disponible")
+
+    now = datetime.utcnow()
+    order_code = f"MO-{now.strftime('%Y%m%d%H%M%S')}-{rack.id}"
+    order = MovementOrder(
+        order_code=order_code,
+        order_type="material_request",
+        source_area_id=source_area_id,
+        destination_area_id=destination_area_id,
+        material_group_id=selection.material_group.id,
+        rack_id=rack.id,
+        source_cell_id=source_cell.id,
+        destination_cell_id=destination_cell.id,
+        priority=normalized_priority,
+        agv_code=(agv_code or "").strip() or None,
+        task_typ=(task_typ or "").strip() or None,
+        comment=(comment or "").strip() or None,
+        status="pending_dispatch",
+        created_by=(created_by or "operador").strip() or None,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(rack)
+    db.add(source_cell)
+    db.add(destination_cell)
+    db.add(order)
+    db.flush()
+    apply_rack_reservation_status(rack, True, updated_at=now, order_id=order.id, dispatch_status=order.status, source="fifo_service", reason="fifo_any_available_order_created")
+    db.add(rack)
+    db.commit()
+    db.refresh(order)
+    logger.info("FIFO any-available order created order_id=%s order_code=%s rack_id=%s source_cell_id=%s destination_cell_id=%s", order.id, order.order_code, rack.id, source_cell.id, destination_cell.id)
+
+    selection.rack = rack
+    selection.source_cell = source_cell
+    selection.destination_cell = destination_cell
+    return order, selection
+
+
 
 def simulate_order_completed(db, order_id: int) -> MovementOrder:
     order = db.execute(select(MovementOrder).where(MovementOrder.id == order_id)).scalar_one_or_none()
@@ -477,9 +606,26 @@ def simulate_order_completed(db, order_id: int) -> MovementOrder:
     db.add(destination_cell)
     db.add(rack)
     db.add(order)
+    try:
+        transition_result = apply_transition_for_completed_order(db, order.id, reason="movement_completed")
+        logger.info(
+            "QR_TRANSITION_COMPLETION_HOOK movement_order_id=%s status=%s message=%s",
+            order.id,
+            transition_result.get("status"),
+            transition_result.get("message"),
+        )
+    except Exception as exc:
+        logger.exception("QR_TRANSITION_COMPLETION_HOOK_ERROR movement_order_id=%s error=%s", order.id, exc)
     db.commit()
     db.refresh(order)
     logger.info("Movement order completed order_id=%s order_code=%s rack_id=%s destination_cell_id=%s", order.id, order.order_code, rack.id, destination_cell.id)
+    try:
+        from fifo_chain_service import trigger_fifo_chain_next_step_if_needed
+
+        trigger_fifo_chain_next_step_if_needed(db, order.id)
+        db.refresh(order)
+    except Exception as exc:
+        logger.exception("FIFO_CHAIN_NEXT_STEP_HOOK_ERROR movement_order_id=%s error=%s", order.id, exc)
     return order
 
 

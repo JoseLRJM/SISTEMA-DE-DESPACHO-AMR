@@ -284,6 +284,8 @@
 <div class="card" id="card-cell">
 <h3>Celda seleccionada</h3>
 <div class="small" id="selectedCellTitle">Celda (0, 0)</div>
+<div class="edit-refresh-notice hidden" id="cellEditRefreshNotice">Edicion activa: actualizacion automatica pausada.</div>
+<div class="row edit-refresh-actions hidden" id="cellEditRefreshActions"><button class="btn ghost" id="btnRefreshCellAfterEdit" type="button">Actualizar ahora</button></div>
 <div class="row">
 <div class="button-column">
 <button class="btn" disabled="" id="btnSelectCellsByArea">Seleccion multiple</button>
@@ -368,6 +370,8 @@
 </div>
 <div class="card" id="card-areas">
 <h3>Áreas</h3>
+<div class="edit-refresh-notice hidden" id="areaEditRefreshNotice">Edicion activa: actualizacion automatica pausada.</div>
+<div class="row edit-refresh-actions hidden" id="areaEditRefreshActions"><button class="btn ghost" id="btnRefreshAreasAfterEdit" type="button">Actualizar ahora</button></div>
 <input id="areaId" type="hidden"/>
 <div class="row two-col">
 <div><label>Código</label><input disabled="" id="areaCode" type="text"/></div>
@@ -548,6 +552,7 @@
 <button class="btn qr-tab" data-qr-tab="rules" type="button">C&oacute;digos QR configurados</button>
 <button class="btn qr-tab" data-qr-tab="terminals" type="button">Terminales PDA</button>
 <button class="btn qr-tab" data-qr-tab="events" type="button">Historial de escaneos</button>
+<button class="btn qr-tab" data-qr-tab="transitions" type="button">Transiciones</button>
 </div>
 <div class="qr-panel active" id="qrPanelStations">
 <div class="qr-help">Configura aqu&iacute; D&Oacute;NDE se escanea. Ejemplo: LINEA_SW_44_03, ALMACEN_ENTRADA_1. No pongas aqu&iacute; el n&uacute;mero de parte del QR.</div>
@@ -562,12 +567,56 @@
 <div><label>Acci&oacute;n default</label><select disabled="" id="scannerDefaultAction"><option value="fifo_request">fifo_request</option><option value="store_rack">store_rack</option><option value="request_empty">request_empty</option><option value="return_full">return_full</option><option value="direct_move">direct_move</option><option value="point_to_area">point_to_area</option><option value="preview_only">preview_only</option></select></div>
 </div>
 <div class="row two-col">
-<div><label>&Aacute;rea origen</label><select disabled="" id="scannerSourceArea"><option value="">Sin &aacute;rea</option></select></div>
-<div><label>&Aacute;rea destino</label><select disabled="" id="scannerDestinationArea"><option value="">Sin &aacute;rea</option></select></div>
+<div><label>Modo de ruta</label><select disabled="" id="scannerRouteMode"><option value="simple_area">Simple por origen/destino</option><option value="double_area">Doble &aacute;rea / multipunto</option><option value="fifo_chain">Flujo doble FIFO / tareas encadenadas</option></select></div>
+<div class="hidden" data-fifo-chain-owner="scanner"><label>Cantidad de tramos</label><select disabled="" id="scannerFifoChainTotalSteps"><option value="2">2 tramos</option><option value="3">3 tramos</option></select><div class="small">El QR tiene prioridad. El scanner se usa como respaldo.</div></div>
+</div>
+<div class="small">Los valores del QR tienen prioridad. La estaci&oacute;n/scanner se usa como respaldo cuando el QR no trae una configuraci&oacute;n.</div>
+<div class="qr-section-title">Tramo 1</div>
+<div class="row two-col">
+<div class="hidden" data-fifo-chain-owner="scanner"><label>Origen tramo 1</label><select disabled="" id="scannerFifoChainStep1SourceMode"><option value="configured_area">&Aacute;rea origen configurada</option><option value="any_area_by_material">Cualquier &aacute;rea por material</option></select><div class="small">El QR tiene prioridad. El scanner se usa como respaldo.</div></div>
+<div class="hidden" data-fifo-chain-owner="scanner"><label>Material requerido tramo 1</label><select disabled="" id="scannerFifoChainStep1Material"><option value="">Sin material</option></select><div class="small">El QR tiene prioridad. El scanner se usa como respaldo.</div></div>
+</div>
+<div class="qr-fifo-chain-global-note hidden" data-fifo-chain-global-note="scanner_step1">El tramo 1 buscar&aacute; un rack disponible con este material en cualquier &aacute;rea operativa. Configura el destino 1; el origen real se decidir&aacute; al escanear.</div>
+<div class="row two-col">
+<div data-fifo-chain-source1="scanner"><label>&Aacute;rea origen 1</label><select disabled="" id="scannerSourceArea"><option value="">Sin &aacute;rea</option></select></div>
+<div><label>&Aacute;rea destino 1</label><select disabled="" id="scannerDestinationArea"><option value="">Sin &aacute;rea</option></select></div>
 </div>
 <div class="row two-col">
-<div><label>Celda origen</label><select disabled="" id="scannerSourceCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="scannerSourceCellSummary">No hay celda seleccionada.</div></div>
-<div><label>Celda destino</label><select disabled="" id="scannerDestinationCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="scannerDestinationCellSummary">No hay celda seleccionada.</div></div>
+<div data-fifo-chain-source1="scanner"><label>Celda origen 1</label><select disabled="" id="scannerSourceCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="scannerSourceCellSummary">No hay celda seleccionada.</div></div>
+<div><label>Celda destino 1</label><select disabled="" id="scannerDestinationCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="scannerDestinationCellSummary">No hay celda seleccionada.</div></div>
+</div>
+<div class="qr-route-double hidden" data-route-owner="scanner">
+<div class="qr-fifo-chain-help hidden" data-fifo-chain-owner="scanner">Crea dos &oacute;rdenes separadas. El segundo tramo se enviar&aacute; solo cuando el primero finalice correctamente.</div>
+<div class="qr-section-title">Tramo 2</div>
+<div class="row two-col">
+<div class="hidden" data-fifo-chain-owner="scanner"><label>Origen tramo 2</label><select disabled="" id="scannerFifoChainStep2SourceMode"><option value="configured_area">&Aacute;rea origen configurada</option><option value="any_area_by_material">Cualquier &aacute;rea por material</option></select><div class="small">El QR tiene prioridad. El scanner se usa como respaldo.</div></div>
+<div class="hidden" data-fifo-chain-owner="scanner"><label>Material requerido tramo 2</label><select disabled="" id="scannerFifoChainStep2Material"><option value="">Sin material</option></select><div class="small">El QR tiene prioridad. El scanner se usa como respaldo.</div></div>
+</div>
+<div class="qr-fifo-chain-global-note hidden" data-fifo-chain-global-note="scanner_step2">El paso 2 buscar&aacute; un rack disponible con este material en cualquier &aacute;rea operativa. El origen real se decidir&aacute; cuando finalice el paso 1.</div>
+<div class="row two-col">
+<div data-fifo-chain-source2="scanner"><label>&Aacute;rea origen 2</label><select disabled="" id="scannerSecondSourceArea"><option value="">Sin &aacute;rea</option></select></div>
+<div><label>&Aacute;rea destino 2</label><select disabled="" id="scannerSecondDestinationArea"><option value="">Sin &aacute;rea</option></select></div>
+</div>
+<div class="row two-col">
+<div data-fifo-chain-source2="scanner"><label>Celda origen 2 opcional</label><select disabled="" id="scannerSecondSourceCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="scannerSecondSourceCellSummary">No hay celda seleccionada.</div></div>
+<div><label>Celda destino 2 opcional</label><select disabled="" id="scannerSecondDestinationCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="scannerSecondDestinationCellSummary">No hay celda seleccionada.</div></div>
+</div>
+</div>
+<div class="qr-route-triple hidden" data-fifo-chain-step3="scanner">
+<div class="qr-section-title">TRAMO 3</div>
+<div class="row two-col">
+<div><label>Origen tramo 3</label><select disabled="" id="scannerFifoChainStep3SourceMode"><option value="configured_area">&Aacute;rea origen configurada</option><option value="any_area_by_material">Cualquier &aacute;rea por material</option></select><div class="small">El QR tiene prioridad. El scanner se usa como respaldo.</div></div>
+<div><label>Material requerido tramo 3</label><select disabled="" id="scannerFifoChainStep3Material"><option value="">Sin material</option></select><div class="small">El QR tiene prioridad. El scanner se usa como respaldo.</div></div>
+</div>
+<div class="qr-fifo-chain-global-note hidden" data-fifo-chain-global-note="scanner_step3">El paso 3 buscar&aacute; un rack disponible con este material en cualquier &aacute;rea operativa. El origen real se decidir&aacute; al finalizar el paso 2.</div>
+<div class="row two-col">
+<div data-fifo-chain-source3="scanner"><label>&Aacute;rea origen 3</label><select disabled="" id="scannerFifoChainStep3SourceArea"><option value="">Sin &aacute;rea</option></select></div>
+<div><label>&Aacute;rea destino 3</label><select disabled="" id="scannerFifoChainStep3DestinationArea"><option value="">Sin &aacute;rea</option></select></div>
+</div>
+<div class="row two-col">
+<div data-fifo-chain-source3="scanner"><label>Celda origen 3 opcional</label><select disabled="" id="scannerFifoChainStep3SourceCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="scannerFifoChainStep3SourceCellSummary">No hay celda seleccionada.</div></div>
+<div><label>Celda destino 3 opcional</label><select disabled="" id="scannerFifoChainStep3DestinationCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="scannerFifoChainStep3DestinationCellSummary">No hay celda seleccionada.</div></div>
+</div>
 </div>
 <div class="row two-col">
 <div><label>&Aacute;rea almacenamiento</label><select disabled="" id="scannerStorageArea"><option value="">Sin &aacute;rea</option></select></div>
@@ -579,6 +628,10 @@
 <div class="row two-col">
 <div><label>Material default</label><select disabled="" id="scannerDefaultMaterial"><option value="">Sin material</option></select></div>
 <div><label>Prioridad</label><input disabled="" id="scannerPriority" min="0" type="number" value="0"/></div>
+</div>
+<div class="row two-col">
+<div><label>Modo de selecci&oacute;n de material</label><select disabled="" id="scannerFifoMaterialPolicy"><option value="specific_material">Material espec&iacute;fico</option><option value="any_available_from_source">Cualquier rack disponible del origen</option></select></div>
+<div class="small">El QR tiene prioridad. El scanner se usa como fallback.</div>
 </div>
 <div class="row two-col">
 <div><label>AGV code</label><input disabled="" id="scannerAgvCode" type="text"/></div>
@@ -612,16 +665,64 @@
 <div><label>Material asociado</label><select disabled="" id="qrMaterial"><option value="">Sin material</option></select></div>
 </div>
 <div class="row two-col">
+<div><label>Modo de selecci&oacute;n de material</label><select disabled="" id="qrFifoMaterialPolicy"><option value="specific_material">Material espec&iacute;fico</option><option value="any_available_from_source">Cualquier rack disponible del origen</option></select></div>
+<div class="qr-policy-help hidden" id="qrFifoMaterialPolicyHelp">Se tomar&aacute; cualquier rack disponible del &aacute;rea/celda origen. El material puede cambiar despu&eacute;s mediante transiciones.</div>
+</div>
+<div class="row two-col">
 <div><label>Rack asociado</label><select disabled="" id="qrRack"><option value="">Sin rack</option></select></div>
 <div><label>Prioridad</label><input disabled="" id="qrPriority" min="0" type="number"/></div>
 </div>
 <div class="row two-col">
-<div><label>&Aacute;rea origen</label><select disabled="" id="qrSourceArea"><option value="">Sin &aacute;rea</option></select></div>
-<div><label>&Aacute;rea destino</label><select disabled="" id="qrDestinationArea"><option value="">Sin &aacute;rea</option></select></div>
+<div><label>Modo de ruta</label><select disabled="" id="qrRouteMode"><option value="simple_area">Simple por origen/destino</option><option value="double_area">Doble &aacute;rea / multipunto</option><option value="fifo_chain">Flujo doble FIFO / tareas encadenadas</option></select></div>
+<div class="hidden" data-fifo-chain-owner="qr"><label>Cantidad de tramos</label><select disabled="" id="qrFifoChainTotalSteps"><option value="2">2 tramos</option><option value="3">3 tramos</option></select></div>
+</div>
+<div class="small">Si el QR trae ruta configurada, tiene prioridad sobre los valores default del scanner.</div>
+<div class="qr-section-title">Tramo 1</div>
+<div class="row two-col">
+<div class="hidden" data-fifo-chain-owner="qr"><label>Origen tramo 1</label><select disabled="" id="qrFifoChainStep1SourceMode"><option value="configured_area">&Aacute;rea origen configurada</option><option value="any_area_by_material">Cualquier &aacute;rea por material</option></select></div>
+<div class="hidden" data-fifo-chain-owner="qr"><label>Material requerido tramo 1</label><select disabled="" id="qrFifoChainStep1Material"><option value="">Sin material</option></select></div>
+</div>
+<div class="qr-fifo-chain-global-note hidden" data-fifo-chain-global-note="qr_step1">El tramo 1 buscar&aacute; un rack disponible con este material en cualquier &aacute;rea operativa. Configura el destino 1; el origen real se decidir&aacute; al escanear.</div>
+<div class="row two-col">
+<div data-fifo-chain-source1="qr"><label>&Aacute;rea origen 1</label><select disabled="" id="qrSourceArea"><option value="">Sin &aacute;rea</option></select></div>
+<div><label>&Aacute;rea destino 1</label><select disabled="" id="qrDestinationArea"><option value="">Sin &aacute;rea</option></select></div>
 </div>
 <div class="row two-col">
-<div><label>Celda origen</label><select disabled="" id="qrSourceCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="qrSourceCellSummary">No hay celda seleccionada.</div></div>
-<div><label>Celda destino</label><select disabled="" id="qrDestinationCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="qrDestinationCellSummary">No hay celda seleccionada.</div></div>
+<div data-fifo-chain-source1="qr"><label>Celda origen 1 opcional</label><select disabled="" id="qrSourceCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="qrSourceCellSummary">No hay celda seleccionada.</div></div>
+<div><label>Celda destino 1 opcional</label><select disabled="" id="qrDestinationCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="qrDestinationCellSummary">No hay celda seleccionada.</div></div>
+</div>
+<div class="qr-route-double hidden" data-route-owner="qr">
+<div class="qr-fifo-chain-help hidden" data-fifo-chain-owner="qr">Crea dos &oacute;rdenes separadas. El segundo tramo se enviar&aacute; solo cuando el primero finalice correctamente.</div>
+<div class="qr-section-title">Tramo 2</div>
+<div class="row two-col">
+<div class="hidden" data-fifo-chain-owner="qr"><label>Origen tramo 2</label><select disabled="" id="qrFifoChainStep2SourceMode"><option value="configured_area">&Aacute;rea origen configurada</option><option value="any_area_by_material">Cualquier &aacute;rea por material</option></select></div>
+<div class="hidden" data-fifo-chain-owner="qr"><label>Material requerido tramo 2</label><select disabled="" id="qrFifoChainStep2Material"><option value="">Sin material</option></select></div>
+</div>
+<div class="qr-fifo-chain-global-note hidden" data-fifo-chain-global-note="qr_step2">El paso 2 buscar&aacute; un rack disponible con este material en cualquier &aacute;rea operativa. El origen real se decidir&aacute; cuando finalice el paso 1.</div>
+<div class="row two-col">
+<div data-fifo-chain-source2="qr"><label>&Aacute;rea origen 2</label><select disabled="" id="qrSecondSourceArea"><option value="">Sin &aacute;rea</option></select></div>
+<div><label>&Aacute;rea destino 2</label><select disabled="" id="qrSecondDestinationArea"><option value="">Sin &aacute;rea</option></select></div>
+</div>
+<div class="row two-col">
+<div data-fifo-chain-source2="qr"><label>Celda origen 2 opcional</label><select disabled="" id="qrSecondSourceCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="qrSecondSourceCellSummary">No hay celda seleccionada.</div></div>
+<div><label>Celda destino 2 opcional</label><select disabled="" id="qrSecondDestinationCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="qrSecondDestinationCellSummary">No hay celda seleccionada.</div></div>
+</div>
+</div>
+<div class="qr-route-triple hidden" data-fifo-chain-step3="qr">
+<div class="qr-section-title">TRAMO 3</div>
+<div class="row two-col">
+<div><label>Origen tramo 3</label><select disabled="" id="qrFifoChainStep3SourceMode"><option value="configured_area">&Aacute;rea origen configurada</option><option value="any_area_by_material">Cualquier &aacute;rea por material</option></select></div>
+<div><label>Material requerido tramo 3</label><select disabled="" id="qrFifoChainStep3Material"><option value="">Sin material</option></select></div>
+</div>
+<div class="qr-fifo-chain-global-note hidden" data-fifo-chain-global-note="qr_step3">El paso 3 buscar&aacute; un rack disponible con este material en cualquier &aacute;rea operativa. El origen real se decidir&aacute; al finalizar el paso 2.</div>
+<div class="row two-col">
+<div data-fifo-chain-source3="qr"><label>&Aacute;rea origen 3</label><select disabled="" id="qrFifoChainStep3SourceArea"><option value="">Sin &aacute;rea</option></select></div>
+<div><label>&Aacute;rea destino 3</label><select disabled="" id="qrFifoChainStep3DestinationArea"><option value="">Sin &aacute;rea</option></select></div>
+</div>
+<div class="row two-col">
+<div data-fifo-chain-source3="qr"><label>Celda origen 3 opcional</label><select disabled="" id="qrFifoChainStep3SourceCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="qrFifoChainStep3SourceCellSummary">No hay celda seleccionada.</div></div>
+<div><label>Celda destino 3 opcional</label><select disabled="" id="qrFifoChainStep3DestinationCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="qrFifoChainStep3DestinationCellSummary">No hay celda seleccionada.</div></div>
+</div>
 </div>
 <div class="row two-col">
 <div><label>AGV code</label><input disabled="" id="qrAgvCode" type="text"/></div>
@@ -666,6 +767,78 @@
 <div class="row"><button class="btn" id="btnRefreshScanEvents" type="button">Refrescar historial</button></div>
 <div class="diagnosis-table-wrap qr-events-wrap" id="scanEventsList">Sin datos.</div>
 <div class="list-box json-box hidden" id="scanEventDetailBox"><pre class="json-pre" id="scanEventDetailJson">Sin detalle.</pre></div>
+</div>
+<div class="qr-panel" id="qrPanelTransitions">
+<div class="qr-help">Configura aqu&iacute; qu&eacute; debe cambiar en el rack cuando una orden creada por QR/PDA se complete. Ejemplo: un rack SIN_MATERIAL que se mueve de &Aacute;rea 3 a &Aacute;rea 1 puede cambiar autom&aacute;ticamente a MATERIAL_REAL al finalizar el movimiento.</div>
+<div class="qr-execute-warning">Las transiciones se aplican al completar la orden, no al crearla ni al despacharla.</div>
+<input id="qrTransitionRuleId" type="hidden"/>
+<div class="row two-col">
+<div><label>Nombre</label><input disabled="" id="qrTransitionName" placeholder="Vac&iacute;o pasa a material" type="text"/></div>
+<div><label>Alcance</label><select disabled="" id="qrTransitionScope"><option value="qr_pda">Solo &oacute;rdenes QR/PDA</option><option value="any_completed_order">Cualquier orden completada</option></select></div>
+</div>
+<div class="row"><label>Descripci&oacute;n</label><textarea disabled="" id="qrTransitionDescription" rows="2"></textarea></div>
+<div class="row two-col">
+<div><label>Modo de coincidencia</label><select disabled="" id="qrTransitionMatchMode"><option value="advanced">Avanzado</option><option value="route_simple">Simple por origen/destino</option></select></div>
+<div><label>Ignorar material actual</label><select disabled="" id="qrTransitionIgnoreCurrentMaterial"><option value="0">No</option><option value="1">S&iacute;</option></select></div>
+</div>
+<div class="row two-col">
+<div><label>Origen de transici&oacute;n</label><select disabled="" id="qrTransitionSourceMatchMode"><option value="configured_source">Origen configurado</option><option value="any_source">Cualquier &aacute;rea</option></select></div>
+<div class="small hidden" id="qrTransitionAnySourceHelp">La regla aplicar&aacute; desde cualquier origen, siempre que coincidan el material actual y el destino configurado.</div>
+</div>
+<div class="qr-route-simple-help hidden" id="qrTransitionSimpleHelp">Modo simple: cuando una orden se complete desde este origen hacia este destino, el rack cambiar&aacute; al material seleccionado. Puede aplicar aunque la orden haya sido creada por QR, PDA, estaci&oacute;n de trabajo u otro flujo.</div>
+<div class="qr-execute-warning">La transici&oacute;n se aplica solo al completar correctamente la orden, no al crearla ni al despacharla.</div>
+<div class="row two-col qr-transition-advanced-only">
+<div><label>QR asociado opcional</label><select disabled="" id="qrTransitionQrRule"><option value="">Cualquier QR</option></select></div>
+<div><label>Scanner / estaci&oacute;n opcional</label><select disabled="" id="qrTransitionScanner"><option value="">Cualquier scanner</option></select></div>
+</div>
+<div class="row two-col">
+<div data-qr-transition-source-config><label>&Aacute;rea origen opcional</label><select disabled="" id="qrTransitionSourceArea"><option value="">Cualquier origen</option></select></div>
+<div><label>&Aacute;rea destino opcional</label><select disabled="" id="qrTransitionDestinationArea"><option value="">Cualquier destino</option></select></div>
+</div>
+<div class="row two-col">
+<div data-qr-transition-source-config><label>Celda origen opcional</label><select disabled="" id="qrTransitionSourceCell"><option value="">Sin celda</option></select></div>
+<div><label>Celda destino opcional</label><select disabled="" id="qrTransitionDestinationCell"><option value="">Sin celda</option></select></div>
+</div>
+<div class="row two-col" data-qr-transition-current-condition>
+<div><label id="qrTransitionCurrentMaterialLabel">Material actual opcional</label><select disabled="" id="qrTransitionCurrentMaterial"><option value="">Cualquier material</option></select></div>
+<div><label>Status actual de rack opcional</label><input disabled="" id="qrTransitionCurrentRackStatus" placeholder="available / reserved / disponible" type="text"/></div>
+</div>
+<div class="row two-col">
+<div><label>Material despu&eacute;s de completar</label><select disabled="" id="qrTransitionNextMaterial"><option value="">Sin cambio de material</option></select></div>
+<div class="qr-transition-advanced-only"><label>Status rack despu&eacute;s opcional</label><input disabled="" id="qrTransitionNextRackStatus" placeholder="available / disponible" type="text"/></div>
+</div>
+<div class="row two-col qr-transition-advanced-only">
+<div><label>Nueva cantidad opcional</label><input disabled="" id="qrTransitionNextQuantity" min="0" placeholder="Sin cambio" type="number"/></div>
+<div><label>Limpiar cantidad</label><select disabled="" id="qrTransitionClearQuantity"><option value="0">No</option><option value="1">S&iacute;</option></select></div>
+</div>
+<div class="row two-col qr-transition-advanced-only">
+<div><label>Comentario despu&eacute;s</label><input disabled="" id="qrTransitionNextComment" placeholder="Material actualizado por QR/PDA" type="text"/></div>
+<div><label>Agregar comentario al existente</label><select disabled="" id="qrTransitionAppendComment"><option value="1">S&iacute;</option><option value="0">No</option></select></div>
+</div>
+<div class="row two-col">
+<div><label>Aplicar cuando</label><select disabled="" id="qrTransitionApplyOn"><option value="movement_completed">movement_completed</option></select></div>
+<div><label>Prioridad</label><input disabled="" id="qrTransitionPriority" min="0" type="number" value="0"/></div>
+</div>
+<div class="row two-col">
+<div><label>Activo</label><select disabled="" id="qrTransitionActive"><option value="1">S&iacute;</option><option value="0">No</option></select></div>
+</div>
+<div class="row"><button class="btn primary" disabled="" id="btnSaveQrTransitionRule" type="button">Guardar transici&oacute;n</button><button class="btn ghost" disabled="" id="btnNewQrTransitionRule" type="button">Nuevo</button><button class="btn danger" disabled="" id="btnDisableQrTransitionRule" type="button">Desactivar</button></div>
+<div class="diagnosis-table-wrap qr-transitions-wrap" id="qrTransitionRulesList">Sin transiciones configuradas.</div>
+<div class="list-box qr-transition-preview">
+<h4>Probar transici&oacute;n por MovementOrder ID</h4>
+<div class="row two-col">
+<div><label>movement_order_id</label><input disabled="" id="qrTransitionPreviewOrderId" min="1" placeholder="729" type="number"/></div>
+<div><label>&nbsp;</label><button class="btn" disabled="" id="btnPreviewQrTransition" type="button">Preview transici&oacute;n</button></div>
+</div>
+<div class="row"><button class="btn primary" disabled="" id="btnApplyQrTransition" type="button">Aplicar transici&oacute;n</button></div>
+<div class="small">Solo aplica si la orden ya est&aacute; completada.</div>
+<div class="small" id="qrTransitionPreviewResult">Sin preview.</div>
+</div>
+<div class="list-box qr-transition-preview">
+<h4>Historial de transiciones</h4>
+<div class="row"><button class="btn ghost" disabled="" id="btnRefreshQrTransitionLogs" type="button">Actualizar historial</button></div>
+<div class="diagnosis-table-wrap qr-transitions-wrap" id="qrTransitionLogsList">Sin historial de transiciones.</div>
+</div>
 </div>
 <div class="small" id="qrAdminMsg"></div>
 </div>

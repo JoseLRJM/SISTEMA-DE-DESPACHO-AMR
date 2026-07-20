@@ -84,6 +84,11 @@
     btnPdaConfirmCancel: $("btnPdaConfirmCancel"),
     btnPdaConfirmCancelReturn: $("btnPdaConfirmCancelReturn"),
     btnPdaBackAction: $("btnPdaBackAction"),
+    pdaExecuteConfirmModal: $("pdaExecuteConfirmModal"),
+    pdaExecuteConfirmSummary: $("pdaExecuteConfirmSummary"),
+    pdaExecuteConfirmError: $("pdaExecuteConfirmError"),
+    btnPdaExecuteConfirm: $("btnPdaExecuteConfirm"),
+    btnPdaExecuteCancel: $("btnPdaExecuteCancel"),
   };
 
   let isProcessing = false;
@@ -119,6 +124,10 @@
   let selectedHistoryItem = null;
   let selectedCancelAction = "";
   const pendingCancelOrders = new Set();
+  let pendingPreviewForExecution = null;
+  let pendingQrValue = "";
+  let isConfirmModalOpen = false;
+  let isExecutingConfirmed = false;
 
   function text(value, fallback = "-") {
     const raw = value == null ? "" : String(value).trim();
@@ -307,6 +316,13 @@
     setStatus("ready", "LECTURA DUPLICADA");
   }
 
+  function resetLocalDuplicateGuard() {
+    lastSubmittedQr = "";
+    lastSubmittedAt = 0;
+    lastSubmittedInputValue = "";
+    lastSubmission = { value: "", timestamp: 0 };
+  }
+
   function setScannerEnabled(enabled) {
     if (!enabled) {
       clearScanIdleTimer();
@@ -461,6 +477,7 @@
     }
     updatePdaModeSummary();
     syncModeWarning();
+    renderHistory();
     if (pdaInterfaceMode === "developer") {
       window.setTimeout(() => {
         try { els.btnPdaExitDeveloper?.focus(); } catch (_) {}
@@ -1227,6 +1244,52 @@
     return composeLabel(entityLabel(group.area), cellLabel(group.cell));
   }
 
+  function appendConfirmRow(container, label, value) {
+    if (!container) return false;
+    const readable = readableValue(value);
+    if (!readable) return false;
+    const row = document.createElement("div");
+    row.className = "history-field pda-confirm-field";
+    const span = document.createElement("span");
+    span.textContent = label;
+    const bold = document.createElement("b");
+    bold.textContent = readable;
+    row.append(span, bold);
+    container.appendChild(row);
+    return true;
+  }
+
+  function setExecuteConfirmError(message) {
+    if (!els.pdaExecuteConfirmError) return;
+    els.pdaExecuteConfirmError.textContent = message || "";
+    els.pdaExecuteConfirmError.classList.toggle("hidden", !message);
+  }
+
+  function setExecuteConfirmButtonsDisabled(disabled) {
+    [els.btnPdaExecuteConfirm, els.btnPdaExecuteCancel].forEach((btn) => {
+      if (btn) btn.disabled = !!disabled;
+    });
+  }
+
+  function fillExecuteConfirmSummary(preview, qrValue) {
+    if (!els.pdaExecuteConfirmSummary) return;
+    els.pdaExecuteConfirmSummary.textContent = "";
+    const qr = preview?.qr || {};
+    const material = preview?.material || {};
+    const rack = preview?.rack_selected || preview?.selected_rack || preview?.rack || {};
+    const source = preview?.source || {};
+    const destination = preview?.destination || {};
+    const essentialValue = (value, fallback) => readableValue(value) || fallback;
+    [
+      ["QR leído", essentialValue(firstValue(preview?.qr_value, qr.qr_value, qrValue), "No disponible")],
+      ["Material", essentialValue(firstValue(entityLabel(material), preview?.material_name, preview?.material_code), "No disponible")],
+      ["Rack seleccionado", essentialValue(entityLabel(rack), "No disponible")],
+      ["Origen", essentialValue(areaCellLabel(source), "No disponible")],
+      ["Destino", essentialValue(areaCellLabel(destination), "No disponible")],
+      ["Mensaje preview", essentialValue(preview?.message, "Sin mensaje")],
+    ].forEach(([label, value]) => appendConfirmRow(els.pdaExecuteConfirmSummary, label, value));
+  }
+
   function formatOperationalStatus(value) {
     const raw = readableValue(value);
     const key = raw.toLowerCase();
@@ -1706,6 +1769,50 @@
     container.appendChild(row);
   }
 
+  function normalizeHistoryRouteMode(value) {
+    const mode = readableValue(value).toLowerCase();
+    if (mode === "fifo_chain" || mode === "trmx_doble") return "fifo_chain";
+    return mode;
+  }
+
+  function pdaFifoChainInfo(item) {
+    if (normalizeHistoryRouteMode(item?.route_mode) !== "fifo_chain" && !item?.fifo_chain_group_id) return null;
+    const step = Number(item?.fifo_chain_step || 0) || null;
+    const total = Number(item?.fifo_chain_total_steps || 2) || 2;
+    const groupId = readableValue(item?.fifo_chain_group_id);
+    const groupShort = groupId ? groupId.slice(0, 8) : "-";
+    const status = readableValue(item?.fifo_chain_status);
+    const parentOrderId = item?.fifo_chain_parent_order_id;
+    return { step, total, groupShort, status, parentOrderId };
+  }
+
+  function appendPdaFifoChainSummary(container, item) {
+    if (pdaInterfaceMode !== "developer") return;
+    const info = pdaFifoChainInfo(item);
+    if (!info) return;
+    const parts = [
+      "Flujo doble FIFO",
+      `Paso ${info.step || "-"}/${info.total || "-"}`,
+      `Grupo ${info.groupShort}`,
+    ];
+    if (info.status) parts.push(`Estado ${info.status}`);
+    if (info.step === 2 && info.parentOrderId) parts.push(`Generada por orden ${info.parentOrderId}`);
+
+    const badge = document.createElement("div");
+    badge.className = "fifo-chain-history-badge";
+    badge.textContent = parts.join(" · ");
+    container.appendChild(badge);
+
+    if (info.step === 1 || info.step === 2) {
+      const note = document.createElement("div");
+      note.className = "fifo-chain-history-note";
+      note.textContent = info.step === 1
+        ? "Al simular completed se creará/despachará el paso 2 automáticamente."
+        : "Último paso del Flujo doble FIFO. No se crearán más órdenes.";
+      container.appendChild(note);
+    }
+  }
+
   function renderPdaHistory(items) {
     const target = els.localHistory;
     if (!target) return;
@@ -1741,6 +1848,7 @@
       appendHistoryField(fields, "Mensaje RCS", item.rcs_message);
       appendHistoryField(fields, "Error", item.error_message);
       card.append(title, meta, fields);
+      appendPdaFifoChainSummary(card, item);
 
       const areaGrid = document.createElement("div");
       areaGrid.className = "history-area-grid";
@@ -1862,8 +1970,53 @@
     return !!(els.pdaActionModal && !els.pdaActionModal.classList.contains("hidden"));
   }
 
+  function isPdaExecuteConfirmModalOpen() {
+    return !!(els.pdaExecuteConfirmModal && !els.pdaExecuteConfirmModal.classList.contains("hidden"));
+  }
+
   function isPdaModalOpen() {
-    return isPdaActionModalOpen() || !!(els.pdaAdminModal && !els.pdaAdminModal.classList.contains("hidden"));
+    return isPdaActionModalOpen() || isPdaExecuteConfirmModalOpen() || !!(els.pdaAdminModal && !els.pdaAdminModal.classList.contains("hidden"));
+  }
+
+  function clearPendingExecutePreview() {
+    pendingPreviewForExecution = null;
+    pendingQrValue = "";
+    isConfirmModalOpen = false;
+    isExecutingConfirmed = false;
+    setExecuteConfirmError("");
+    setExecuteConfirmButtonsDisabled(false);
+  }
+
+  function closeExecuteConfirmModal({ refocus = true, clearPending = true, readyMessage = "" } = {}) {
+    els.pdaExecuteConfirmModal?.classList.add("hidden");
+    if (clearPending) clearPendingExecutePreview();
+    if (els.qrInput) els.qrInput.value = "";
+    resetLocalDuplicateGuard();
+    setScannerEnabled(!isConfigPanelOpen && terminalValidationState === "valid" && !!terminalConfig);
+    if (readyMessage) setStatus("ready", readyMessage);
+    if (refocus && terminalValidationState === "valid") focusScanner();
+  }
+
+  function cancelExecuteConfirmModal() {
+    closeExecuteConfirmModal({ refocus: true, clearPending: true, readyMessage: "LISTO PARA ESCANEAR" });
+    if (els.resultSummary) els.resultSummary.textContent = "Listo para escanear.";
+  }
+
+  function openExecuteConfirmModal(preview, qrValue) {
+    pendingPreviewForExecution = preview;
+    pendingQrValue = qrValue;
+    isConfirmModalOpen = true;
+    isExecutingConfirmed = false;
+    clearScanIdleTimer();
+    setScannerEnabled(false);
+    fillExecuteConfirmSummary(preview, qrValue);
+    setExecuteConfirmError("");
+    setExecuteConfirmButtonsDisabled(false);
+    els.pdaExecuteConfirmModal?.classList.remove("hidden");
+    setStatus("processing", "CONFIRMAR ENVIO");
+    window.setTimeout(() => {
+      try { els.pdaExecuteConfirmModal?.focus(); } catch (_) {}
+    }, 0);
   }
 
   function setPdaActionButtonsDisabled(disabled) {
@@ -1999,7 +2152,7 @@
     if (!isProcessing && !isConfigPanelOpen && terminalValidationState === "valid") setStatus("ready", "LISTO PARA ESCANEAR");
   }
 
-  async function postTerminalPreview(qrValue) {
+  async function postTerminalScan(qrValue, mode = currentMode()) {
     const terminalCode = terminalConfig?.terminal_code || currentTerminalCode();
     if (!terminalCode) {
       els.configBody.classList.add("open");
@@ -2011,7 +2164,7 @@
     const response = await fetch("/api/scan/terminal", {
       method: "POST",
       headers,
-      body: JSON.stringify({ terminal_code: terminalCode, qr_value: qrValue, mode: currentMode() }),
+      body: JSON.stringify({ terminal_code: terminalCode, qr_value: qrValue, mode }),
     });
     const textBody = await response.text();
     let data = {};
@@ -2023,8 +2176,52 @@
     return data;
   }
 
+  async function confirmPendingExecute() {
+    if (!pendingPreviewForExecution || !pendingQrValue || isExecutingConfirmed) return;
+    isExecutingConfirmed = true;
+    setExecuteConfirmButtonsDisabled(true);
+    setExecuteConfirmError("");
+    setStatus("processing", "EJECUTANDO");
+    const qrValue = pendingQrValue;
+    const terminalCode = currentTerminalCode();
+    try {
+      const result = await postTerminalScan(qrValue, "execute");
+      els.pdaExecuteConfirmModal?.classList.add("hidden");
+      renderScanResult(result, { qrValue, terminalCode, mode: "execute" });
+      addHistory({ time: new Date().toLocaleTimeString(), qr_value: qrValue, ok: !!result.ok, action: result.action || "-", message: result.message || "-" });
+      await loadPdaHistory({ force: true });
+      clearPendingExecutePreview();
+      if (els.qrInput) els.qrInput.value = "";
+      resetLocalDuplicateGuard();
+      window.setTimeout(() => {
+        syncModeWarning();
+        setScannerEnabled(!isConfigPanelOpen && terminalValidationState === "valid" && !!terminalConfig);
+      }, 650);
+    } catch (err) {
+      const message = err?.message || String(err);
+      els.pdaExecuteConfirmModal?.classList.add("hidden");
+      renderScanResult({
+        ok: false,
+        status: "communication_error",
+        qr_value: qrValue,
+        terminal_code: terminalCode,
+        mode: "execute",
+        message: "No fue posible ejecutar la tarea.",
+        error_message: message,
+      }, { qrValue, terminalCode, mode: "execute" });
+      addHistory({ time: new Date().toLocaleTimeString(), qr_value: qrValue, ok: false, action: "-", message });
+      await loadPdaHistory({ force: true });
+      clearPendingExecutePreview();
+      if (els.qrInput) els.qrInput.value = "";
+      resetLocalDuplicateGuard();
+      syncModeWarning();
+      setScannerEnabled(!isConfigPanelOpen && terminalValidationState === "valid" && !!terminalConfig);
+    }
+  }
+
   async function submitQr(source = "manual") {
     clearScanIdleTimer();
+    if (isConfirmModalOpen || isPdaExecuteConfirmModalOpen()) return;
     if (isProcessing) return;
     if (isConfigPanelOpen) {
       setConfigMessage("Termina de guardar o cancela la configuración antes de escanear.");
@@ -2059,6 +2256,7 @@
     lastSubmittedAt = now;
     clearScanIdleTimer();
     isProcessing = true;
+    const requestedMode = currentMode();
     const submissionId = ++submissionSequence;
     activeSubmission = {
       id: submissionId,
@@ -2067,7 +2265,7 @@
       startedAt: now,
     };
     els.qrInput.disabled = true;
-    setStatus("processing", currentMode() === "execute" ? "EJECUTANDO" : "PROCESANDO");
+    setStatus("processing", requestedMode === "execute" ? "PREVIEW PARA EJECUTAR" : "PROCESANDO");
     setResultClass("processing");
     if (els.resultTitle) els.resultTitle.textContent = "PROCESANDO...";
     els.resultSummary.textContent = "Enviando lectura al servidor...";
@@ -2076,7 +2274,7 @@
     setField(els.resQr, qrValue);
     setField(els.resTerminal, currentTerminalCode());
     setField(els.resScanner, terminalConfig?.scanner?.scanner_code);
-    setField(els.resAction, currentMode());
+    setField(els.resAction, requestedMode);
     setField(els.resAlias, "");
     setField(els.resType, "");
     setField(els.resMaterial, "");
@@ -2087,8 +2285,19 @@
     setField(els.resEvent, "");
     setField(els.resError, "");
     try {
-      const result = await postTerminalPreview(qrValue);
-      renderScanResult(result, { qrValue, terminalCode: currentTerminalCode(), mode: currentMode() });
+      if (requestedMode === "execute") {
+        const preview = await postTerminalScan(qrValue, "preview");
+        renderScanResult(preview, { qrValue, terminalCode: currentTerminalCode(), mode: "preview" });
+        if (!preview?.ok) {
+          addHistory({ time: new Date().toLocaleTimeString(), qr_value: qrValue, ok: false, action: preview?.action || "-", message: preview?.message || "Preview rechazado." });
+          await loadPdaHistory({ force: true });
+          return;
+        }
+        openExecuteConfirmModal(preview, qrValue);
+        return;
+      }
+      const result = await postTerminalScan(qrValue, "preview");
+      renderScanResult(result, { qrValue, terminalCode: currentTerminalCode(), mode: "preview" });
       addHistory({ time: new Date().toLocaleTimeString(), qr_value: qrValue, ok: !!result.ok, action: result.action || "-", message: result.message || "-" });
       await loadPdaHistory({ force: true });
     } catch (err) {
@@ -2098,10 +2307,10 @@
         status: "communication_error",
         qr_value: qrValue,
         terminal_code: currentTerminalCode(),
-        mode: currentMode(),
+        mode: requestedMode === "execute" ? "preview" : requestedMode,
         message: "No fue posible comunicarse con el sistema de despacho.",
         error_message: message,
-      }, { qrValue, terminalCode: currentTerminalCode(), mode: currentMode() });
+      }, { qrValue, terminalCode: currentTerminalCode(), mode: requestedMode === "execute" ? "preview" : requestedMode });
       addHistory({ time: new Date().toLocaleTimeString(), qr_value: qrValue, ok: false, action: "-", message });
       await loadPdaHistory({ force: true });
     } finally {
@@ -2111,6 +2320,10 @@
         els.qrInput.value = "";
         lastSubmittedInputValue = "";
         isProcessing = false;
+        if (isConfirmModalOpen || isPdaExecuteConfirmModalOpen()) {
+          setScannerEnabled(false);
+          return;
+        }
         window.setTimeout(() => {
           if (!isProcessing) syncModeWarning();
           setScannerEnabled(!isConfigPanelOpen && terminalValidationState === "valid" && !!terminalConfig);
@@ -2190,6 +2403,8 @@
   els.btnPdaCancelReturnOrder?.addEventListener("click", () => showPdaCancelConfirm("cancel_return"));
   els.btnPdaConfirmCancel?.addEventListener("click", () => cancelPdaMovementOrder(selectedHistoryItem?.movement_order_id, "cancel"));
   els.btnPdaConfirmCancelReturn?.addEventListener("click", () => cancelPdaMovementOrder(selectedHistoryItem?.movement_order_id, "cancel_return"));
+  els.btnPdaExecuteConfirm?.addEventListener("click", confirmPendingExecute);
+  els.btnPdaExecuteCancel?.addEventListener("click", cancelExecuteConfirmModal);
   els.qrInput.addEventListener("keydown", (event) => {
     if (isPdaModalOpen()) return;
     if (event.key !== "Enter") return;
@@ -2200,6 +2415,18 @@
   });
   els.qrInput.addEventListener("input", scheduleScanIdleSubmit);
   document.addEventListener("keydown", (event) => {
+    if (isPdaExecuteConfirmModalOpen()) {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        cancelExecuteConfirmModal();
+      }
+      return;
+    }
     if (event.key !== "Escape") return;
     if (els.pdaAdminModal && !els.pdaAdminModal.classList.contains("hidden")) {
       event.preventDefault();
@@ -2211,13 +2438,13 @@
       clearScanIdleTimer();
       return;
     }
-    if (!document.hidden && terminalValidationState === "valid") {
+    if (!document.hidden && terminalValidationState === "valid" && !isPdaModalOpen()) {
       refreshPdaHistoryNow();
       focusScanner();
     }
   });
   window.addEventListener("pageshow", () => {
-    if (terminalValidationState === "valid") {
+    if (terminalValidationState === "valid" && !isPdaModalOpen()) {
       refreshPdaHistoryNow();
       focusScanner();
     }

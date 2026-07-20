@@ -93,6 +93,11 @@ const API = {
   adminQrActionRules: "/api/admin/qr-action-rules",
   adminQrActionRule: (id) => `/api/admin/qr-action-rules/${id}`,
   adminQrActionRuleImage: (id, size = 240) => `/api/admin/qr-action-rules/${id}/qr-image?size=${encodeURIComponent(size)}`,
+  adminQrTransitionRules: "/api/admin/qr-transition-rules",
+  adminQrTransitionRule: (id) => `/api/admin/qr-transition-rules/${id}`,
+  adminQrTransitionPreview: (id) => `/api/admin/qr-transition-rules/preview/${encodeURIComponent(id)}`,
+  adminQrTransitionApply: (id) => `/api/admin/qr-transition-rules/apply/${encodeURIComponent(id)}`,
+  adminQrTransitionLogs: "/api/admin/qr-transition-logs",
   adminScanTerminals: "/api/admin/scan-terminals",
   adminScanTerminal: (id) => `/api/admin/scan-terminals/${id}`,
   scanPreview: "/api/scan/preview",
@@ -135,6 +140,15 @@ let debugConsoleHoverPaused = false;
 let debugConsolePendingEntries = null;
 let RUNTIME_AUTO_REFRESH_MS = 5000;
 let RUNTIME_SOCKET_RECONNECT_MS = 3000;
+const EDITING_GRACE_MS = 10000;
+let editingLock = {
+  active: false,
+  section: null,
+  since: 0,
+  lastUserEditAt: 0,
+  pendingRuntimeSnapshot: null,
+  pendingCatalogRender: false,
+};
 const ROBOT_MONITOR_POS_KEY = "agv_robot_monitor_pos_v1";
 const ROBOT_MONITOR_SIZE_KEY = "agv_robot_monitor_size_v1";
 
@@ -317,6 +331,9 @@ const cellNote = $("cellNote");
 const btnSelectCellsByArea = $("btnSelectCellsByArea");
 const btnSaveCell = $("btnSaveCell");
 const cellMsg = $("cellMsg");
+const cellEditRefreshNotice = $("cellEditRefreshNotice");
+const cellEditRefreshActions = $("cellEditRefreshActions");
+const btnRefreshCellAfterEdit = $("btnRefreshCellAfterEdit");
 
 const areaId = $("areaId");
 const areaCode = $("areaCode");
@@ -332,6 +349,107 @@ const btnNewArea = $("btnNewArea");
 const btnDeleteArea = $("btnDeleteArea");
 const areasList = $("areasList");
 const areaMsg = $("areaMsg");
+const areaEditRefreshNotice = $("areaEditRefreshNotice");
+const areaEditRefreshActions = $("areaEditRefreshActions");
+const btnRefreshAreasAfterEdit = $("btnRefreshAreasAfterEdit");
+
+function editingSectionElements(section) {
+  if (section === "cell") {
+    return [cellCode, cellStatus, cellEnabled, cellVisible, cellArea, cellRack, cellReservationState, cellNote].filter(Boolean);
+  }
+  if (section === "areas") {
+    return [areaCode, areaName, areaType, areaColor, areaPriority, areaActive, areaMatterArea, areaDescription].filter(Boolean);
+  }
+  return [];
+}
+function editingSectionHasFocus(section) {
+  const activeEl = document.activeElement;
+  return !!activeEl && editingSectionElements(section).some(el => el === activeEl || el.contains?.(activeEl));
+}
+function updateEditRefreshNotices() {
+  const pending = !!(editingLock.pendingRuntimeSnapshot || editingLock.pendingCatalogRender);
+  const text = pending
+    ? "Edicion activa: actualizacion automatica pausada. Hay datos nuevos; se actualizaran al guardar o salir de edicion."
+    : "Edicion activa: actualizacion automatica pausada.";
+  if (cellEditRefreshNotice) {
+    const active = editingLock.active && editingLock.section === "cell";
+    cellEditRefreshNotice.textContent = text;
+    cellEditRefreshNotice.classList.toggle("hidden", !active);
+    cellEditRefreshActions?.classList.toggle("hidden", !active);
+  }
+  if (areaEditRefreshNotice) {
+    const active = editingLock.active && editingLock.section === "areas";
+    areaEditRefreshNotice.textContent = text;
+    areaEditRefreshNotice.classList.toggle("hidden", !active);
+    areaEditRefreshActions?.classList.toggle("hidden", !active);
+  }
+}
+function markEditingActivity(section, dirty = true) {
+  const now = Date.now();
+  editingLock.active = true;
+  editingLock.section = section;
+  if (!editingLock.since) editingLock.since = now;
+  if (dirty || !editingLock.lastUserEditAt) editingLock.lastUserEditAt = now;
+  updateEditRefreshNotices();
+}
+function finishEditingLock(section = null, options = {}) {
+  if (section && editingLock.section !== section) return;
+  const pendingSnapshot = editingLock.pendingRuntimeSnapshot;
+  const pendingCatalogRender = editingLock.pendingCatalogRender;
+  editingLock = {
+    active: false,
+    section: null,
+    since: 0,
+    lastUserEditAt: 0,
+    pendingRuntimeSnapshot: null,
+    pendingCatalogRender: false,
+  };
+  updateEditRefreshNotices();
+  if (options.applyPending === false) return;
+  window.setTimeout(() => {
+    if (pendingCatalogRender) renderDeferredCatalogParts();
+    if (pendingSnapshot) applyRuntimeSnapshotData(pendingSnapshot, selectedOrderId, { forceAdminRender: true });
+  }, 0);
+}
+async function refreshAfterEditingLock(section = null) {
+  finishEditingLock(section, { applyPending: false });
+  if (section === "areas") {
+    await loadCatalog();
+    return;
+  }
+  if (section === "cell") {
+    await Promise.all([loadCatalog(), loadMovementOrders(selectedOrderId)]);
+    return;
+  }
+  await Promise.all([loadCatalog(), loadMovementOrders(selectedOrderId)]);
+}
+function isEditingLockEffective(section = null) {
+  if (!editingLock.active) return false;
+  if (section && editingLock.section !== section) return false;
+  const hasFocus = editingSectionHasFocus(editingLock.section);
+  const lastEdit = Number(editingLock.lastUserEditAt || editingLock.since || 0);
+  const withinGrace = Date.now() - lastEdit < EDITING_GRACE_MS;
+  if (hasFocus || withinGrace) return true;
+  finishEditingLock(editingLock.section);
+  return false;
+}
+function deferAdminRefresh() {
+  editingLock.pendingCatalogRender = true;
+  updateEditRefreshNotices();
+}
+function renderDeferredCatalogParts() {
+  renderAreaOptions({ force: true });
+  renderRackOptions({ force: true });
+  renderAreaList({ force: true });
+  updateEditRefreshNotices();
+}
+function bindEditingLockEvents(section, elements) {
+  elements.forEach(el => {
+    el.addEventListener("focus", () => markEditingActivity(section, false));
+    el.addEventListener("input", () => markEditingActivity(section, true));
+    el.addEventListener("change", () => markEditingActivity(section, true));
+  });
+}
 
 const materialId = $("materialId");
 const materialCode = $("materialCode");
@@ -371,17 +489,38 @@ const scannerName = $("scannerName");
 const scannerDescription = $("scannerDescription");
 const scannerStationType = $("scannerStationType");
 const scannerDefaultAction = $("scannerDefaultAction");
+const scannerRouteMode = $("scannerRouteMode");
 const scannerSourceArea = $("scannerSourceArea");
 const scannerDestinationArea = $("scannerDestinationArea");
 const scannerSourceCell = $("scannerSourceCell");
 const scannerDestinationCell = $("scannerDestinationCell");
 const scannerSourceCellSummary = $("scannerSourceCellSummary");
 const scannerDestinationCellSummary = $("scannerDestinationCellSummary");
+const scannerSecondSourceArea = $("scannerSecondSourceArea");
+const scannerSecondDestinationArea = $("scannerSecondDestinationArea");
+const scannerSecondSourceCell = $("scannerSecondSourceCell");
+const scannerSecondDestinationCell = $("scannerSecondDestinationCell");
+const scannerSecondSourceCellSummary = $("scannerSecondSourceCellSummary");
+const scannerSecondDestinationCellSummary = $("scannerSecondDestinationCellSummary");
 const scannerStorageArea = $("scannerStorageArea");
 const scannerEmptyRackArea = $("scannerEmptyRackArea");
 const scannerCancelReturnArea = $("scannerCancelReturnArea");
 const scannerCancelReturnAreaWarning = $("scannerCancelReturnAreaWarning");
 const scannerDefaultMaterial = $("scannerDefaultMaterial");
+const scannerFifoMaterialPolicy = $("scannerFifoMaterialPolicy");
+const scannerFifoChainTotalSteps = $("scannerFifoChainTotalSteps");
+const scannerFifoChainStep1SourceMode = $("scannerFifoChainStep1SourceMode");
+const scannerFifoChainStep1Material = $("scannerFifoChainStep1Material");
+const scannerFifoChainStep2SourceMode = $("scannerFifoChainStep2SourceMode");
+const scannerFifoChainStep2Material = $("scannerFifoChainStep2Material");
+const scannerFifoChainStep3SourceMode = $("scannerFifoChainStep3SourceMode");
+const scannerFifoChainStep3Material = $("scannerFifoChainStep3Material");
+const scannerFifoChainStep3SourceArea = $("scannerFifoChainStep3SourceArea");
+const scannerFifoChainStep3DestinationArea = $("scannerFifoChainStep3DestinationArea");
+const scannerFifoChainStep3SourceCell = $("scannerFifoChainStep3SourceCell");
+const scannerFifoChainStep3DestinationCell = $("scannerFifoChainStep3DestinationCell");
+const scannerFifoChainStep3SourceCellSummary = $("scannerFifoChainStep3SourceCellSummary");
+const scannerFifoChainStep3DestinationCellSummary = $("scannerFifoChainStep3DestinationCellSummary");
 const scannerAgvCode = $("scannerAgvCode");
 const scannerTaskTyp = $("scannerTaskTyp");
 const scannerPriority = $("scannerPriority");
@@ -400,13 +539,35 @@ const qrType = $("qrType");
 const qrMatchType = $("qrMatchType");
 const qrActionType = $("qrActionType");
 const qrMaterial = $("qrMaterial");
+const qrFifoMaterialPolicy = $("qrFifoMaterialPolicy");
+const qrFifoMaterialPolicyHelp = $("qrFifoMaterialPolicyHelp");
+const qrFifoChainTotalSteps = $("qrFifoChainTotalSteps");
+const qrFifoChainStep1SourceMode = $("qrFifoChainStep1SourceMode");
+const qrFifoChainStep1Material = $("qrFifoChainStep1Material");
+const qrFifoChainStep2SourceMode = $("qrFifoChainStep2SourceMode");
+const qrFifoChainStep2Material = $("qrFifoChainStep2Material");
+const qrFifoChainStep3SourceMode = $("qrFifoChainStep3SourceMode");
+const qrFifoChainStep3Material = $("qrFifoChainStep3Material");
+const qrFifoChainStep3SourceArea = $("qrFifoChainStep3SourceArea");
+const qrFifoChainStep3DestinationArea = $("qrFifoChainStep3DestinationArea");
+const qrFifoChainStep3SourceCell = $("qrFifoChainStep3SourceCell");
+const qrFifoChainStep3DestinationCell = $("qrFifoChainStep3DestinationCell");
+const qrFifoChainStep3SourceCellSummary = $("qrFifoChainStep3SourceCellSummary");
+const qrFifoChainStep3DestinationCellSummary = $("qrFifoChainStep3DestinationCellSummary");
 const qrRack = $("qrRack");
+const qrRouteMode = $("qrRouteMode");
 const qrSourceArea = $("qrSourceArea");
 const qrDestinationArea = $("qrDestinationArea");
 const qrSourceCell = $("qrSourceCell");
 const qrDestinationCell = $("qrDestinationCell");
 const qrSourceCellSummary = $("qrSourceCellSummary");
 const qrDestinationCellSummary = $("qrDestinationCellSummary");
+const qrSecondSourceArea = $("qrSecondSourceArea");
+const qrSecondDestinationArea = $("qrSecondDestinationArea");
+const qrSecondSourceCell = $("qrSecondSourceCell");
+const qrSecondDestinationCell = $("qrSecondDestinationCell");
+const qrSecondSourceCellSummary = $("qrSecondSourceCellSummary");
+const qrSecondDestinationCellSummary = $("qrSecondDestinationCellSummary");
 const qrPriority = $("qrPriority");
 const qrAgvCode = $("qrAgvCode");
 const qrTaskTyp = $("qrTaskTyp");
@@ -432,6 +593,43 @@ const scanEventsList = $("scanEventsList");
 const scanEventDetailBox = $("scanEventDetailBox");
 const scanEventDetailJson = $("scanEventDetailJson");
 const qrAdminMsg = $("qrAdminMsg");
+const qrTransitionRuleId = $("qrTransitionRuleId");
+const qrTransitionName = $("qrTransitionName");
+const qrTransitionDescription = $("qrTransitionDescription");
+const qrTransitionScope = $("qrTransitionScope");
+const qrTransitionMatchMode = $("qrTransitionMatchMode");
+const qrTransitionIgnoreCurrentMaterial = $("qrTransitionIgnoreCurrentMaterial");
+const qrTransitionSourceMatchMode = $("qrTransitionSourceMatchMode");
+const qrTransitionAnySourceHelp = $("qrTransitionAnySourceHelp");
+const qrTransitionSimpleHelp = $("qrTransitionSimpleHelp");
+const qrTransitionQrRule = $("qrTransitionQrRule");
+const qrTransitionScanner = $("qrTransitionScanner");
+const qrTransitionSourceArea = $("qrTransitionSourceArea");
+const qrTransitionDestinationArea = $("qrTransitionDestinationArea");
+const qrTransitionSourceCell = $("qrTransitionSourceCell");
+const qrTransitionDestinationCell = $("qrTransitionDestinationCell");
+const qrTransitionCurrentMaterialLabel = $("qrTransitionCurrentMaterialLabel");
+const qrTransitionCurrentMaterial = $("qrTransitionCurrentMaterial");
+const qrTransitionCurrentRackStatus = $("qrTransitionCurrentRackStatus");
+const qrTransitionNextMaterial = $("qrTransitionNextMaterial");
+const qrTransitionNextRackStatus = $("qrTransitionNextRackStatus");
+const qrTransitionNextQuantity = $("qrTransitionNextQuantity");
+const qrTransitionClearQuantity = $("qrTransitionClearQuantity");
+const qrTransitionNextComment = $("qrTransitionNextComment");
+const qrTransitionAppendComment = $("qrTransitionAppendComment");
+const qrTransitionApplyOn = $("qrTransitionApplyOn");
+const qrTransitionPriority = $("qrTransitionPriority");
+const qrTransitionActive = $("qrTransitionActive");
+const btnSaveQrTransitionRule = $("btnSaveQrTransitionRule");
+const btnNewQrTransitionRule = $("btnNewQrTransitionRule");
+const btnDisableQrTransitionRule = $("btnDisableQrTransitionRule");
+const qrTransitionRulesList = $("qrTransitionRulesList");
+const qrTransitionPreviewOrderId = $("qrTransitionPreviewOrderId");
+const btnPreviewQrTransition = $("btnPreviewQrTransition");
+const btnApplyQrTransition = $("btnApplyQrTransition");
+const qrTransitionPreviewResult = $("qrTransitionPreviewResult");
+const btnRefreshQrTransitionLogs = $("btnRefreshQrTransitionLogs");
+const qrTransitionLogsList = $("qrTransitionLogsList");
 const scanTerminalId = $("scanTerminalId");
 const scanTerminalCode = $("scanTerminalCode");
 const scanTerminalName = $("scanTerminalName");
@@ -649,6 +847,8 @@ let rackReservationOriginal = "0";
 const OPERATOR_LAST_POINT_KEY = "agv_operator_point_area_defaults_v1";
 let scannerStations = [];
 let qrActionRules = [];
+let qrTransitionRules = [];
+let qrTransitionLogs = [];
 const qrRuleImageObjectUrls = new Map();
 let qrRuleModalImageObjectUrl = null;
 let scanEvents = [];
@@ -3136,7 +3336,8 @@ function setAdminUI(enabled) {
     "mapLayoutMode", "freeLayoutEditEnabled", "btnAddFreeCell",
     "podPositionRack", "btnQueryPodPosition", "rcsPodPositionEndpoint", "rcsRackSyncQueryEndpoint", "rcsRackSyncBindEndpoint", "rcsRackSyncScheduleEnabled", "rcsRackSyncScheduleTime", "btnRackSyncPreview", "btnRackSyncQuery", "btnRackSyncBind", "btnRackSyncHistory",
     "operatorButtonIndex", "operatorButtonActive", "operatorButtonLabel", "operatorButtonColor", "operatorButtonMode", "operatorButtonPriority", "operatorButtonSourceArea", "operatorButtonDestinationArea", "operatorButtonPointDestinationArea", "operatorButtonMaterial", "operatorButtonSourceCell", "operatorButtonDestinationCell", "btnOperatorButtonPickSource", "btnOperatorButtonPickDestination", "operatorButtonAgv", "operatorButtonTaskTyp", "operatorButtonComment", "btnSaveOperatorButton", "btnAddOperatorPointField",
-    "btnRefreshScanTerminals"
+    "btnRefreshScanTerminals",
+    "qrTransitionName", "qrTransitionDescription", "qrTransitionScope", "qrTransitionMatchMode", "qrTransitionIgnoreCurrentMaterial", "qrTransitionSourceMatchMode", "qrTransitionQrRule", "qrTransitionScanner", "qrTransitionSourceArea", "qrTransitionDestinationArea", "qrTransitionSourceCell", "qrTransitionDestinationCell", "qrTransitionCurrentMaterial", "qrTransitionCurrentRackStatus", "qrTransitionNextMaterial", "qrTransitionNextRackStatus", "qrTransitionNextQuantity", "qrTransitionClearQuantity", "qrTransitionNextComment", "qrTransitionAppendComment", "qrTransitionApplyOn", "qrTransitionPriority", "qrTransitionActive", "btnSaveQrTransitionRule", "btnNewQrTransitionRule", "btnDisableQrTransitionRule", "qrTransitionPreviewOrderId", "btnPreviewQrTransition", "btnApplyQrTransition", "btnRefreshQrTransitionLogs"
   ]);
 
   const disabledPlaceholderIds = new Set([
@@ -3176,6 +3377,7 @@ function setAdminUI(enabled) {
   setCellBulkControlsState();
   updateAddFreeCellAvailability();
   updateRackSyncButtons();
+  syncRouteModeSections();
 }
 function applyAgvOverlayConfigFromGrid(cfg = {}) {
   agvOverlayConfig.scale_x = Number(cfg.agv_overlay_scale_x ?? 1) || 1;
@@ -3242,7 +3444,7 @@ async function loadCatalog() {
   renderQrCatalogOptions();
 }
 
-function applyRuntimeSnapshotData(snapshot, preferredOrderId = null) {
+function applyRuntimeSnapshotData(snapshot, preferredOrderId = null, options = {}) {
   const rows = Array.isArray(snapshot?.locations) ? snapshot.locations : [];
   const orders = Array.isArray(snapshot?.orders) ? snapshot.orders : [];
   const debugLog = Array.isArray(snapshot?.debug_log) ? snapshot.debug_log : [];
@@ -3263,15 +3465,21 @@ function applyRuntimeSnapshotData(snapshot, preferredOrderId = null) {
   renderOrdersList();
   renderOrderStatusQuery(null, null, debugConsoleEvents, true);
   renderDirectMoveSelection();
-  const selectedLoc = getLocationAtGrid(selected.x, selected.y);
-  if (isMultiSelectionActive()) {
-    multiSelectedLocationIds = new Set(Array.from(multiSelectedLocationIds).filter(id => getLocationById(id)));
-    fillMultiCellForm();
-  } else if (selectedLoc) {
-    fillCellForm(selectedLoc);
+  const deferCellRender = !options.forceAdminRender && isEditingLockEffective("cell");
+  if (deferCellRender) {
+    editingLock.pendingRuntimeSnapshot = snapshot;
+    updateEditRefreshNotices();
+  } else {
+    const selectedLoc = getLocationAtGrid(selected.x, selected.y);
+    if (isMultiSelectionActive()) {
+      multiSelectedLocationIds = new Set(Array.from(multiSelectedLocationIds).filter(id => getLocationById(id)));
+      fillMultiCellForm();
+    } else if (selectedLoc) {
+      fillCellForm(selectedLoc);
+    }
+    setCellBulkControlsState();
+    refreshRackReservationFieldsForSelection();
   }
-  setCellBulkControlsState();
-  refreshRackReservationFieldsForSelection();
 
   draw();
 
@@ -3294,10 +3502,14 @@ async function refreshMatrixViewData() {
   draw();
 }
 
-function renderAreaOptions() {
-  const current = cellArea.value;
-  cellArea.innerHTML = `<option value="">Sin área</option>` + catalog.areas.map(a => `<option value="${a.id}">${a.code} - ${a.name}</option>`).join("");
-  if ([...cellArea.options].some(o => o.value === current)) cellArea.value = current;
+function renderAreaOptions(renderOptions = {}) {
+  if (!renderOptions.force && isEditingLockEffective("cell")) {
+    deferAdminRefresh();
+  } else {
+    const current = cellArea.value;
+    cellArea.innerHTML = `<option value="">Sin area</option>` + catalog.areas.map(a => `<option value="${a.id}">${a.code} - ${a.name}</option>`).join("");
+    if ([...cellArea.options].some(o => o.value === current)) cellArea.value = current;
+  }
   const activeAreas = catalog.areas.filter(a => Number(a.is_active) === 1);
   const currentSource = fifoSourceArea.value;
   const currentDestination = fifoDestinationArea.value;
@@ -3343,7 +3555,11 @@ function availableRacksForCell() {
   const currentRack = locations[idx(selected.x, selected.y)]?.rack_id;
   return catalog.racks.filter(r => r.location_x == null || Number(r.id) === Number(currentRack));
 }
-function renderRackOptions() {
+function renderRackOptions(renderOptions = {}) {
+  if (!renderOptions.force && isEditingLockEffective("cell")) {
+    deferAdminRefresh();
+    return;
+  }
   const current = cellRack.value;
   const racks = availableRacksForCell();
   cellRack.innerHTML = `<option value="">Sin rack</option>` + racks.map(r => `<option value="${r.id}">${r.code}${r.material_group_name ? ` - ${r.material_group_name}` : ""}</option>`).join("");
@@ -3359,7 +3575,11 @@ function renderPodPositionRackOptions() {
   }).join("");
   if ([...podPositionRack.options].some(o => o.value === current)) podPositionRack.value = current;
 }
-function renderAreaList() {
+function renderAreaList(renderOptions = {}) {
+  if (!renderOptions.force && isEditingLockEffective("areas")) {
+    deferAdminRefresh();
+    return;
+  }
   areasList.innerHTML = catalog.areas.map(a => `<button type="button" class="list-item" data-kind="area" data-id="${a.id}"><span class="swatch" style="background:${a.color}"></span><b>${a.code}</b> ${a.name}<small>${a.area_type} · prioridad ${a.priority} · Matter Area: ${escapeHtml(a.matter_area || '-')}</small></button>`).join("") || `<div class="small">Sin áreas capturadas.</div>`;
   areasList.querySelectorAll("[data-kind='area']").forEach(btn => btn.addEventListener("click", () => loadAreaForm(Number(btn.dataset.id))));
 }
@@ -3523,11 +3743,198 @@ function renderQrCellSummary(selectEl, targetEl) {
 function renderQrCellSummaries() {
   renderQrCellSummary(scannerSourceCell, scannerSourceCellSummary);
   renderQrCellSummary(scannerDestinationCell, scannerDestinationCellSummary);
+  renderQrCellSummary(scannerSecondSourceCell, scannerSecondSourceCellSummary);
+  renderQrCellSummary(scannerSecondDestinationCell, scannerSecondDestinationCellSummary);
+  renderQrCellSummary(scannerFifoChainStep3SourceCell, scannerFifoChainStep3SourceCellSummary);
+  renderQrCellSummary(scannerFifoChainStep3DestinationCell, scannerFifoChainStep3DestinationCellSummary);
   renderQrCellSummary(qrSourceCell, qrSourceCellSummary);
   renderQrCellSummary(qrDestinationCell, qrDestinationCellSummary);
+  renderQrCellSummary(qrSecondSourceCell, qrSecondSourceCellSummary);
+  renderQrCellSummary(qrSecondDestinationCell, qrSecondDestinationCellSummary);
+  renderQrCellSummary(qrFifoChainStep3SourceCell, qrFifoChainStep3SourceCellSummary);
+  renderQrCellSummary(qrFifoChainStep3DestinationCell, qrFifoChainStep3DestinationCellSummary);
+}
+function normalizeRouteMode(value) {
+  if (value === "fifo_chain" || value === "trmx_doble") return "fifo_chain";
+  return value === "double_area" ? "double_area" : "simple_area";
+}
+function routeModeLabel(value) {
+  const mode = normalizeRouteMode(value);
+  if (mode === "fifo_chain") return "Flujo doble FIFO / tareas encadenadas";
+  return mode === "double_area" ? "Doble area / multipunto" : "Simple por origen/destino";
+}
+function fifoChainFlowLabel(item) {
+  if (normalizeRouteMode(item?.route_mode) !== "fifo_chain") return routeModeLabel(item?.route_mode);
+  return normalizeFifoChainTotalSteps(item?.fifo_chain_total_steps) === 3 ? "Flujo triple FIFO" : "Flujo doble FIFO";
+}
+function normalizeFifoMaterialPolicy(value) {
+  return value === "any_available_from_source" ? "any_available_from_source" : "specific_material";
+}
+function fifoMaterialPolicyLabel(value) {
+  return normalizeFifoMaterialPolicy(value) === "any_available_from_source" ? "Cualquier rack disponible" : "Material especifico";
+}
+function normalizeFifoChainSourceMode(value) {
+  return value === "any_area_by_material" ? "any_area_by_material" : "configured_area";
+}
+function normalizeFifoChainStep2SourceMode(value) {
+  return normalizeFifoChainSourceMode(value);
+}
+function normalizeFifoChainTotalSteps(value) {
+  const total = Number(value || 2);
+  return total === 3 ? 3 : 2;
+}
+function fifoChainSourceModeLabel(value) {
+  return normalizeFifoChainSourceMode(value) === "any_area_by_material" ? "Cualquier area por material" : "Area origen configurada";
+}
+function fifoChainStep2SourceModeLabel(value) {
+  return fifoChainSourceModeLabel(value);
+}
+function qrRuleMaterialDisplay(q) {
+  return normalizeFifoMaterialPolicy(q?.fifo_material_policy) === "any_available_from_source" ? "Cualquier rack del origen" : qrRuleMaterialLabel(q);
+}
+function fifoChainStep1MaterialDisplay(item) {
+  if (item?.fifo_chain_step1_material_group_name) return item.fifo_chain_step1_material_group_name;
+  if (item?.fifo_chain_step1_material_group_id) return `Material ID ${item.fifo_chain_step1_material_group_id}`;
+  return "-";
+}
+function fifoChainStep2MaterialDisplay(item) {
+  if (item?.fifo_chain_step2_material_group_name) return item.fifo_chain_step2_material_group_name;
+  if (item?.fifo_chain_step2_material_group_id) return `Material ID ${item.fifo_chain_step2_material_group_id}`;
+  return "-";
+}
+function fifoChainStep3MaterialDisplay(item) {
+  if (item?.fifo_chain_step3_material_group_name) return item.fifo_chain_step3_material_group_name;
+  if (item?.fifo_chain_step3_material_group_id) return `Material ID ${item.fifo_chain_step3_material_group_id}`;
+  return "-";
+}
+function syncFifoMaterialPolicyHelp() {
+  const anyQr = normalizeFifoMaterialPolicy(qrFifoMaterialPolicy?.value) === "any_available_from_source" && (qrActionType?.value || "") === "fifo_request";
+  if (qrFifoMaterialPolicyHelp) qrFifoMaterialPolicyHelp.classList.toggle("hidden", !anyQr);
+}
+function setFifoChainEndpointDisabled(ids, disabled) {
+  ids.forEach((id) => {
+    const el = $(id);
+    if (el) el.disabled = !!disabled || !adminToken;
+  });
+}
+function syncFifoChainUi(owner, routeMode, totalSteps, step1SourceMode, step2SourceMode, step3SourceMode) {
+  const isFifoChain = normalizeRouteMode(routeMode) === "fifo_chain";
+  const isTriple = isFifoChain && normalizeFifoChainTotalSteps(totalSteps) === 3;
+  const isGlobalStep1 = isFifoChain && normalizeFifoChainSourceMode(step1SourceMode) === "any_area_by_material";
+  const isGlobalStep2 = isFifoChain && normalizeFifoChainSourceMode(step2SourceMode) === "any_area_by_material";
+  const isGlobalStep3 = isTriple && normalizeFifoChainSourceMode(step3SourceMode) === "any_area_by_material";
+  document.querySelectorAll(`[data-fifo-chain-source1="${owner}"]`).forEach(el => el.classList.toggle("hidden", isGlobalStep1));
+  document.querySelectorAll(`[data-fifo-chain-source2="${owner}"]`).forEach(el => el.classList.toggle("hidden", isGlobalStep2));
+  document.querySelectorAll(`[data-fifo-chain-source3="${owner}"]`).forEach(el => el.classList.toggle("hidden", isGlobalStep3));
+  document.querySelectorAll(`[data-fifo-chain-step3="${owner}"]`).forEach(el => el.classList.toggle("hidden", !isTriple));
+  document.querySelectorAll(`[data-fifo-chain-global-note="${owner}_step1"]`).forEach(el => el.classList.toggle("hidden", !isGlobalStep1));
+  document.querySelectorAll(`[data-fifo-chain-global-note="${owner}_step2"]`).forEach(el => el.classList.toggle("hidden", !isGlobalStep2));
+  document.querySelectorAll(`[data-fifo-chain-global-note="${owner}_step3"]`).forEach(el => el.classList.toggle("hidden", !isGlobalStep3));
+  if (owner === "scanner") {
+    setFifoChainEndpointDisabled(["scannerSourceArea", "scannerSourceCell"], isGlobalStep1);
+    setFifoChainEndpointDisabled(["scannerSecondSourceArea", "scannerSecondSourceCell"], isGlobalStep2);
+    setFifoChainEndpointDisabled(["scannerFifoChainStep3SourceArea", "scannerFifoChainStep3SourceCell"], isGlobalStep3 || !isTriple);
+    setFifoChainEndpointDisabled(["scannerFifoChainStep3DestinationArea", "scannerFifoChainStep3DestinationCell"], !isTriple);
+  } else if (owner === "qr") {
+    setFifoChainEndpointDisabled(["qrSourceArea", "qrSourceCell"], isGlobalStep1);
+    setFifoChainEndpointDisabled(["qrSecondSourceArea", "qrSecondSourceCell"], isGlobalStep2);
+    setFifoChainEndpointDisabled(["qrFifoChainStep3SourceArea", "qrFifoChainStep3SourceCell"], isGlobalStep3 || !isTriple);
+    setFifoChainEndpointDisabled(["qrFifoChainStep3DestinationArea", "qrFifoChainStep3DestinationCell"], !isTriple);
+  }
+}
+function syncRouteModeSections() {
+  const scannerMode = normalizeRouteMode(scannerRouteMode?.value);
+  const qrMode = normalizeRouteMode(qrRouteMode?.value);
+  document.querySelectorAll('[data-route-owner="scanner"]').forEach(el => el.classList.toggle("hidden", !["double_area", "fifo_chain"].includes(scannerMode)));
+  document.querySelectorAll('[data-route-owner="qr"]').forEach(el => el.classList.toggle("hidden", !["double_area", "fifo_chain"].includes(qrMode)));
+  document.querySelectorAll('[data-fifo-chain-owner="scanner"]').forEach(el => el.classList.toggle("hidden", scannerMode !== "fifo_chain"));
+  document.querySelectorAll('[data-fifo-chain-owner="qr"]').forEach(el => el.classList.toggle("hidden", qrMode !== "fifo_chain"));
+  syncFifoChainUi("scanner", scannerMode, scannerFifoChainTotalSteps?.value, scannerFifoChainStep1SourceMode?.value, scannerFifoChainStep2SourceMode?.value, scannerFifoChainStep3SourceMode?.value);
+  syncFifoChainUi("qr", qrMode, qrFifoChainTotalSteps?.value, qrFifoChainStep1SourceMode?.value, qrFifoChainStep2SourceMode?.value, qrFifoChainStep3SourceMode?.value);
+}
+function validateRouteConfig(prefix, payload) {
+  const mode = normalizeRouteMode(payload.route_mode);
+  payload.route_mode = mode;
+  if (!["double_area", "fifo_chain"].includes(mode)) return;
+  const hasSource1 = !!payload.source_area_id || !!payload.source_cell_id;
+  const hasDestination1 = !!payload.destination_area_id || !!payload.destination_cell_id;
+  const hasSource2 = !!payload.second_source_area_id || !!payload.second_source_cell_id;
+  const hasDestination2 = !!payload.second_destination_area_id || !!payload.second_destination_cell_id;
+  if (mode === "fifo_chain") {
+    const totalSteps = normalizeFifoChainTotalSteps(payload.fifo_chain_total_steps);
+    const step1SourceMode = normalizeFifoChainSourceMode(payload.fifo_chain_step1_source_mode);
+    const step2SourceMode = normalizeFifoChainSourceMode(payload.fifo_chain_step2_source_mode);
+    const step3SourceMode = normalizeFifoChainSourceMode(payload.fifo_chain_step3_source_mode);
+    const hasSource3 = !!payload.fifo_chain_step3_source_area_id || !!payload.fifo_chain_step3_source_cell_id;
+    const hasDestination3 = !!payload.fifo_chain_step3_destination_area_id || !!payload.fifo_chain_step3_destination_cell_id;
+    payload.fifo_chain_total_steps = totalSteps;
+    payload.fifo_chain_step1_source_mode = step1SourceMode;
+    payload.fifo_chain_step2_source_mode = step2SourceMode;
+    payload.fifo_chain_step3_source_mode = step3SourceMode;
+    if (!hasDestination1) {
+      throw new Error(step1SourceMode === "any_area_by_material" ? "El tramo 1 por material requiere destino 1." : `${prefix}: Flujo doble FIFO requiere destino para tramo 1.`);
+    }
+    if (step1SourceMode === "any_area_by_material") {
+      if (!payload.fifo_chain_step1_material_group_id) {
+        throw new Error("El tramo 1 por material requiere Material requerido tramo 1.");
+      }
+      payload.source_area_id = null;
+      payload.source_cell_id = null;
+    } else if (!hasSource1) {
+      throw new Error(`${prefix}: Flujo doble FIFO requiere origen para tramo 1.`);
+    } else {
+      payload.fifo_chain_step1_material_group_id = null;
+    }
+    if (!hasDestination2) {
+      throw new Error(step2SourceMode === "any_area_by_material" ? "El tramo 2 por material requiere destino 2." : `${prefix}: Flujo doble FIFO requiere destino para tramo 2.`);
+    }
+    if (step2SourceMode === "any_area_by_material") {
+      if (!payload.fifo_chain_step2_material_group_id) {
+        throw new Error("El tramo 2 por material requiere Material requerido tramo 2.");
+      }
+      payload.second_source_area_id = null;
+      payload.second_source_cell_id = null;
+    } else {
+      payload.fifo_chain_step2_material_group_id = null;
+      if (!hasSource2) {
+        throw new Error(`${prefix}: Flujo doble FIFO requiere origen para tramo 2.`);
+      }
+    }
+    if (totalSteps === 2) {
+      payload.fifo_chain_step3_source_mode = "configured_area";
+      payload.fifo_chain_step3_material_group_id = null;
+      payload.fifo_chain_step3_source_area_id = null;
+      payload.fifo_chain_step3_source_cell_id = null;
+      payload.fifo_chain_step3_destination_area_id = null;
+      payload.fifo_chain_step3_destination_cell_id = null;
+      return;
+    }
+    if (step3SourceMode === "any_area_by_material") {
+      if (!payload.fifo_chain_step3_material_group_id) {
+        throw new Error("El tramo 3 por material requiere Material requerido tramo 3.");
+      }
+      if (!hasDestination3) {
+        throw new Error("El tramo 3 por material requiere destino 3.");
+      }
+      payload.fifo_chain_step3_source_area_id = null;
+      payload.fifo_chain_step3_source_cell_id = null;
+      return;
+    }
+    payload.fifo_chain_step3_material_group_id = null;
+    if (!hasSource3 || !hasDestination3) {
+      throw new Error("El tramo 3 requiere origen y destino.");
+    }
+    return;
+  }
+  if (!hasSource1 || !hasDestination1) {
+    throw new Error(`${prefix}: Ruta doble requiere origen y destino para tramo 1.`);
+  }
+  if (!hasSource2 || !hasDestination2) {
+    throw new Error(`${prefix}: Ruta doble requiere origen y destino para tramo 1 y tramo 2.`);
+  }
 }
 function renderQrCatalogOptions() {
-  [scannerSourceArea, scannerDestinationArea, scannerStorageArea, scannerEmptyRackArea, qrSourceArea, qrDestinationArea].forEach((el) => {
+  [scannerSourceArea, scannerDestinationArea, scannerSecondSourceArea, scannerSecondDestinationArea, scannerFifoChainStep3SourceArea, scannerFifoChainStep3DestinationArea, scannerStorageArea, scannerEmptyRackArea, qrSourceArea, qrDestinationArea, qrSecondSourceArea, qrSecondDestinationArea, qrFifoChainStep3SourceArea, qrFifoChainStep3DestinationArea, qrTransitionSourceArea, qrTransitionDestinationArea].forEach((el) => {
     if (!el) return;
     const cur = el.value;
     el.innerHTML = buildAreaOptions(cur);
@@ -3537,7 +3944,7 @@ function renderQrCatalogOptions() {
     scannerCancelReturnArea.innerHTML = buildScannerCancelReturnAreaOptions(cur);
     renderScannerCancelReturnAreaWarning();
   }
-  [scannerDefaultMaterial, qrMaterial].forEach((el) => {
+  [scannerDefaultMaterial, scannerFifoChainStep1Material, scannerFifoChainStep2Material, scannerFifoChainStep3Material, qrMaterial, qrFifoChainStep1Material, qrFifoChainStep2Material, qrFifoChainStep3Material, qrTransitionCurrentMaterial, qrTransitionNextMaterial].forEach((el) => {
     if (!el) return;
     const cur = el.value;
     el.innerHTML = buildMaterialOptions(cur);
@@ -3546,12 +3953,13 @@ function renderQrCatalogOptions() {
     const cur = qrRack.value;
     qrRack.innerHTML = buildRackSelectOptions(cur);
   }
-  [scannerSourceCell, scannerDestinationCell, qrSourceCell, qrDestinationCell].forEach((el) => {
+  [scannerSourceCell, scannerDestinationCell, scannerSecondSourceCell, scannerSecondDestinationCell, scannerFifoChainStep3SourceCell, scannerFifoChainStep3DestinationCell, qrSourceCell, qrDestinationCell, qrSecondSourceCell, qrSecondDestinationCell, qrFifoChainStep3SourceCell, qrFifoChainStep3DestinationCell, qrTransitionSourceCell, qrTransitionDestinationCell].forEach((el) => {
     if (!el) return;
     const cur = el.value;
     el.innerHTML = buildCellOptions(cur);
   });
   renderQrCellSummaries();
+  syncRouteModeSections();
 }
 function clearScannerStationForm() {
   if (!scannerStationId) return;
@@ -3561,10 +3969,15 @@ function clearScannerStationForm() {
   scannerDescription.value = "";
   scannerStationType.value = "generic";
   scannerDefaultAction.value = "preview_only";
+  if (scannerRouteMode) scannerRouteMode.value = "simple_area";
   scannerSourceArea.value = "";
   scannerDestinationArea.value = "";
   scannerSourceCell.value = "";
   scannerDestinationCell.value = "";
+  if (scannerSecondSourceArea) scannerSecondSourceArea.value = "";
+  if (scannerSecondDestinationArea) scannerSecondDestinationArea.value = "";
+  if (scannerSecondSourceCell) scannerSecondSourceCell.value = "";
+  if (scannerSecondDestinationCell) scannerSecondDestinationCell.value = "";
   scannerStorageArea.value = "";
   scannerEmptyRackArea.value = "";
   if (scannerCancelReturnArea) {
@@ -3573,12 +3986,26 @@ function clearScannerStationForm() {
   }
   renderScannerCancelReturnAreaWarning();
   scannerDefaultMaterial.value = "";
+  if (scannerFifoMaterialPolicy) scannerFifoMaterialPolicy.value = "specific_material";
+  if (scannerFifoChainTotalSteps) scannerFifoChainTotalSteps.value = "2";
+  if (scannerFifoChainStep1SourceMode) scannerFifoChainStep1SourceMode.value = "configured_area";
+  if (scannerFifoChainStep1Material) scannerFifoChainStep1Material.value = "";
+  if (scannerFifoChainStep2SourceMode) scannerFifoChainStep2SourceMode.value = "configured_area";
+  if (scannerFifoChainStep2Material) scannerFifoChainStep2Material.value = "";
+  if (scannerFifoChainStep3SourceMode) scannerFifoChainStep3SourceMode.value = "configured_area";
+  if (scannerFifoChainStep3Material) scannerFifoChainStep3Material.value = "";
+  if (scannerFifoChainStep3SourceArea) scannerFifoChainStep3SourceArea.value = "";
+  if (scannerFifoChainStep3DestinationArea) scannerFifoChainStep3DestinationArea.value = "";
+  if (scannerFifoChainStep3SourceCell) scannerFifoChainStep3SourceCell.value = "";
+  if (scannerFifoChainStep3DestinationCell) scannerFifoChainStep3DestinationCell.value = "";
   scannerAgvCode.value = "";
   scannerTaskTyp.value = "";
   scannerPriority.value = 0;
   scannerRequirePreview.value = "0";
   scannerAllowExecute.value = "1";
   scannerActive.value = "1";
+  renderQrCellSummaries();
+  syncRouteModeSections();
 }
 function loadScannerStationForm(id) {
   const item = scannerStations.find(x => Number(x.id) === Number(id));
@@ -3589,13 +4016,25 @@ function loadScannerStationForm(id) {
   scannerDescription.value = item.description || "";
   scannerStationType.value = item.station_type || "generic";
   scannerDefaultAction.value = item.default_action || "preview_only";
+  if (scannerRouteMode) scannerRouteMode.value = normalizeRouteMode(item.route_mode);
   scannerSourceArea.value = item.source_area_id || "";
   scannerDestinationArea.value = item.destination_area_id || "";
   scannerSourceCell.innerHTML = buildCellOptions(item.source_cell_id || "");
   scannerDestinationCell.innerHTML = buildCellOptions(item.destination_cell_id || "");
   scannerSourceCell.value = item.source_cell_id || "";
   scannerDestinationCell.value = item.destination_cell_id || "";
+  if (scannerSecondSourceArea) scannerSecondSourceArea.value = item.second_source_area_id || "";
+  if (scannerSecondDestinationArea) scannerSecondDestinationArea.value = item.second_destination_area_id || "";
+  if (scannerSecondSourceCell) {
+    scannerSecondSourceCell.innerHTML = buildCellOptions(item.second_source_cell_id || "");
+    scannerSecondSourceCell.value = item.second_source_cell_id || "";
+  }
+  if (scannerSecondDestinationCell) {
+    scannerSecondDestinationCell.innerHTML = buildCellOptions(item.second_destination_cell_id || "");
+    scannerSecondDestinationCell.value = item.second_destination_cell_id || "";
+  }
   renderQrCellSummaries();
+  syncRouteModeSections();
   scannerStorageArea.value = item.storage_area_id || "";
   scannerEmptyRackArea.value = item.empty_rack_area_id || "";
   if (scannerCancelReturnArea) {
@@ -3604,6 +4043,25 @@ function loadScannerStationForm(id) {
   }
   renderScannerCancelReturnAreaWarning(item);
   scannerDefaultMaterial.value = item.default_material_group_id || "";
+  if (scannerFifoMaterialPolicy) scannerFifoMaterialPolicy.value = normalizeFifoMaterialPolicy(item.fifo_material_policy);
+  if (scannerFifoChainTotalSteps) scannerFifoChainTotalSteps.value = String(normalizeFifoChainTotalSteps(item.fifo_chain_total_steps));
+  if (scannerFifoChainStep1SourceMode) scannerFifoChainStep1SourceMode.value = normalizeFifoChainSourceMode(item.fifo_chain_step1_source_mode);
+  if (scannerFifoChainStep1Material) scannerFifoChainStep1Material.value = item.fifo_chain_step1_material_group_id || "";
+  if (scannerFifoChainStep2SourceMode) scannerFifoChainStep2SourceMode.value = normalizeFifoChainSourceMode(item.fifo_chain_step2_source_mode);
+  if (scannerFifoChainStep2Material) scannerFifoChainStep2Material.value = item.fifo_chain_step2_material_group_id || "";
+  if (scannerFifoChainStep3SourceMode) scannerFifoChainStep3SourceMode.value = normalizeFifoChainSourceMode(item.fifo_chain_step3_source_mode);
+  if (scannerFifoChainStep3Material) scannerFifoChainStep3Material.value = item.fifo_chain_step3_material_group_id || "";
+  if (scannerFifoChainStep3SourceArea) scannerFifoChainStep3SourceArea.value = item.fifo_chain_step3_source_area_id || "";
+  if (scannerFifoChainStep3DestinationArea) scannerFifoChainStep3DestinationArea.value = item.fifo_chain_step3_destination_area_id || "";
+  if (scannerFifoChainStep3SourceCell) {
+    scannerFifoChainStep3SourceCell.innerHTML = buildCellOptions(item.fifo_chain_step3_source_cell_id || "");
+    scannerFifoChainStep3SourceCell.value = item.fifo_chain_step3_source_cell_id || "";
+  }
+  if (scannerFifoChainStep3DestinationCell) {
+    scannerFifoChainStep3DestinationCell.innerHTML = buildCellOptions(item.fifo_chain_step3_destination_cell_id || "");
+    scannerFifoChainStep3DestinationCell.value = item.fifo_chain_step3_destination_cell_id || "";
+  }
+  syncRouteModeSections();
   scannerAgvCode.value = item.agv_code || "";
   scannerTaskTyp.value = item.task_typ || "";
   scannerPriority.value = item.priority ?? 0;
@@ -3612,20 +4070,37 @@ function loadScannerStationForm(id) {
   scannerActive.value = String(item.is_active ?? 1);
 }
 function scannerStationPayload() {
-  return {
+  const payload = {
     scanner_code: scannerCode.value.trim(),
     name: scannerName.value.trim(),
     description: scannerDescription.value.trim() || null,
     station_type: scannerStationType.value || "generic",
     default_action: scannerDefaultAction.value || "preview_only",
+    route_mode: normalizeRouteMode(scannerRouteMode?.value),
     source_area_id: scannerSourceArea.value ? Number(scannerSourceArea.value) : null,
     destination_area_id: scannerDestinationArea.value ? Number(scannerDestinationArea.value) : null,
     source_cell_id: scannerSourceCell.value ? Number(scannerSourceCell.value) : null,
     destination_cell_id: scannerDestinationCell.value ? Number(scannerDestinationCell.value) : null,
+    fifo_chain_total_steps: normalizeFifoChainTotalSteps(scannerFifoChainTotalSteps?.value),
+    fifo_chain_step1_source_mode: normalizeFifoChainSourceMode(scannerFifoChainStep1SourceMode?.value),
+    fifo_chain_step1_material_group_id: scannerFifoChainStep1Material?.value ? Number(scannerFifoChainStep1Material.value) : null,
+    fifo_chain_step2_source_mode: normalizeFifoChainSourceMode(scannerFifoChainStep2SourceMode?.value),
+    fifo_chain_step2_material_group_id: scannerFifoChainStep2Material?.value ? Number(scannerFifoChainStep2Material.value) : null,
+    fifo_chain_step3_source_mode: normalizeFifoChainSourceMode(scannerFifoChainStep3SourceMode?.value),
+    fifo_chain_step3_material_group_id: scannerFifoChainStep3Material?.value ? Number(scannerFifoChainStep3Material.value) : null,
+    fifo_chain_step3_source_area_id: scannerFifoChainStep3SourceArea?.value ? Number(scannerFifoChainStep3SourceArea.value) : null,
+    fifo_chain_step3_source_cell_id: scannerFifoChainStep3SourceCell?.value ? Number(scannerFifoChainStep3SourceCell.value) : null,
+    fifo_chain_step3_destination_area_id: scannerFifoChainStep3DestinationArea?.value ? Number(scannerFifoChainStep3DestinationArea.value) : null,
+    fifo_chain_step3_destination_cell_id: scannerFifoChainStep3DestinationCell?.value ? Number(scannerFifoChainStep3DestinationCell.value) : null,
+    second_source_area_id: scannerSecondSourceArea?.value ? Number(scannerSecondSourceArea.value) : null,
+    second_destination_area_id: scannerSecondDestinationArea?.value ? Number(scannerSecondDestinationArea.value) : null,
+    second_source_cell_id: scannerSecondSourceCell?.value ? Number(scannerSecondSourceCell.value) : null,
+    second_destination_cell_id: scannerSecondDestinationCell?.value ? Number(scannerSecondDestinationCell.value) : null,
     storage_area_id: scannerStorageArea.value ? Number(scannerStorageArea.value) : null,
     empty_rack_area_id: scannerEmptyRackArea.value ? Number(scannerEmptyRackArea.value) : null,
     cancel_return_area_id: scannerCancelReturnArea?.value ? Number(scannerCancelReturnArea.value) : null,
     default_material_group_id: scannerDefaultMaterial.value ? Number(scannerDefaultMaterial.value) : null,
+    fifo_material_policy: normalizeFifoMaterialPolicy(scannerFifoMaterialPolicy?.value),
     agv_code: scannerAgvCode.value.trim() || null,
     task_typ: scannerTaskTyp.value.trim() || null,
     priority: Number(scannerPriority.value || 0),
@@ -3633,15 +4108,33 @@ function scannerStationPayload() {
     allow_execute: Number(scannerAllowExecute.value || 0),
     is_active: Number(scannerActive.value || 0),
   };
+  validateRouteConfig("Scanner", payload);
+  return payload;
 }
 function renderScannerStationsList() {
   if (!scannerStationsList) return;
-  scannerStationsList.innerHTML = scannerStations.map(s => `
-    <button type="button" class="list-item" data-scanner-id="${s.id}">
-      <b>${escapeHtml(s.scanner_code || "")}</b> ${escapeHtml(s.name || "")}
-      <small>${escapeHtml(s.station_type || "-")} - ${escapeHtml(s.default_action || "-")} - ${Number(s.is_active ?? 0) ? "activo" : "inactivo"}</small>
-      ${scannerCancelReturnAreaListSummary(s)}
-    </button>`).join("") || `<div class="small">Sin scanners configurados.</div>`;
+  if (!scannerStations.length) {
+    scannerStationsList.innerHTML = `<div class="small">Sin scanners configurados.</div>`;
+    return;
+  }
+  const rows = scannerStations.map(s => `
+    <tr class="clickable-row" data-scanner-id="${s.id}">
+      <td><b>${escapeHtml(s.scanner_code || "")}</b><div class="small">${escapeHtml(s.name || "")}</div></td>
+      <td>${escapeHtml(fifoChainFlowLabel(s))}</td>
+      <td>${escapeHtml(routeEndpointLabel(s, "source"))}</td>
+      <td>${escapeHtml(routeEndpointLabel(s, "destination"))}</td>
+      <td>${escapeHtml(fifoChainStep1MaterialDisplay(s))}</td>
+      <td>${escapeHtml(secondaryRouteEndpointLabel(s, "second_source"))}</td>
+      <td>${escapeHtml(secondaryRouteEndpointLabel(s, "second_destination"))}</td>
+      <td>${escapeHtml(fifoChainStep2MaterialDisplay(s))}</td>
+      <td>${escapeHtml(fifoChainStep3EndpointLabel(s, "source"))}</td>
+      <td>${escapeHtml(fifoChainStep3EndpointLabel(s, "destination"))}</td>
+      <td>${escapeHtml(fifoChainStep3MaterialDisplayForList(s))}</td>
+      <td>${escapeHtml(s.default_action || "-")}</td>
+      <td>${escapeHtml(fifoMaterialPolicyLabel(s.fifo_material_policy))}</td>
+      <td>${Number(s.is_active ?? 0) ? "Activo" : "Inactivo"}</td>
+    </tr>`).join("");
+  scannerStationsList.innerHTML = `<table class="diagnosis-table qr-route-table"><thead><tr><th>C&oacute;digo scanner</th><th>Modo de ruta</th><th>Origen 1</th><th>Destino 1</th><th>Material tramo 1</th><th>Origen 2</th><th>Destino 2</th><th>Material tramo 2</th><th>Origen 3</th><th>Destino 3</th><th>Material tramo 3</th><th>Default action</th><th>Modo selecci&oacute;n</th><th>Activo</th></tr></thead><tbody>${rows}</tbody></table>`;
   scannerStationsList.querySelectorAll("[data-scanner-id]").forEach(btn => btn.addEventListener("click", () => loadScannerStationForm(Number(btn.dataset.scannerId))));
 }
 function buildScannerStationOptions(selectedValue = "") {
@@ -3657,11 +4150,21 @@ function renderScanTerminalScannerOptions() {
   const cur = scanTerminalScannerStation.value;
   scanTerminalScannerStation.innerHTML = buildScannerStationOptions(cur);
 }
+function renderQrTransitionScannerOptions() {
+  if (!qrTransitionScanner) return;
+  const cur = qrTransitionScanner.value;
+  qrTransitionScanner.innerHTML = `<option value="">Cualquier scanner</option>` + (scannerStations || []).map(s => {
+    const inactive = Number(s.is_active ?? 0) === 1 ? "" : " - inactivo";
+    const label = `${s.scanner_code || ""}${s.name ? ` - ${s.name}` : ""}${inactive}`;
+    return `<option value="${s.id}" ${String(cur) === String(s.id) ? "selected" : ""}>${escapeHtml(label)}</option>`;
+  }).join("");
+}
 async function loadScannerStations() {
   if (!adminToken) return;
   scannerStations = await fetchJson(API.adminScannerStations, { headers: fetchHeaders() });
   renderScannerStationsList();
   renderScanTerminalScannerOptions();
+  renderQrTransitionScannerOptions();
   renderScanQrScannerOptions();
 }
 async function saveScannerStation() {
@@ -3697,16 +4200,36 @@ function clearQrRuleForm() {
   qrMatchType.value = "exact";
   qrActionType.value = "fifo_request";
   qrMaterial.value = "";
+  if (qrFifoMaterialPolicy) qrFifoMaterialPolicy.value = "specific_material";
+  if (qrFifoChainTotalSteps) qrFifoChainTotalSteps.value = "2";
+  if (qrFifoChainStep1SourceMode) qrFifoChainStep1SourceMode.value = "configured_area";
+  if (qrFifoChainStep1Material) qrFifoChainStep1Material.value = "";
+  if (qrFifoChainStep2SourceMode) qrFifoChainStep2SourceMode.value = "configured_area";
+  if (qrFifoChainStep2Material) qrFifoChainStep2Material.value = "";
+  if (qrFifoChainStep3SourceMode) qrFifoChainStep3SourceMode.value = "configured_area";
+  if (qrFifoChainStep3Material) qrFifoChainStep3Material.value = "";
+  if (qrFifoChainStep3SourceArea) qrFifoChainStep3SourceArea.value = "";
+  if (qrFifoChainStep3DestinationArea) qrFifoChainStep3DestinationArea.value = "";
+  if (qrFifoChainStep3SourceCell) qrFifoChainStep3SourceCell.value = "";
+  if (qrFifoChainStep3DestinationCell) qrFifoChainStep3DestinationCell.value = "";
   qrRack.value = "";
+  if (qrRouteMode) qrRouteMode.value = "simple_area";
   qrSourceArea.value = "";
   qrDestinationArea.value = "";
   qrSourceCell.value = "";
   qrDestinationCell.value = "";
+  if (qrSecondSourceArea) qrSecondSourceArea.value = "";
+  if (qrSecondDestinationArea) qrSecondDestinationArea.value = "";
+  if (qrSecondSourceCell) qrSecondSourceCell.value = "";
+  if (qrSecondDestinationCell) qrSecondDestinationCell.value = "";
   qrPriority.value = "";
   qrAgvCode.value = "";
   qrTaskTyp.value = "";
   qrRequiresScanner.value = "1";
   qrActive.value = "1";
+  renderQrCellSummaries();
+  syncRouteModeSections();
+  syncFifoMaterialPolicyHelp();
 }
 function loadQrRuleForm(id) {
   const item = qrActionRules.find(x => Number(x.id) === Number(id));
@@ -3719,22 +4242,53 @@ function loadQrRuleForm(id) {
   qrMatchType.value = item.match_type || "exact";
   qrActionType.value = item.action_type || "use_scanner_default";
   qrMaterial.value = item.material_group_id || "";
+  if (qrFifoMaterialPolicy) qrFifoMaterialPolicy.value = normalizeFifoMaterialPolicy(item.fifo_material_policy);
+  if (qrFifoChainTotalSteps) qrFifoChainTotalSteps.value = String(normalizeFifoChainTotalSteps(item.fifo_chain_total_steps));
+  if (qrFifoChainStep1SourceMode) qrFifoChainStep1SourceMode.value = normalizeFifoChainSourceMode(item.fifo_chain_step1_source_mode);
+  if (qrFifoChainStep1Material) qrFifoChainStep1Material.value = item.fifo_chain_step1_material_group_id || "";
+  if (qrFifoChainStep2SourceMode) qrFifoChainStep2SourceMode.value = normalizeFifoChainSourceMode(item.fifo_chain_step2_source_mode);
+  if (qrFifoChainStep2Material) qrFifoChainStep2Material.value = item.fifo_chain_step2_material_group_id || "";
+  if (qrFifoChainStep3SourceMode) qrFifoChainStep3SourceMode.value = normalizeFifoChainSourceMode(item.fifo_chain_step3_source_mode);
+  if (qrFifoChainStep3Material) qrFifoChainStep3Material.value = item.fifo_chain_step3_material_group_id || "";
   qrRack.value = item.rack_id || "";
+  if (qrRouteMode) qrRouteMode.value = normalizeRouteMode(item.route_mode);
   qrSourceArea.value = item.source_area_id || "";
   qrDestinationArea.value = item.destination_area_id || "";
   qrSourceCell.innerHTML = buildCellOptions(item.source_cell_id || "");
   qrDestinationCell.innerHTML = buildCellOptions(item.destination_cell_id || "");
   qrSourceCell.value = item.source_cell_id || "";
   qrDestinationCell.value = item.destination_cell_id || "";
+  if (qrSecondSourceArea) qrSecondSourceArea.value = item.second_source_area_id || "";
+  if (qrSecondDestinationArea) qrSecondDestinationArea.value = item.second_destination_area_id || "";
+  if (qrSecondSourceCell) {
+    qrSecondSourceCell.innerHTML = buildCellOptions(item.second_source_cell_id || "");
+    qrSecondSourceCell.value = item.second_source_cell_id || "";
+  }
+  if (qrSecondDestinationCell) {
+    qrSecondDestinationCell.innerHTML = buildCellOptions(item.second_destination_cell_id || "");
+    qrSecondDestinationCell.value = item.second_destination_cell_id || "";
+  }
+  if (qrFifoChainStep3SourceArea) qrFifoChainStep3SourceArea.value = item.fifo_chain_step3_source_area_id || "";
+  if (qrFifoChainStep3DestinationArea) qrFifoChainStep3DestinationArea.value = item.fifo_chain_step3_destination_area_id || "";
+  if (qrFifoChainStep3SourceCell) {
+    qrFifoChainStep3SourceCell.innerHTML = buildCellOptions(item.fifo_chain_step3_source_cell_id || "");
+    qrFifoChainStep3SourceCell.value = item.fifo_chain_step3_source_cell_id || "";
+  }
+  if (qrFifoChainStep3DestinationCell) {
+    qrFifoChainStep3DestinationCell.innerHTML = buildCellOptions(item.fifo_chain_step3_destination_cell_id || "");
+    qrFifoChainStep3DestinationCell.value = item.fifo_chain_step3_destination_cell_id || "";
+  }
   renderQrCellSummaries();
+  syncRouteModeSections();
   qrPriority.value = item.priority ?? "";
   qrAgvCode.value = item.agv_code || "";
   qrTaskTyp.value = item.task_typ || "";
   qrRequiresScanner.value = String(item.requires_scanner_station ?? 1);
   qrActive.value = String(item.is_active ?? 1);
+  syncFifoMaterialPolicyHelp();
 }
 function qrRulePayload() {
-  return {
+  const payload = {
     qr_value: qrValue.value.trim(),
     qr_alias: qrAlias.value.trim() || null,
     description: qrDescription.value.trim() || null,
@@ -3742,17 +4296,36 @@ function qrRulePayload() {
     match_type: qrMatchType.value || "exact",
     action_type: qrActionType.value || "use_scanner_default",
     material_group_id: qrMaterial.value ? Number(qrMaterial.value) : null,
+    fifo_material_policy: normalizeFifoMaterialPolicy(qrFifoMaterialPolicy?.value),
+    fifo_chain_total_steps: normalizeFifoChainTotalSteps(qrFifoChainTotalSteps?.value),
+    fifo_chain_step1_source_mode: normalizeFifoChainSourceMode(qrFifoChainStep1SourceMode?.value),
+    fifo_chain_step1_material_group_id: qrFifoChainStep1Material?.value ? Number(qrFifoChainStep1Material.value) : null,
+    fifo_chain_step2_source_mode: normalizeFifoChainSourceMode(qrFifoChainStep2SourceMode?.value),
+    fifo_chain_step2_material_group_id: qrFifoChainStep2Material?.value ? Number(qrFifoChainStep2Material.value) : null,
+    fifo_chain_step3_source_mode: normalizeFifoChainSourceMode(qrFifoChainStep3SourceMode?.value),
+    fifo_chain_step3_material_group_id: qrFifoChainStep3Material?.value ? Number(qrFifoChainStep3Material.value) : null,
+    fifo_chain_step3_source_area_id: qrFifoChainStep3SourceArea?.value ? Number(qrFifoChainStep3SourceArea.value) : null,
+    fifo_chain_step3_source_cell_id: qrFifoChainStep3SourceCell?.value ? Number(qrFifoChainStep3SourceCell.value) : null,
+    fifo_chain_step3_destination_area_id: qrFifoChainStep3DestinationArea?.value ? Number(qrFifoChainStep3DestinationArea.value) : null,
+    fifo_chain_step3_destination_cell_id: qrFifoChainStep3DestinationCell?.value ? Number(qrFifoChainStep3DestinationCell.value) : null,
     rack_id: qrRack.value ? Number(qrRack.value) : null,
+    route_mode: normalizeRouteMode(qrRouteMode?.value),
     source_area_id: qrSourceArea.value ? Number(qrSourceArea.value) : null,
     destination_area_id: qrDestinationArea.value ? Number(qrDestinationArea.value) : null,
     source_cell_id: qrSourceCell.value ? Number(qrSourceCell.value) : null,
     destination_cell_id: qrDestinationCell.value ? Number(qrDestinationCell.value) : null,
+    second_source_area_id: qrSecondSourceArea?.value ? Number(qrSecondSourceArea.value) : null,
+    second_destination_area_id: qrSecondDestinationArea?.value ? Number(qrSecondDestinationArea.value) : null,
+    second_source_cell_id: qrSecondSourceCell?.value ? Number(qrSecondSourceCell.value) : null,
+    second_destination_cell_id: qrSecondDestinationCell?.value ? Number(qrSecondDestinationCell.value) : null,
     priority: qrPriority.value === "" ? null : Number(qrPriority.value || 0),
     task_typ: qrTaskTyp.value.trim() || null,
     agv_code: qrAgvCode.value.trim() || null,
     requires_scanner_station: Number(qrRequiresScanner.value || 0),
     is_active: Number(qrActive.value || 0),
   };
+  validateRouteConfig("QR", payload);
+  return payload;
 }
 function revokeQrRuleThumbUrls() {
   qrRuleImageObjectUrls.forEach(url => URL.revokeObjectURL(url));
@@ -3796,15 +4369,70 @@ function qrRuleAreaLabel(q, kind) {
   const id = q?.[`${kind}_area_id`];
   return name || (id ? `Área ID ${id}` : "-");
 }
+function routeEndpointLabel(item, kind) {
+  if (
+    kind === "source"
+    && normalizeRouteMode(item?.route_mode) === "fifo_chain"
+    && normalizeFifoChainSourceMode(item?.fifo_chain_step1_source_mode) === "any_area_by_material"
+  ) {
+    return "Cualquier area por material";
+  }
+  const areaName = item?.[`${kind}_area_name`];
+  const areaCode = item?.[`${kind}_area_code`];
+  const areaId = item?.[`${kind}_area_id`];
+  const cellCode = item?.[`${kind}_cell_code`];
+  const cellId = item?.[`${kind}_cell_id`];
+  const area = areaCode && areaName ? `${areaCode} - ${areaName}` : (areaName || areaCode || (areaId ? `Area ID ${areaId}` : ""));
+  const cell = cellCode || (cellId ? `Celda ID ${cellId}` : "");
+  if (area && cell) return `${area} / ${cell}`;
+  return area || cell || "-";
+}
+function secondaryRouteEndpointLabel(item, kind) {
+  const mode = normalizeRouteMode(item?.route_mode);
+  if (!["double_area", "fifo_chain"].includes(mode)) return "-";
+  if (mode === "fifo_chain" && kind === "second_source" && normalizeFifoChainSourceMode(item?.fifo_chain_step2_source_mode) === "any_area_by_material") {
+    return "Cualquier area por material";
+  }
+  return routeEndpointLabel(item, kind);
+}
+function fifoChainStep3EndpointLabel(item, kind) {
+  if (normalizeRouteMode(item?.route_mode) !== "fifo_chain" || normalizeFifoChainTotalSteps(item?.fifo_chain_total_steps) !== 3) return "-";
+  if (kind === "source" && normalizeFifoChainSourceMode(item?.fifo_chain_step3_source_mode) === "any_area_by_material") {
+    return "Cualquier area por material";
+  }
+  const prefix = kind === "source" ? "fifo_chain_step3_source" : "fifo_chain_step3_destination";
+  const areaName = item?.[`${prefix}_area_name`];
+  const areaId = item?.[`${prefix}_area_id`];
+  const cellCode = item?.[`${prefix}_cell_code`];
+  const cellId = item?.[`${prefix}_cell_id`];
+  const area = areaName || (areaId ? `Area ID ${areaId}` : "");
+  const cell = cellCode || (cellId ? `Celda ID ${cellId}` : "");
+  if (area && cell) return `${area} / ${cell}`;
+  return area || cell || "-";
+}
+function fifoChainStep3MaterialDisplayForList(item) {
+  if (normalizeRouteMode(item?.route_mode) !== "fifo_chain" || normalizeFifoChainTotalSteps(item?.fifo_chain_total_steps) !== 3) return "-";
+  return fifoChainStep3MaterialDisplay(item);
+}
 function renderQrRuleMetaHtml(q) {
   const rows = [
     ["Tipo QR", q?.qr_type || "-"],
     ["Coincidencia", q?.match_type || "-"],
     ["Acción", q?.action_type || "-"],
-    ["Material", qrRuleMaterialLabel(q)],
+    ["Material", qrRuleMaterialDisplay(q)],
+    ["Modo seleccion", fifoMaterialPolicyLabel(q?.fifo_material_policy)],
     ["Rack", q?.rack_code || (q?.rack_id ? `Rack ID ${q.rack_id}` : "-")],
-    ["Origen", `${qrRuleAreaLabel(q, "source")} / ${qrRuleCellLabel(q, "source")}`],
-    ["Destino", `${qrRuleAreaLabel(q, "destination")} / ${qrRuleCellLabel(q, "destination")}`],
+    ["Modo de ruta", fifoChainFlowLabel(q)],
+    ["Origen tramo 1", routeEndpointLabel(q, "source")],
+    ["Material tramo 1", fifoChainStep1MaterialDisplay(q)],
+    ["Destino 1", routeEndpointLabel(q, "destination")],
+    ["Origen tramo 2", fifoChainStep2SourceModeLabel(q?.fifo_chain_step2_source_mode)],
+    ["Material tramo 2", fifoChainStep2MaterialDisplay(q)],
+    ["Origen 2", secondaryRouteEndpointLabel(q, "second_source")],
+    ["Destino 2", secondaryRouteEndpointLabel(q, "second_destination")],
+    ["Origen tramo 3", fifoChainStep3EndpointLabel(q, "source")],
+    ["Material tramo 3", fifoChainStep3MaterialDisplayForList(q)],
+    ["Destino tramo 3", fifoChainStep3EndpointLabel(q, "destination")],
     ["Scanner requerido", Number(q?.requires_scanner_station ?? 0) ? "Sí" : "No"],
     ["Estado", Number(q?.is_active ?? 0) ? "Activo" : "Inactivo"],
   ];
@@ -3905,19 +4533,38 @@ function closeQrRulePreviewModal() {
 function renderQrRulesList() {
   if (!qrRulesList) return;
   revokeQrRuleThumbUrls();
-  qrRulesList.innerHTML = qrActionRules.map(q => `
-    <div class="list-item qr-rule-row" data-qr-rule-id="${q.id}" role="button" tabindex="0">
-      <button type="button" class="qr-thumb-button" data-qr-preview-id="${q.id}" title="Ver QR ${escapeHtml(q.qr_value || "")}" aria-label="Ver QR ${escapeHtml(q.qr_value || "")}">
-        <span class="qr-thumb-loading">QR</span>
-        <img class="qr-thumb-img hidden" data-qr-thumb-img="${q.id}" alt="QR ${escapeHtml(q.qr_value || "")}">
-        <span class="qr-thumb-error hidden">QR no disponible</span>
-      </button>
-      <div class="qr-rule-row-main">
-        <b>${escapeHtml(q.qr_value || "")}</b>
-        <span>${escapeHtml(q.qr_alias || "")}</span>
-        <small>${escapeHtml(q.qr_type || "-")} - ${escapeHtml(q.match_type || "-")} - ${escapeHtml(q.action_type || "-")} - ${Number(q.is_active ?? 0) ? "activo" : "inactivo"}</small>
-      </div>
-    </div>`).join("") || `<div class="small">Sin QR configurados.</div>`;
+  if (!qrActionRules.length) {
+    qrRulesList.innerHTML = `<div class="small">Sin QR configurados.</div>`;
+    return;
+  }
+  const rows = qrActionRules.map(q => `
+    <tr class="clickable-row" data-qr-rule-id="${q.id}" tabindex="0">
+      <td>
+        <button type="button" class="qr-thumb-button" data-qr-preview-id="${q.id}" title="Ver QR ${escapeHtml(q.qr_value || "")}" aria-label="Ver QR ${escapeHtml(q.qr_value || "")}">
+          <span class="qr-thumb-loading">QR</span>
+          <img class="qr-thumb-img hidden" data-qr-thumb-img="${q.id}" alt="QR ${escapeHtml(q.qr_value || "")}">
+          <span class="qr-thumb-error hidden">QR no disponible</span>
+        </button>
+      </td>
+      <td><b>${escapeHtml(q.qr_value || "")}</b><div class="small">${escapeHtml(q.qr_alias || "")}</div></td>
+      <td>${escapeHtml(q.action_type || "-")}</td>
+      <td>${escapeHtml(qrRuleMaterialDisplay(q))}</td>
+      <td>${escapeHtml(fifoMaterialPolicyLabel(q.fifo_material_policy))}</td>
+      <td>${escapeHtml(fifoChainFlowLabel(q))}</td>
+      <td>${escapeHtml(routeEndpointLabel(q, "source"))}</td>
+      <td>${escapeHtml(routeEndpointLabel(q, "destination"))}</td>
+      <td>${escapeHtml(fifoChainStep1MaterialDisplay(q))}</td>
+      <td>${escapeHtml(secondaryRouteEndpointLabel(q, "second_source"))}</td>
+      <td>${escapeHtml(secondaryRouteEndpointLabel(q, "second_destination"))}</td>
+      <td>${escapeHtml(fifoChainStep2MaterialDisplay(q))}</td>
+      <td>${escapeHtml(fifoChainStep3EndpointLabel(q, "source"))}</td>
+      <td>${escapeHtml(fifoChainStep3EndpointLabel(q, "destination"))}</td>
+      <td>${escapeHtml(fifoChainStep3MaterialDisplayForList(q))}</td>
+      <td>${escapeHtml(q.agv_code || "-")}</td>
+      <td>${escapeHtml(q.task_typ || "-")}</td>
+      <td>${Number(q.is_active ?? 0) ? "Activo" : "Inactivo"}</td>
+    </tr>`).join("");
+  qrRulesList.innerHTML = `<table class="diagnosis-table qr-route-table"><thead><tr><th>QR le&iacute;do</th><th>Valor</th><th>Acci&oacute;n</th><th>Material</th><th>Modo selecci&oacute;n</th><th>Modo de ruta</th><th>Origen tramo 1</th><th>Destino 1</th><th>Material tramo 1</th><th>Origen 2</th><th>Destino 2</th><th>Material tramo 2</th><th>Origen 3</th><th>Destino 3</th><th>Material tramo 3</th><th>AGV</th><th>Task type</th><th>Activo</th></tr></thead><tbody>${rows}</tbody></table>`;
   qrRulesList.querySelectorAll("[data-qr-rule-id]").forEach(row => {
     row.addEventListener("click", (ev) => {
       if (ev.target.closest("[data-qr-preview-id]")) return;
@@ -3940,6 +4587,7 @@ async function loadQrActionRules() {
   if (!adminToken) return;
   qrActionRules = await fetchJson(API.adminQrActionRules, { headers: fetchHeaders() });
   renderQrRulesList();
+  renderQrTransitionQrOptions();
 }
 async function saveQrRule() {
   if (!adminToken) throw new Error("Admin bloqueado.");
@@ -3958,6 +4606,305 @@ async function disableQrRule() {
   await loadQrActionRules();
   loadQrRuleForm(row.id);
   if (qrAdminMsg) qrAdminMsg.textContent = "QR desactivado.";
+}
+function buildQrActionRuleOptions(selectedValue = "") {
+  const selectedText = String(selectedValue || "");
+  return `<option value="">Cualquier QR</option>` + (qrActionRules || []).map(q => {
+    const alias = q.qr_alias ? ` - ${q.qr_alias}` : "";
+    const inactive = Number(q.is_active ?? 0) === 1 ? "" : " - inactivo";
+    return `<option value="${q.id}" ${selectedText === String(q.id) ? "selected" : ""}>${escapeHtml((q.qr_value || "") + alias + inactive)}</option>`;
+  }).join("");
+}
+function renderQrTransitionQrOptions() {
+  if (!qrTransitionQrRule) return;
+  const cur = qrTransitionQrRule.value;
+  qrTransitionQrRule.innerHTML = buildQrActionRuleOptions(cur);
+}
+function qrTransitionScopeLabel(value) {
+  return value === "any_completed_order" ? "Cualquier orden completada" : "Solo ordenes QR/PDA";
+}
+function qrTransitionMatchModeLabel(value) {
+  return value === "route_simple" ? "Simple por origen/destino" : "Avanzado";
+}
+function normalizeQrTransitionSourceMatchMode(value) {
+  return value === "any_source" ? "any_source" : "configured_source";
+}
+function qrTransitionSourceMatchModeLabel(value) {
+  return normalizeQrTransitionSourceMatchMode(value) === "any_source" ? "Cualquier area" : "Origen configurado";
+}
+function syncQrTransitionModeOptions({ applyDefaults = false } = {}) {
+  const mode = qrTransitionMatchMode?.value || "advanced";
+  const simple = mode === "route_simple";
+  const anySource = normalizeQrTransitionSourceMatchMode(qrTransitionSourceMatchMode?.value) === "any_source";
+  const ignoreCurrentMaterial = Number(qrTransitionIgnoreCurrentMaterial?.value || 0) === 1;
+  if (qrTransitionSimpleHelp) qrTransitionSimpleHelp.classList.toggle("hidden", !simple);
+  if (qrTransitionAnySourceHelp) {
+    qrTransitionAnySourceHelp.textContent = ignoreCurrentMaterial
+      ? "Aplicara desde cualquier area y con cualquier material actual."
+      : "La regla aplicara desde cualquier origen, siempre que coincidan el material actual y el destino configurado.";
+    qrTransitionAnySourceHelp.classList.toggle("hidden", !anySource);
+  }
+  if (qrTransitionCurrentMaterialLabel) {
+    qrTransitionCurrentMaterialLabel.textContent = anySource && !ignoreCurrentMaterial ? "Material actual obligatorio" : "Material actual opcional";
+  }
+  document.querySelectorAll("[data-qr-transition-source-config]").forEach(el => el.classList.toggle("hidden", anySource));
+  [qrTransitionSourceArea, qrTransitionSourceCell].forEach(el => {
+    if (el) el.disabled = anySource || !adminToken;
+  });
+  document.querySelectorAll(".qr-transition-advanced-only").forEach(el => el.classList.toggle("hidden", simple));
+  document.querySelectorAll("[data-qr-transition-current-condition]").forEach(el => el.classList.toggle("hidden", simple && (!anySource || ignoreCurrentMaterial)));
+  if (simple && applyDefaults) {
+    if (qrTransitionScope && (!qrTransitionRuleId?.value || qrTransitionScope.value === "qr_pda")) qrTransitionScope.value = "any_completed_order";
+    if (qrTransitionIgnoreCurrentMaterial && (!qrTransitionRuleId?.value || qrTransitionIgnoreCurrentMaterial.value === "0")) qrTransitionIgnoreCurrentMaterial.value = "1";
+    if (qrTransitionApplyOn) qrTransitionApplyOn.value = "movement_completed";
+  }
+}
+function clearQrTransitionRuleForm() {
+  if (!qrTransitionRuleId) return;
+  qrTransitionRuleId.value = "";
+  qrTransitionName.value = "";
+  qrTransitionDescription.value = "";
+  qrTransitionScope.value = "qr_pda";
+  qrTransitionMatchMode.value = "advanced";
+  qrTransitionSourceMatchMode.value = "configured_source";
+  qrTransitionIgnoreCurrentMaterial.value = "0";
+  qrTransitionQrRule.value = "";
+  qrTransitionScanner.value = "";
+  qrTransitionSourceArea.value = "";
+  qrTransitionDestinationArea.value = "";
+  qrTransitionSourceCell.value = "";
+  qrTransitionDestinationCell.value = "";
+  qrTransitionCurrentMaterial.value = "";
+  qrTransitionCurrentRackStatus.value = "";
+  qrTransitionNextMaterial.value = "";
+  qrTransitionNextRackStatus.value = "";
+  qrTransitionNextQuantity.value = "";
+  qrTransitionClearQuantity.value = "0";
+  qrTransitionNextComment.value = "";
+  qrTransitionAppendComment.value = "1";
+  qrTransitionApplyOn.value = "movement_completed";
+  qrTransitionPriority.value = 0;
+  qrTransitionActive.value = "1";
+  syncQrTransitionModeOptions();
+}
+function loadQrTransitionRuleForm(id) {
+  const item = qrTransitionRules.find(x => Number(x.id) === Number(id));
+  if (!item) return;
+  qrTransitionRuleId.value = item.id;
+  qrTransitionName.value = item.name || "";
+  qrTransitionDescription.value = item.description || "";
+  qrTransitionScope.value = item.scope || "qr_pda";
+  qrTransitionMatchMode.value = item.match_mode || "advanced";
+  qrTransitionSourceMatchMode.value = normalizeQrTransitionSourceMatchMode(item.source_match_mode);
+  qrTransitionIgnoreCurrentMaterial.value = String(item.ignore_current_material ?? 0);
+  qrTransitionQrRule.innerHTML = buildQrActionRuleOptions(item.qr_action_rule_id || "");
+  qrTransitionQrRule.value = item.qr_action_rule_id || "";
+  renderQrTransitionScannerOptions();
+  qrTransitionScanner.value = item.scanner_station_id || "";
+  qrTransitionSourceArea.value = item.source_area_id || "";
+  qrTransitionDestinationArea.value = item.destination_area_id || "";
+  qrTransitionSourceCell.innerHTML = buildCellOptions(item.source_cell_id || "");
+  qrTransitionDestinationCell.innerHTML = buildCellOptions(item.destination_cell_id || "");
+  qrTransitionSourceCell.value = item.source_cell_id || "";
+  qrTransitionDestinationCell.value = item.destination_cell_id || "";
+  qrTransitionCurrentMaterial.value = item.current_material_group_id || "";
+  qrTransitionCurrentRackStatus.value = item.current_rack_status || "";
+  qrTransitionNextMaterial.value = item.next_material_group_id || "";
+  qrTransitionNextRackStatus.value = item.next_rack_status || "";
+  qrTransitionNextQuantity.value = item.next_quantity ?? "";
+  qrTransitionClearQuantity.value = String(item.clear_quantity ?? 0);
+  qrTransitionNextComment.value = item.next_comment || "";
+  qrTransitionAppendComment.value = String(item.append_comment ?? 1);
+  qrTransitionApplyOn.value = item.apply_on || "movement_completed";
+  qrTransitionPriority.value = item.priority ?? 0;
+  qrTransitionActive.value = String(item.is_active ?? 1);
+  syncQrTransitionModeOptions();
+}
+function qrTransitionRulePayload() {
+  const payload = {
+    name: qrTransitionName.value.trim(),
+    description: qrTransitionDescription.value.trim() || null,
+    scope: qrTransitionScope.value || "qr_pda",
+    match_mode: qrTransitionMatchMode.value || "advanced",
+    source_match_mode: normalizeQrTransitionSourceMatchMode(qrTransitionSourceMatchMode?.value),
+    ignore_current_material: Number(qrTransitionIgnoreCurrentMaterial.value || 0),
+    qr_action_rule_id: qrTransitionQrRule.value ? Number(qrTransitionQrRule.value) : null,
+    scanner_station_id: qrTransitionScanner.value ? Number(qrTransitionScanner.value) : null,
+    source_area_id: qrTransitionSourceArea.value ? Number(qrTransitionSourceArea.value) : null,
+    destination_area_id: qrTransitionDestinationArea.value ? Number(qrTransitionDestinationArea.value) : null,
+    source_cell_id: qrTransitionSourceCell.value ? Number(qrTransitionSourceCell.value) : null,
+    destination_cell_id: qrTransitionDestinationCell.value ? Number(qrTransitionDestinationCell.value) : null,
+    current_material_group_id: qrTransitionCurrentMaterial.value ? Number(qrTransitionCurrentMaterial.value) : null,
+    current_rack_status: qrTransitionCurrentRackStatus.value.trim() || null,
+    next_material_group_id: qrTransitionNextMaterial.value ? Number(qrTransitionNextMaterial.value) : null,
+    next_rack_status: qrTransitionNextRackStatus.value.trim() || null,
+    next_quantity: qrTransitionNextQuantity.value === "" ? null : Number(qrTransitionNextQuantity.value),
+    clear_quantity: Number(qrTransitionClearQuantity.value || 0),
+    next_comment: qrTransitionNextComment.value.trim() || null,
+    append_comment: Number(qrTransitionAppendComment.value || 0),
+    apply_on: qrTransitionApplyOn.value || "movement_completed",
+    priority: Number(qrTransitionPriority.value || 0),
+    is_active: Number(qrTransitionActive.value || 0),
+  };
+  if (!["qr_pda", "any_completed_order"].includes(payload.scope)) throw new Error("Alcance invalido.");
+  if (!["advanced", "route_simple"].includes(payload.match_mode)) throw new Error("Modo de coincidencia invalido.");
+  if (!["configured_source", "any_source"].includes(payload.source_match_mode)) throw new Error("Origen de transicion invalido.");
+  if (payload.source_match_mode === "any_source") {
+    payload.source_area_id = null;
+    payload.source_cell_id = null;
+    if (!payload.destination_area_id && !payload.destination_cell_id) {
+      throw new Error("La transicion desde cualquier area requiere destino y material siguiente.");
+    }
+    if (!payload.next_material_group_id && !payload.next_rack_status) {
+      throw new Error("La transicion desde cualquier area requiere destino y material siguiente.");
+    }
+    if (!Number(payload.ignore_current_material || 0) && !payload.current_material_group_id) {
+      throw new Error("Cualquier area requiere Material actual cuando no se ignora el material.");
+    }
+  }
+  if (payload.match_mode === "route_simple") {
+    if (!payload.next_material_group_id) throw new Error("En modo simple selecciona Material despues de completar.");
+    if (!payload.source_area_id && !payload.destination_area_id && !payload.source_cell_id && !payload.destination_cell_id) {
+      throw new Error("En modo simple selecciona al menos un origen/destino por area o celda.");
+    }
+    payload.apply_on = "movement_completed";
+  }
+  return payload;
+}
+function transitionLabel(...values) {
+  return values.map(v => String(v || "").trim()).filter(Boolean).join(" - ") || "-";
+}
+function qrTransitionSourceLabel(rule) {
+  return normalizeQrTransitionSourceMatchMode(rule?.source_match_mode) === "any_source"
+    ? "Cualquier area"
+    : transitionLabel(rule?.source_cell_code, rule?.source_area_code, rule?.source_area_name);
+}
+function renderQrTransitionRulesList() {
+  if (!qrTransitionRulesList) return;
+  if (!qrTransitionRules.length) {
+    qrTransitionRulesList.innerHTML = `<div class="small">Sin transiciones configuradas.</div>`;
+    return;
+  }
+  const rows = qrTransitionRules.map(rule => `
+    <tr>
+      <td>${escapeHtml(rule.name || "-")}</td>
+      <td>${escapeHtml(qrTransitionScopeLabel(rule.scope))}</td>
+      <td>${escapeHtml(qrTransitionMatchModeLabel(rule.match_mode))}</td>
+      <td>${escapeHtml(qrTransitionSourceMatchModeLabel(rule.source_match_mode))}</td>
+      <td>${escapeHtml(transitionLabel(rule.qr_action_rule_value, rule.qr_action_rule_alias))}</td>
+      <td>${escapeHtml(transitionLabel(rule.scanner_station_code, rule.scanner_station_name))}</td>
+      <td>${escapeHtml(qrTransitionSourceLabel(rule))}</td>
+      <td>${escapeHtml(transitionLabel(rule.destination_cell_code, rule.destination_area_code, rule.destination_area_name))}</td>
+      <td>${escapeHtml(Number(rule.ignore_current_material ?? 0) ? "Ignorado" : transitionLabel(rule.current_material_group_code, rule.current_material_group_name))}</td>
+      <td>${escapeHtml(transitionLabel(rule.next_material_group_code, rule.next_material_group_name))}</td>
+      <td>${Number(rule.ignore_current_material ?? 0) ? "Si" : "No"}</td>
+      <td>${escapeHtml(rule.priority ?? 0)}</td>
+      <td>${Number(rule.is_active ?? 0) ? "Si" : "No"}</td>
+      <td>${escapeHtml(rule.applied_count ?? 0)}</td>
+      <td>${escapeHtml(rule.last_applied_at ? (toLocalInputValue(rule.last_applied_at).replace("T", " ") || rule.last_applied_at) : "-")}</td>
+      <td><button class="btn ghost small-btn" type="button" data-qr-transition-edit="${rule.id}">Editar</button></td>
+    </tr>`).join("");
+  qrTransitionRulesList.innerHTML = `<table class="diagnosis-table"><thead><tr><th>Nombre</th><th>Alcance</th><th>Modo</th><th>Origen de transici&oacute;n</th><th>QR asociado</th><th>Scanner</th><th>Origen</th><th>Destino</th><th>Material actual</th><th>Material siguiente</th><th>Ignorar material actual</th><th>Prioridad</th><th>Activo</th><th>Applied count</th><th>Last applied</th><th>Acciones</th></tr></thead><tbody>${rows}</tbody></table>`;
+  qrTransitionRulesList.querySelectorAll("[data-qr-transition-edit]").forEach(btn => btn.addEventListener("click", () => loadQrTransitionRuleForm(Number(btn.dataset.qrTransitionEdit))));
+}
+async function loadQrTransitionRules() {
+  if (!adminToken) return;
+  qrTransitionRules = await fetchJson(API.adminQrTransitionRules, { headers: fetchHeaders() });
+  renderQrTransitionRulesList();
+}
+async function saveQrTransitionRule() {
+  if (!adminToken) throw new Error("Admin bloqueado.");
+  const id = qrTransitionRuleId.value ? Number(qrTransitionRuleId.value) : null;
+  const url = id ? API.adminQrTransitionRule(id) : API.adminQrTransitionRules;
+  const method = id ? "PUT" : "POST";
+  await fetchJson(url, { method, headers: { "Content-Type": "application/json", ...fetchHeaders() }, body: JSON.stringify(qrTransitionRulePayload()) });
+  await loadQrTransitionRules();
+  if (id) loadQrTransitionRuleForm(id);
+  if (qrAdminMsg) qrAdminMsg.textContent = "Transicion guardada.";
+}
+async function disableQrTransitionRule() {
+  if (!adminToken) throw new Error("Admin bloqueado.");
+  const id = qrTransitionRuleId.value ? Number(qrTransitionRuleId.value) : null;
+  if (!id) throw new Error("Selecciona una transicion.");
+  const row = await fetchJson(API.adminQrTransitionRule(id), { method: "DELETE", headers: fetchHeaders() });
+  await loadQrTransitionRules();
+  loadQrTransitionRuleForm(row.id);
+  if (qrAdminMsg) qrAdminMsg.textContent = "Transicion desactivada.";
+}
+function renderQrTransitionPreview(data) {
+  if (!qrTransitionPreviewResult) return;
+  if (!data) {
+    qrTransitionPreviewResult.textContent = "Sin preview.";
+    return;
+  }
+  const rack = data.rack || {};
+  const rule = data.matched_rule || null;
+  const simpleRuleMessage = rule?.match_mode === "route_simple" ? "Regla simple por origen/destino encontrada." : "";
+  const anySourceMessage = normalizeQrTransitionSourceMatchMode(rule?.source_match_mode) === "any_source"
+    ? "Regla desde cualquier area encontrada."
+    : "";
+  qrTransitionPreviewResult.innerHTML = `
+    <div><b>movement_order_id:</b> ${escapeHtml(data.movement_order_id || "-")}</div>
+    <div><b>Rack:</b> ${escapeHtml(transitionLabel(rack.code, rack.name))}</div>
+    <div><b>Material actual:</b> ${escapeHtml(transitionLabel(data.current_material?.code, data.current_material?.name))}</div>
+    <div><b>Regla encontrada:</b> ${escapeHtml(rule ? transitionLabel(rule.id, rule.name) : "No hay transicion configurada para esta orden.")}</div>
+    ${simpleRuleMessage ? `<div><b>${escapeHtml(simpleRuleMessage)}</b></div>` : ""}
+    ${anySourceMessage ? `<div><b>${escapeHtml(anySourceMessage)}</b></div>` : ""}
+    <div><b>Alcance:</b> ${escapeHtml(rule ? qrTransitionScopeLabel(rule.scope) : "-")}</div>
+    <div><b>Modo:</b> ${escapeHtml(rule ? qrTransitionMatchModeLabel(rule.match_mode) : "-")}</div>
+    <div><b>Origen:</b> ${escapeHtml(rule ? qrTransitionSourceLabel(rule) : "-")}</div>
+    <div><b>Ignorar material actual:</b> ${escapeHtml(rule ? (Number(rule.ignore_current_material ?? 0) ? "Si" : "No") : "-")}</div>
+    <div><b>Material siguiente:</b> ${escapeHtml(transitionLabel(data.next_material?.code, data.next_material?.name))}</div>
+    <div><b>Candidatas:</b> ${escapeHtml(data.candidate_count ?? 0)}</div>
+    <div><b>Mensaje:</b> ${escapeHtml(data.message || "-")}</div>
+  `;
+}
+async function previewQrTransition() {
+  if (!adminToken) throw new Error("Admin bloqueado.");
+  const id = qrTransitionPreviewOrderId?.value ? Number(qrTransitionPreviewOrderId.value) : null;
+  if (!id) throw new Error("Captura un MovementOrder ID.");
+  const data = await fetchJson(API.adminQrTransitionPreview(id), { headers: fetchHeaders() });
+  renderQrTransitionPreview(data);
+  if (qrAdminMsg) qrAdminMsg.textContent = "Preview de transicion generado. No se modifico ningun dato.";
+}
+function renderQrTransitionLogs() {
+  if (!qrTransitionLogsList) return;
+  if (!qrTransitionLogs.length) {
+    qrTransitionLogsList.innerHTML = `<div class="small">Sin historial de transiciones.</div>`;
+    return;
+  }
+  const rows = qrTransitionLogs.map(log => `
+    <tr>
+      <td>${escapeHtml(log.created_at ? (toLocalInputValue(log.created_at).replace("T", " ") || log.created_at) : "-")}</td>
+      <td>${escapeHtml(transitionLabel(log.transition_rule_id, log.transition_rule_name))}</td>
+      <td>${escapeHtml(transitionLabel(log.movement_order_id, log.order_code))}</td>
+      <td>${escapeHtml(transitionLabel(log.rack_code, log.rack_id))}</td>
+      <td>${escapeHtml(transitionLabel(log.previous_material_group_name, log.previous_material_group_id))}</td>
+      <td>${escapeHtml(transitionLabel(log.next_material_group_name, log.next_material_group_id))}</td>
+      <td>${escapeHtml(log.status || "-")}</td>
+      <td>${escapeHtml(log.message || "-")}</td>
+    </tr>`).join("");
+  qrTransitionLogsList.innerHTML = `<table class="diagnosis-table"><thead><tr><th>Fecha</th><th>Regla</th><th>Orden</th><th>Rack</th><th>Material anterior</th><th>Material nuevo</th><th>Status</th><th>Mensaje</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+async function loadQrTransitionLogs() {
+  if (!adminToken) return;
+  qrTransitionLogs = await fetchJson(API.adminQrTransitionLogs, { headers: fetchHeaders() });
+  renderQrTransitionLogs();
+}
+async function applyQrTransitionManual() {
+  if (!adminToken) throw new Error("Admin bloqueado.");
+  const id = qrTransitionPreviewOrderId?.value ? Number(qrTransitionPreviewOrderId.value) : null;
+  if (!id) throw new Error("Captura un MovementOrder ID.");
+  const result = await fetchJson(API.adminQrTransitionApply(id), { method: "POST", headers: fetchHeaders() });
+  renderQrTransitionPreview({
+    movement_order_id: result.movement_order_id,
+    rack: { id: result.rack_id },
+    matched_rule: result.transition_rule_id ? { id: result.transition_rule_id, name: "" } : null,
+    candidate_count: "-",
+    message: result.message || "-",
+  });
+  await Promise.all([loadQrTransitionRules(), loadQrTransitionLogs()]);
+  if (qrAdminMsg) qrAdminMsg.textContent = result.message || "Aplicacion de transicion finalizada.";
 }
 function clearScanTerminalForm() {
   if (!scanTerminalId) return;
@@ -4107,6 +5054,57 @@ function cellPayloadLabel(cell) {
 function previewDetailRow(label, value) {
   return `<div><b>${escapeHtml(label)}:</b> ${escapeHtml(value == null || value === "" ? "-" : value)}</div>`;
 }
+function previewRoutePointsRows(result) {
+  const points = Array.isArray(result?.route_points) ? result.route_points : [];
+  if (!points.length) return "";
+  return points.map((point, idx) => {
+    const label = point?.role === "source_1" ? "Origen 1"
+      : point?.role === "destination_1" ? "Destino 1"
+      : point?.role === "source_2" ? "Origen 2"
+      : point?.role === "destination_2" ? "Destino 2"
+      : `Punto ${idx + 1}`;
+    const area = entityLabel(point?.area, "");
+    const cell = cellPayloadLabel(point?.cell);
+    return previewDetailRow(label, `${area || "-"} / ${cell}`);
+  }).join("");
+}
+function previewFifoChainStepsRows(result) {
+  const steps = Array.isArray(result?.fifo_chain_steps) ? result.fifo_chain_steps.slice() : (Array.isArray(result?.trmx_steps) ? result.trmx_steps.slice() : []);
+  const totalSteps = normalizeFifoChainTotalSteps(result?.fifo_chain_total_steps ?? result?.trmx_total_steps);
+  if (totalSteps === 3 && !steps.some(step => Number(step?.step || 0) === 3)) {
+    steps.push({
+      step: 3,
+      source_mode: result?.fifo_chain_step3_source_mode,
+      step3_material: result?.fifo_chain_step3_material,
+      source: result?.fifo_chain_step3_source,
+      destination: result?.fifo_chain_step3_destination,
+    });
+  }
+  if (!steps.length) return "";
+  return steps.map((step) => {
+    const sourceMode = normalizeFifoChainStep2SourceMode(step?.source_mode || step?.source?.source_mode);
+    const isGlobalStep1 = Number(step?.step || 0) === 1 && sourceMode === "any_area_by_material";
+    const isGlobalStep2 = Number(step?.step || 0) === 2 && sourceMode === "any_area_by_material";
+    const isGlobalStep3 = Number(step?.step || 0) === 3 && sourceMode === "any_area_by_material";
+    const materialLabel = entityLabel(step?.step1_material || step?.step2_material || step?.step3_material || result?.fifo_chain_step1_material || result?.fifo_chain_step2_material || result?.fifo_chain_step3_material, "");
+    const source = isGlobalStep1 || isGlobalStep2 || isGlobalStep3
+      ? `Cualquier area con material ${materialLabel || "-"}`
+      : `${entityLabel(step?.source?.area, "") || "-"} / ${cellPayloadLabel(step?.source?.cell)}`;
+    const destination = `${entityLabel(step?.destination?.area, "") || "-"} / ${cellPayloadLabel(step?.destination?.cell)}`;
+    const stepNumber = Number(step?.step || 0);
+    const rowLabel = `Tramo ${stepNumber || "-"}`;
+    const row = previewDetailRow(rowLabel, `${source} -> ${destination}`);
+    if (isGlobalStep1) {
+      const rack = entityLabel(step?.source?.rack, "");
+      const cell = cellPayloadLabel(step?.source?.cell);
+      const candidate = rack || cell ? previewDetailRow("Candidato tramo 1", `${rack || "-"} / ${cell}`) : "";
+      return row + candidate + previewDetailRow("Nota tramo 1", "El rack del tramo 1 se seleccionara al ejecutar.");
+    }
+    if (isGlobalStep2) return row + previewDetailRow("Nota tramo 2", "El rack del tramo 2 se revalidara al finalizar el tramo 1.");
+    if (isGlobalStep3) return row + previewDetailRow("Nota tramo 3", "El rack del tramo 3 se revalidara al finalizar el tramo 2.");
+    return row;
+  }).join("");
+}
 function renderScanQrPreviewResult(result) {
   if (!scanQrResultPanel) return;
   const ok = !!result?.ok;
@@ -4128,8 +5126,11 @@ function renderScanQrPreviewResult(result) {
       ${previewDetailRow("Tipo QR", qr.qr_type || result?.parsed?.parsed_type || "-")}
       ${previewDetailRow("Material", entityLabel(result?.material))}
       ${previewDetailRow("Rack", entityLabel(result?.rack_selected))}
+      ${previewDetailRow("Modo de ruta", routeModeLabel(result?.route_mode))}
       ${previewDetailRow("Origen", `${entityLabel(source.area)} / ${cellPayloadLabel(source.cell)}`)}
       ${previewDetailRow("Destino", `${entityLabel(destination.area)} / ${cellPayloadLabel(destination.cell)}`)}
+      ${previewRoutePointsRows(result)}
+      ${previewFifoChainStepsRows(result)}
       ${previewDetailRow("Orden", result?.movement_order_id || result?.existing_movement_order_id || "-")}
       ${previewDetailRow("RCS", result?.dispatch_status || result?.rcs_status || result?.movement_order?.dispatch_status || "-")}
       ${previewDetailRow("Evento", result?.scan_event_id || "-")}
@@ -4241,11 +5242,11 @@ async function loadQrAdminData() {
   renderQrCatalogOptions();
   if (!adminToken) return;
   await loadScannerStations();
-  await Promise.all([loadQrActionRules(), loadScanTerminals(), loadScanEvents()]);
+  await Promise.all([loadQrActionRules(), loadScanTerminals(), loadScanEvents(), loadQrTransitionRules(), loadQrTransitionLogs()]);
 }
 function activateQrPanel(name) {
   document.querySelectorAll("#card-qr-scanners .qr-tab").forEach(btn => btn.classList.toggle("active", btn.dataset.qrTab === name));
-  const panelMap = { stations: "qrPanelStations", rules: "qrPanelRules", terminals: "qrPanelTerminals", events: "qrPanelEvents" };
+  const panelMap = { stations: "qrPanelStations", rules: "qrPanelRules", terminals: "qrPanelTerminals", events: "qrPanelEvents", transitions: "qrPanelTransitions" };
   Object.entries(panelMap).forEach(([key, id]) => {
     const panel = document.getElementById(id);
     if (panel) panel.classList.toggle("active", key === name);
@@ -4253,12 +5254,21 @@ function activateQrPanel(name) {
   if (name === "terminals" && adminToken) {
     loadScanTerminals().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; });
   }
+  if (name === "transitions" && adminToken) {
+    renderQrCatalogOptions();
+    renderQrTransitionScannerOptions();
+    renderQrTransitionQrOptions();
+    loadQrTransitionRules().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; });
+    loadQrTransitionLogs().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; });
+  }
 }
 
 function clearAreaForm() {
+  finishEditingLock("areas", { applyPending: false });
   areaId.value = ""; areaCode.value = ""; areaName.value = ""; areaType.value = "almacen"; areaColor.value = "#4f46e5"; areaPriority.value = 0; areaActive.value = 1; if (areaMatterArea) areaMatterArea.value = ""; areaDescription.value = "";
 }
 function loadAreaForm(id) {
+  finishEditingLock("areas", { applyPending: false });
   const item = catalog.areas.find(a => Number(a.id) === Number(id));
   if (!item) return;
   areaId.value = item.id; areaCode.value = item.code; areaName.value = item.name; areaType.value = item.area_type; areaColor.value = item.color || "#4f46e5"; areaPriority.value = item.priority ?? 0; areaActive.value = String(item.is_active ?? 1); if (areaMatterArea) areaMatterArea.value = item.matter_area || ""; areaDescription.value = item.description || "";
@@ -4293,17 +5303,21 @@ function refreshRackReservationFieldsForSelection() {
 async function refreshReservationUiState() {
   await loadLocations();
   await loadCatalog();
-  renderRackOptions();
-  const selectedLoc = getLocationAtGrid(selected.x, selected.y);
-  if (isMultiSelectionActive()) {
-    multiSelectedLocationIds = new Set(Array.from(multiSelectedLocationIds).filter(id => getLocationById(id)));
-    fillMultiCellForm();
-  } else if (selectedLoc) {
-    fillCellForm(selectedLoc);
+  if (isEditingLockEffective("cell")) {
+    deferAdminRefresh();
+  } else {
+    renderRackOptions();
+    const selectedLoc = getLocationAtGrid(selected.x, selected.y);
+    if (isMultiSelectionActive()) {
+      multiSelectedLocationIds = new Set(Array.from(multiSelectedLocationIds).filter(id => getLocationById(id)));
+      fillMultiCellForm();
+    } else if (selectedLoc) {
+      fillCellForm(selectedLoc);
+    }
+    setCellBulkControlsState();
+    refreshRackReservationFieldsForSelection();
+    if (!isMultiSelectionActive()) syncCellReservationFromRackSelection();
   }
-  setCellBulkControlsState();
-  refreshRackReservationFieldsForSelection();
-  if (!isMultiSelectionActive()) syncCellReservationFromRackSelection();
   draw();
 }
 async function refreshBackground() {
@@ -4863,6 +5877,7 @@ function setCellBulkControlsState() {
 }
 function setPrimarySelection(loc, { preserveMulti = false } = {}) {
   if (!loc) return;
+  finishEditingLock("cell", { applyPending: false });
   selected = { x: Number(loc.x), y: Number(loc.y) };
   if (!preserveMulti) multiSelectedLocationIds.clear();
   if (isMultiSelectionActive()) fillMultiCellForm();
@@ -4906,6 +5921,7 @@ async function saveMultiSelectedCells() {
     }
   }
   await loadLocations();
+  finishEditingLock("cell", { applyPending: false });
   await refreshReservationUiState();
   const ids = new Set(rows.map(loc => Number(loc.id)));
   multiSelectedLocationIds = new Set(locations.filter(loc => loc && ids.has(Number(loc.id))).map(loc => Number(loc.id)));
@@ -4939,6 +5955,7 @@ async function saveSelectedCell() {
     loc = await fetchJson(API.adminLocPatch(selected.x, selected.y), { headers: { ...fetchHeaders() } });
   }
   locations[idx(selected.x, selected.y)] = loc;
+  finishEditingLock("cell", { applyPending: false });
   await refreshReservationUiState();
   cellMsg.textContent = `Celda (${selected.x}, ${selected.y}) guardada.`;
 }
@@ -4963,10 +5980,12 @@ async function saveArea() {
   const payload = { code: areaCode.value.trim(), name: areaName.value.trim(), description: areaDescription.value.trim() || null, matter_area: areaMatterArea?.value?.trim() || null, color: areaColor.value || "#4f46e5", area_type: areaType.value.trim() || "almacen", is_active: Number(areaActive.value || 1), priority: Number(areaPriority.value || 0) };
   const url = areaId.value ? API.adminArea(Number(areaId.value)) : API.adminAreas;
   const method = areaId.value ? "PUT" : "POST";
+  const wasUpdate = !!areaId.value;
   await fetchJson(url, { method, headers: { "Content-Type": "application/json", ...fetchHeaders() }, body: JSON.stringify(payload) });
+  finishEditingLock("areas", { applyPending: false });
   await loadCatalog();
-  areaMsg.textContent = areaId.value ? "Área actualizada." : "Área creada.";
-  if (!areaId.value) clearAreaForm();
+  areaMsg.textContent = wasUpdate ? "Área actualizada." : "Área creada.";
+  if (!wasUpdate) clearAreaForm();
 }
 async function saveMaterial() {
   const payload = { code: materialCode.value.trim(), name: materialName.value.trim(), description: materialDescription.value.trim() || null, color: materialColor.value || randomMaterialColor(), is_active: Number(materialActive.value || 1) };
@@ -4984,6 +6003,7 @@ async function deleteArea() {
   const name = item ? `${item.code} - ${item.name}` : `ID ${areaId.value}`;
   if (!window.confirm(`¿Deseas borrar el área ${name}?`)) return;
   await fetchJson(API.adminArea(Number(areaId.value)), { method: "DELETE", headers: { ...fetchHeaders() } });
+  finishEditingLock("areas", { applyPending: false });
   await loadCatalog();
   clearAreaForm();
   areaMsg.textContent = 'Área eliminada.';
@@ -5066,6 +6086,47 @@ async function refreshAfterDispatchError() {
   draw();
 }
 
+function isFifoChainOrder(order) {
+  return normalizeRouteMode(order?.route_mode) === "fifo_chain"
+    || !!(order?.fifo_chain_group_id || order?.trmx_group_id);
+}
+
+function fifoChainOrderInfo(order) {
+  if (!isFifoChainOrder(order)) return null;
+  const step = Number(order?.fifo_chain_step ?? order?.trmx_step ?? 0) || null;
+  const total = Number(order?.fifo_chain_total_steps ?? order?.trmx_total_steps ?? 2) || 2;
+  const groupId = String(order?.fifo_chain_group_id || order?.trmx_group_id || "").trim();
+  const groupShort = groupId ? groupId.slice(0, 8) : "-";
+  const status = String(order?.fifo_chain_status || order?.trmx_status || "").trim();
+  const parentOrderId = order?.fifo_chain_parent_order_id ?? order?.trmx_parent_order_id;
+  return { step, total, groupShort, status, parentOrderId };
+}
+
+function fifoChainOrderSummaryHtml(order) {
+  const info = fifoChainOrderInfo(order);
+  if (!info) return "";
+  const parts = [
+    "Flujo doble FIFO",
+    `Paso ${info.step || "-"}/${info.total || "-"}`,
+    `Grupo ${info.groupShort}`,
+  ];
+  if (info.status) parts.push(`Estado ${info.status}`);
+  if (info.step === 2 && info.parentOrderId) parts.push(`Generada por orden ${info.parentOrderId}`);
+  return `<div class="fifo-chain-history-badge">${escapeHtml(parts.join(" · "))}</div>`;
+}
+
+function fifoChainDeveloperNoteHtml(order) {
+  const info = fifoChainOrderInfo(order);
+  if (!info) return "";
+  if (info.step === 1) {
+    return `<div class="fifo-chain-history-note">Al simular completed se creará/despachará el paso 2 automáticamente.</div>`;
+  }
+  if (info.step === 2) {
+    return `<div class="fifo-chain-history-note">Último paso del Flujo doble FIFO. No se crearán más órdenes.</div>`;
+  }
+  return "";
+}
+
 function renderOrdersList() {
   if (!ordersList) return;
   if (!movementOrders.length) {
@@ -5086,6 +6147,7 @@ function renderOrdersList() {
         <div class="small">${auditText} · ${order.rack_code}</div>
         <div class="small">Orden: ${order.order_type || '-'} · AGV: ${order.agv_code || '-'} · Tipo tarea: ${order.task_typ || '-'}</div>
         <div class="small">${areaText}</div>
+        ${fifoChainOrderSummaryHtml(order)}
         <div class="small">${new Date(order.created_at).toLocaleString()}</div>
       </button>
       <button type="button" class="btn danger order-cancel-btn" data-cancel-order-id="${order.order_id}" title="${escapeHtml(cancelTitle || '')}"${cancelDisabled}>Cancelar</button>
@@ -5332,9 +6394,13 @@ function renderSelectedOrderDetail(order) {
   const currentCell = order.current_cell ? (order.current_cell.code || `(${order.current_cell.x}, ${order.current_cell.y})`) : 'Sin ubicación';
   const unavailableReason = historyOrderUnavailableReason(order);
   const unavailableHtml = unavailableReason ? `<div class="small"><b>Acciones historial:</b> ${escapeHtml(unavailableReason)}</div>` : '';
+  const fifoChainSummary = fifoChainOrderSummaryHtml(order);
+  const fifoChainNote = fifoChainDeveloperNoteHtml(order);
   orderDetailBox.innerHTML = `
     <div class="small"><b>Orden:</b> ${order.order_code}</div>
     <div class="small"><b>Estado:</b> ${order.status}</div>
+    ${fifoChainSummary}
+    ${fifoChainNote}
     ${unavailableHtml}
     <div class="small"><b>Tipo orden:</b> ${order.order_type || '-'}</div>
     <div class="small"><b>Rack:</b> ${order.rack_code}</div>
@@ -6803,15 +7869,36 @@ btnNewScannerStation?.addEventListener("click", () => { clearScannerStationForm(
 btnSaveScannerStation?.addEventListener("click", () => saveScannerStation().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
 btnDisableScannerStation?.addEventListener("click", () => disableScannerStation().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
 scannerCancelReturnArea?.addEventListener("change", () => renderScannerCancelReturnAreaWarning());
+scannerRouteMode?.addEventListener("change", syncRouteModeSections);
+scannerFifoChainTotalSteps?.addEventListener("change", syncRouteModeSections);
+scannerFifoChainStep1SourceMode?.addEventListener("change", syncRouteModeSections);
+scannerFifoChainStep2SourceMode?.addEventListener("change", syncRouteModeSections);
+scannerFifoChainStep3SourceMode?.addEventListener("change", syncRouteModeSections);
 btnNewQrRule?.addEventListener("click", () => { clearQrRuleForm(); if (qrAdminMsg) qrAdminMsg.textContent = ""; });
 btnSaveQrRule?.addEventListener("click", () => saveQrRule().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
 btnDisableQrRule?.addEventListener("click", () => disableQrRule().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
+qrRouteMode?.addEventListener("change", syncRouteModeSections);
+qrFifoChainTotalSteps?.addEventListener("change", syncRouteModeSections);
+qrFifoChainStep1SourceMode?.addEventListener("change", syncRouteModeSections);
+qrFifoChainStep2SourceMode?.addEventListener("change", syncRouteModeSections);
+qrFifoChainStep3SourceMode?.addEventListener("change", syncRouteModeSections);
+qrActionType?.addEventListener("change", syncFifoMaterialPolicyHelp);
+qrFifoMaterialPolicy?.addEventListener("change", syncFifoMaterialPolicyHelp);
+btnNewQrTransitionRule?.addEventListener("click", () => { clearQrTransitionRuleForm(); renderQrTransitionQrOptions(); renderQrTransitionScannerOptions(); renderQrCatalogOptions(); if (qrAdminMsg) qrAdminMsg.textContent = ""; });
+btnSaveQrTransitionRule?.addEventListener("click", () => saveQrTransitionRule().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
+btnDisableQrTransitionRule?.addEventListener("click", () => disableQrTransitionRule().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
+btnPreviewQrTransition?.addEventListener("click", () => previewQrTransition().catch(err => { if (qrTransitionPreviewResult) qrTransitionPreviewResult.textContent = `Error: ${String(err)}`; }));
+qrTransitionMatchMode?.addEventListener("change", () => syncQrTransitionModeOptions({ applyDefaults: qrTransitionMatchMode.value === "route_simple" }));
+qrTransitionSourceMatchMode?.addEventListener("change", syncQrTransitionModeOptions);
+qrTransitionIgnoreCurrentMaterial?.addEventListener("change", syncQrTransitionModeOptions);
+btnApplyQrTransition?.addEventListener("click", () => applyQrTransitionManual().catch(err => { if (qrTransitionPreviewResult) qrTransitionPreviewResult.textContent = `Error: ${String(err)}`; }));
+btnRefreshQrTransitionLogs?.addEventListener("click", () => loadQrTransitionLogs().then(() => { if (qrAdminMsg) qrAdminMsg.textContent = "Historial de transiciones actualizado."; }).catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
 btnNewScanTerminal?.addEventListener("click", () => { clearScanTerminalForm(); renderScanTerminalScannerOptions(); if (qrAdminMsg) qrAdminMsg.textContent = ""; });
 btnSaveScanTerminal?.addEventListener("click", () => saveScanTerminal().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
 btnRefreshScanTerminals?.addEventListener("click", () => loadScanTerminals().then(() => { if (qrAdminMsg) qrAdminMsg.textContent = "Terminales PDA actualizados."; }).catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
 btnDisableScanTerminal?.addEventListener("click", () => disableScanTerminal().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
 btnRefreshScanEvents?.addEventListener("click", () => loadScanEvents().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
-[scannerSourceCell, scannerDestinationCell, qrSourceCell, qrDestinationCell].forEach(el => el?.addEventListener("change", renderQrCellSummaries));
+[scannerSourceCell, scannerDestinationCell, scannerSecondSourceCell, scannerSecondDestinationCell, scannerFifoChainStep3SourceCell, scannerFifoChainStep3DestinationCell, qrSourceCell, qrDestinationCell, qrSecondSourceCell, qrSecondDestinationCell, qrFifoChainStep3SourceCell, qrFifoChainStep3DestinationCell].forEach(el => el?.addEventListener("change", renderQrCellSummaries));
 btnScanQrPreview?.addEventListener("click", () => runScanQrPreview());
 btnScanQrExecute?.addEventListener("click", () => runScanQrPreview("execute"));
 scanQrValue?.addEventListener("keydown", (ev) => {
@@ -6928,6 +8015,10 @@ operatorCancelMode?.addEventListener("change", () => {
   updateCancelReturnAreaHint(order);
 });
 btnDeleteOrder?.addEventListener("click", () => deleteSelectedOrder().catch(err => orderMsg.textContent = `Error: ${String(err)}`));
+bindEditingLockEvents("cell", editingSectionElements("cell"));
+bindEditingLockEvents("areas", editingSectionElements("areas"));
+btnRefreshCellAfterEdit?.addEventListener("click", () => refreshAfterEditingLock("cell").catch(err => { if (cellMsg) cellMsg.textContent = `Error: ${String(err)}`; }));
+btnRefreshAreasAfterEdit?.addEventListener("click", () => refreshAfterEditingLock("areas").catch(err => { if (areaMsg) areaMsg.textContent = `Error: ${String(err)}`; }));
 operatorWindowSelect?.addEventListener("change", () => openOperatorWindow().catch(err => operatorWindowMsg.textContent = `Error: ${String(err)}`));
 operatorWindowPassword?.addEventListener("change", () => { if (operatorWindowSelect?.value) openOperatorWindow().catch(err => operatorWindowMsg.textContent = `Error: ${String(err)}`); });
 operatorWindowPassword?.addEventListener("keydown", (ev) => { if (ev.key === "Enter" && operatorWindowSelect?.value) openOperatorWindow().catch(err => operatorWindowMsg.textContent = `Error: ${String(err)}`); });

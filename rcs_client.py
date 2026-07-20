@@ -491,14 +491,15 @@ class RcsClient:
             logger.exception("RCS queryTaskStatus parse error | endpoint=%s | data=%s", endpoint, data)
             raise RcsParseError(f"Respuesta JSON no coincide con el formato esperado: {data}") from e
 
-    def query_task_status(self, task_code: str, req_code: str = "", token_code: str = "", client_code: str = "WCS") -> RcsTaskStatusResponse:
+    def query_task_status(self, task_code: str, req_code: str = "", token_code: str = "", client_code: str = "") -> RcsTaskStatusResponse:
         payload = {
             "reqCode": req_code or uuid.uuid4().hex[:16],
-            "reqTime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "clientCode": client_code or "WCS",
-            "tokenCode": token_code or "",
-            "taskCode": task_code,
+            "taskCodes": [task_code],
         }
+        if client_code:
+            payload["clientCode"] = client_code
+        if token_code:
+            payload["tokenCode"] = token_code
         return self.query_task_status_with_payload(payload)
 
     def create_task(self, task: RcsTaskRequest) -> RcsTaskResponse:

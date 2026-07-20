@@ -187,6 +187,22 @@ class MovementOrder(Base):
     comment = Column(String(512), nullable=True)
     status = Column(String(32), nullable=False, default="pending_dispatch")
     created_by = Column(String(128), nullable=True)
+    route_mode = Column(String(32), nullable=False, default="simple_area")
+    route_points_json = Column(Text, nullable=True)
+    trmx_group_id = Column(String(64), nullable=True)
+    trmx_step = Column(Integer, nullable=True)
+    trmx_total_steps = Column(Integer, nullable=True)
+    trmx_parent_order_id = Column(Integer, ForeignKey("movement_orders.id"), nullable=True)
+    trmx_status = Column(String(32), nullable=True)
+    trmx_next_config_json = Column(Text, nullable=True)
+    trmx_select_policy = Column(String(32), nullable=True)
+    fifo_chain_group_id = Column(String(64), nullable=True)
+    fifo_chain_step = Column(Integer, nullable=True)
+    fifo_chain_total_steps = Column(Integer, nullable=True)
+    fifo_chain_parent_order_id = Column(Integer, ForeignKey("movement_orders.id"), nullable=True)
+    fifo_chain_status = Column(String(32), nullable=True)
+    fifo_chain_next_config_json = Column(Text, nullable=True)
+    fifo_chain_select_policy = Column(String(32), nullable=True)
     dispatch_status = Column(String(32), nullable=False, default="not_sent")
     dispatch_request_json = Column(Text, nullable=True)
     dispatch_response_json = Column(Text, nullable=True)
@@ -311,6 +327,23 @@ class ScannerStation(Base):
     destination_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
     source_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
     destination_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
+    route_mode = Column(String(32), nullable=False, default="simple_area")
+    fifo_material_policy = Column(String(32), nullable=False, default="specific_material")
+    fifo_chain_total_steps = Column(Integer, nullable=False, default=2)
+    fifo_chain_step1_source_mode = Column(String(32), nullable=False, default="configured_area")
+    fifo_chain_step1_material_group_id = Column(Integer, ForeignKey("material_groups.id"), nullable=True)
+    fifo_chain_step2_source_mode = Column(String(32), nullable=False, default="configured_area")
+    fifo_chain_step2_material_group_id = Column(Integer, ForeignKey("material_groups.id"), nullable=True)
+    fifo_chain_step3_source_mode = Column(String(32), nullable=False, default="configured_area")
+    fifo_chain_step3_material_group_id = Column(Integer, ForeignKey("material_groups.id"), nullable=True)
+    fifo_chain_step3_source_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
+    fifo_chain_step3_source_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
+    fifo_chain_step3_destination_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
+    fifo_chain_step3_destination_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
+    second_source_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
+    second_destination_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
+    second_source_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
+    second_destination_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
     storage_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
     empty_rack_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
     cancel_return_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
@@ -345,6 +378,23 @@ class QrActionRule(Base):
     destination_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
     source_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
     destination_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
+    route_mode = Column(String(32), nullable=False, default="simple_area")
+    fifo_material_policy = Column(String(32), nullable=False, default="specific_material")
+    fifo_chain_total_steps = Column(Integer, nullable=False, default=2)
+    fifo_chain_step1_source_mode = Column(String(32), nullable=False, default="configured_area")
+    fifo_chain_step1_material_group_id = Column(Integer, ForeignKey("material_groups.id"), nullable=True)
+    fifo_chain_step2_source_mode = Column(String(32), nullable=False, default="configured_area")
+    fifo_chain_step2_material_group_id = Column(Integer, ForeignKey("material_groups.id"), nullable=True)
+    fifo_chain_step3_source_mode = Column(String(32), nullable=False, default="configured_area")
+    fifo_chain_step3_material_group_id = Column(Integer, ForeignKey("material_groups.id"), nullable=True)
+    fifo_chain_step3_source_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
+    fifo_chain_step3_source_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
+    fifo_chain_step3_destination_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
+    fifo_chain_step3_destination_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
+    second_source_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
+    second_destination_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
+    second_source_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
+    second_destination_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
     priority = Column(Integer, nullable=True)
     task_typ = Column(String(64), nullable=True)
     agv_code = Column(String(128), nullable=True)
@@ -352,6 +402,77 @@ class QrActionRule(Base):
     is_active = Column(Integer, nullable=False, default=1)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class QrTransitionRule(Base):
+    __tablename__ = "qr_transition_rules"
+    __table_args__ = (
+        Index("ix_qr_transition_rules_is_active", "is_active"),
+        Index("ix_qr_transition_rules_apply_on", "apply_on"),
+        Index("ix_qr_transition_rules_qr_action_rule_id", "qr_action_rule_id"),
+        Index("ix_qr_transition_rules_scanner_station_id", "scanner_station_id"),
+        Index("ix_qr_transition_rules_route", "source_area_id", "destination_area_id"),
+        Index("ix_qr_transition_rules_cells", "source_cell_id", "destination_cell_id"),
+        Index("ix_qr_transition_rules_scope", "scope"),
+        Index("ix_qr_transition_rules_match_mode", "match_mode"),
+        Index("ix_qr_transition_rules_source_match_mode", "source_match_mode"),
+        Index("ix_qr_transition_rules_priority", "priority"),
+    )
+    id = Column(Integer, primary_key=True)
+    name = Column(String(128), nullable=False)
+    description = Column(String(512), nullable=True)
+    qr_action_rule_id = Column(Integer, ForeignKey("qr_action_rules.id"), nullable=True)
+    scanner_station_id = Column(Integer, ForeignKey("scanner_stations.id"), nullable=True)
+    source_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
+    destination_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
+    source_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
+    destination_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
+    current_material_group_id = Column(Integer, ForeignKey("material_groups.id"), nullable=True)
+    current_rack_status = Column(String(32), nullable=True)
+    next_material_group_id = Column(Integer, ForeignKey("material_groups.id"), nullable=True)
+    next_rack_status = Column(String(32), nullable=True)
+    next_quantity = Column(Integer, nullable=True)
+    clear_quantity = Column(Integer, nullable=False, default=0)
+    next_comment = Column(String(512), nullable=True)
+    append_comment = Column(Integer, nullable=False, default=1)
+    apply_on = Column(String(64), nullable=False, default="movement_completed")
+    scope = Column(String(64), nullable=False, default="qr_pda")
+    match_mode = Column(String(64), nullable=False, default="advanced")
+    source_match_mode = Column(String(64), nullable=False, default="configured_source")
+    ignore_current_material = Column(Integer, nullable=False, default=0)
+    priority = Column(Integer, nullable=False, default=0)
+    is_active = Column(Integer, nullable=False, default=1)
+    applied_count = Column(Integer, nullable=False, default=0)
+    last_applied_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class QrTransitionLog(Base):
+    __tablename__ = "qr_transition_logs"
+    __table_args__ = (
+        Index("ix_qr_transition_logs_movement_order_id", "movement_order_id"),
+        Index("ix_qr_transition_logs_transition_rule_id", "transition_rule_id"),
+        Index("ix_qr_transition_logs_rack_id", "rack_id"),
+        Index("ix_qr_transition_logs_status", "status"),
+        Index("ix_qr_transition_logs_created_at", "created_at"),
+    )
+    id = Column(Integer, primary_key=True)
+    transition_rule_id = Column(Integer, ForeignKey("qr_transition_rules.id"), nullable=True)
+    movement_order_id = Column(Integer, ForeignKey("movement_orders.id"), nullable=True)
+    scan_event_id = Column(Integer, ForeignKey("scan_events.id"), nullable=True)
+    rack_id = Column(Integer, ForeignKey("racks.id"), nullable=True)
+    previous_material_group_id = Column(Integer, ForeignKey("material_groups.id"), nullable=True)
+    next_material_group_id = Column(Integer, ForeignKey("material_groups.id"), nullable=True)
+    previous_rack_status = Column(String(32), nullable=True)
+    next_rack_status = Column(String(32), nullable=True)
+    previous_quantity = Column(Integer, nullable=True)
+    next_quantity = Column(Integer, nullable=True)
+    previous_comment = Column(String(512), nullable=True)
+    next_comment = Column(String(512), nullable=True)
+    status = Column(String(32), nullable=False, default="skipped")
+    message = Column(String(512), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
 class ScanTerminal(Base):
