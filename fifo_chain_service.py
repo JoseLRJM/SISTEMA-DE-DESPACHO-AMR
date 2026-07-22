@@ -39,6 +39,14 @@ def _as_int(value, field_name: str) -> int:
     return parsed
 
 
+def _as_optional_int(value) -> Optional[int]:
+    try:
+        parsed = int(value)
+    except Exception:
+        return None
+    return parsed if parsed > 0 else None
+
+
 def _load_area(db, area_id: int, label: str) -> Area:
     area = db.execute(select(Area).where(Area.id == area_id)).scalar_one_or_none()
     if not area or int(getattr(area, "is_active", 0) or 0) != 1:
@@ -73,33 +81,94 @@ def _reserved_destination_cell_ids(db) -> set[int]:
     return {row[0] for row in rows if row and row[0] is not None}
 
 
-def _select_rack_for_next_step(db, *, source_area: Area, source_cell: Location, material_group_id, fifo_material_policy: str):
+def _select_destination_cell_for_next_step(
+    db,
+    *,
+    destination_area: Area,
+    destination_cell_id: Optional[int],
+    next_step: int,
+) -> Location:
+    reserved_ids = _reserved_destination_cell_ids(db)
+    if destination_cell_id:
+        cell = _load_cell(
+            db,
+            destination_cell_id,
+            destination_area,
+            f"Celda destino paso {next_step}",
+            destination=True,
+        )
+        if cell.id in reserved_ids:
+            raise ValueError(f"La celda destino paso {next_step} ya esta reservada")
+        return cell
+
+    cells = db.execute(
+        select(Location)
+        .where(Location.area_id == destination_area.id)
+        .where(Location.enabled == 1)
+        .where(Location.is_visible == 1)
+        .where(Location.rack_id.is_(None))
+        .where(Location.code.is_not(None))
+        .order_by(Location.y.asc(), Location.x.asc(), Location.id.asc())
+    ).scalars().all()
+    for cell in cells:
+        if cell.id not in reserved_ids and str(cell.code or "").strip():
+            return cell
+    area_label = destination_area.name or destination_area.code or destination_area.id
+    raise ValueError(f"Paso {next_step}: no hay espacio libre en el area destino {area_label}.")
+
+
+def _select_rack_for_next_step(
+    db,
+    *,
+    source_area: Area,
+    source_cell: Optional[Location],
+    material_group_id,
+    fifo_material_policy: str,
+    next_step: int,
+):
     policy = str(fifo_material_policy or "any_available_from_source").strip() or "any_available_from_source"
-    if policy == "specific_material":
+    if _as_optional_int(material_group_id) is not None:
         material = _resolve_material_group_for_fifo(db, material_group_id)
-        rack_id = getattr(source_cell, "rack_id", None)
-        if rack_id:
+        if source_cell is not None:
+            rack_id = getattr(source_cell, "rack_id", None)
+            if not rack_id:
+                raise ValueError(f"Paso {next_step}: no hay rack disponible en la celda origen configurada.")
             rack = db.execute(select(Rack).where(Rack.id == rack_id)).scalar_one_or_none()
             if not rack:
-                raise ValueError("No hay rack disponible en origen 2")
+                raise ValueError(f"Paso {next_step}: no hay rack disponible en la celda origen configurada.")
             status = _normalize_rack_status(rack.status)
             if status in INACTIVE_RACK_STATUSES or (status and status not in ACTIVE_RACK_STATUSES):
-                raise ValueError("No hay rack disponible en origen 2")
+                raise ValueError(f"Paso {next_step}: el rack de la celda origen configurada no esta disponible.")
             if getattr(rack, "material_group_id", None) != material.id:
-                raise ValueError("El rack en origen 2 no coincide con el material requerido")
-            return rack, material
-        rack, candidate_cell = _find_fifo_candidate(db, source_area, material)
-        if candidate_cell.id != source_cell.id:
-            raise ValueError("El rack FIFO disponible no esta en la celda origen 2 configurada")
-        return rack, material
+                actual = db.execute(select(MaterialGroup).where(MaterialGroup.id == rack.material_group_id)).scalar_one_or_none() if rack.material_group_id else None
+                required_label = material.code or material.name or material.id
+                actual_label = getattr(actual, "code", None) or getattr(actual, "name", None) or "sin material"
+                raise ValueError(
+                    f"Paso {next_step} requiere material {required_label}, pero el rack disponible en el origen tiene material {actual_label}. "
+                    f"Revise Material requerido tramo {next_step} o la transicion aplicada al paso anterior."
+                )
+            return rack, material, source_cell
 
-    rack, candidate_cell = _find_any_available_fifo_candidate(db, source_area, source_cell_id=source_cell.id)
-    if candidate_cell.id != source_cell.id:
-        raise ValueError("El rack disponible no esta en la celda origen 2 configurada")
+        try:
+            rack, candidate_cell = _find_fifo_candidate(db, source_area, material)
+        except Exception as exc:
+            required_label = material.code or material.name or material.id
+            area_label = source_area.name or source_area.code or source_area.id
+            raise ValueError(
+                f"Paso {next_step} requiere material {required_label}, pero no hay un rack disponible con ese material en {area_label}. "
+                f"Revise Material requerido tramo {next_step} o la transicion aplicada al paso anterior."
+            ) from exc
+        return rack, material, candidate_cell
+
+    rack, candidate_cell = _find_any_available_fifo_candidate(
+        db,
+        source_area,
+        source_cell_id=getattr(source_cell, "id", None),
+    )
     material = db.execute(select(MaterialGroup).where(MaterialGroup.id == rack.material_group_id)).scalar_one_or_none() if rack.material_group_id else None
     if not material:
         material = _resolve_material_group_for_fifo(db, None)
-    return rack, material
+    return rack, material, candidate_cell
 
 
 def resolve_fifo_request_by_material_any_area(db, material_group_id) -> tuple[Rack, Location, Area]:
@@ -142,7 +211,7 @@ def resolve_fifo_request_by_material_any_area(db, material_group_id) -> tuple[Ra
     raise ValueError(f"No hay rack disponible con material {material.code or material.id} en ninguna area operativa para paso 2.")
 
 
-def _select_rack_for_next_step_global_material(db, *, material_group_id, destination_area: Area) -> tuple[Rack, MaterialGroup, Area, Location]:
+def _select_rack_for_next_step_global_material(db, *, material_group_id, destination_area: Area, next_step: int) -> tuple[Rack, MaterialGroup, Area, Location]:
     material = _resolve_material_group_for_fifo(db, material_group_id)
     rack, cell, area = resolve_fifo_request_by_material_any_area(db, material.id)
     if area.id == destination_area.id:
@@ -181,7 +250,7 @@ def _select_rack_for_next_step_global_material(db, *, material_group_id, destina
             if not str(getattr(candidate_cell, "code", "") or "").strip():
                 continue
             return candidate_rack, material, candidate_area, candidate_cell
-        raise ValueError(f"No hay rack disponible con material {material.code or material.id} fuera del area destino para paso 2.")
+        raise ValueError(f"No hay rack disponible con material {material.code or material.id} fuera del area destino para paso {next_step}.")
     return rack, material, area, cell
 
 
@@ -209,36 +278,56 @@ def _dispatch_next_order(db, order: MovementOrder, dispatch_func=_USE_DEFAULT_DI
 
 
 def create_fifo_chain_next_step(db, completed_order: MovementOrder, config: dict, dispatch_func=_USE_DEFAULT_DISPATCH) -> MovementOrder:
+    if (completed_order.route_mode or "") != "fifo_chain":
+        raise ValueError("La orden completada no pertenece a fifo_chain")
+    current_step = int(completed_order.fifo_chain_step or 0)
+    total_steps = int(completed_order.fifo_chain_total_steps or 0)
+    if current_step <= 0 or total_steps <= 0:
+        raise ValueError("La orden completada no tiene paso/total de fifo_chain")
+    next_step = current_step + 1
+    if next_step > total_steps:
+        raise ValueError("La cadena fifo_chain ya no tiene pasos pendientes")
+    configured_step = int(config.get("step") or next_step)
+    if configured_step != next_step:
+        raise ValueError(f"Configuracion esperada para paso {next_step}, recibida para paso {configured_step}")
     source_mode = str(config.get("source_mode") or "configured_area").strip() or "configured_area"
     destination_area_id = _as_int(config.get("destination_area_id"), "destination_area_id")
-    destination_cell_id = _as_int(config.get("destination_cell_id"), "destination_cell_id")
+    destination_cell_id = _as_optional_int(config.get("destination_cell_id"))
     fifo_material_policy = str(config.get("fifo_material_policy") or "any_available_from_source").strip() or "any_available_from_source"
     priority = _normalize_priority(str(config.get("priority") or "normal"))
 
-    destination_area = _load_area(db, destination_area_id, "Area destino paso 2")
-    destination_cell = _load_cell(db, destination_cell_id, destination_area, "Celda destino paso 2", destination=True)
-    if destination_cell.id in _reserved_destination_cell_ids(db):
-        raise ValueError("La celda destino paso 2 ya esta reservada")
+    destination_area = _load_area(db, destination_area_id, f"Area destino paso {next_step}")
+    destination_cell = _select_destination_cell_for_next_step(
+        db,
+        destination_area=destination_area,
+        destination_cell_id=destination_cell_id,
+        next_step=next_step,
+    )
 
     if source_mode == "any_area_by_material":
         rack, material, source_area, source_cell = _select_rack_for_next_step_global_material(
             db,
             material_group_id=config.get("step2_material_group_id") or config.get("material_group_id"),
             destination_area=destination_area,
+            next_step=next_step,
         )
     else:
         source_area_id = _as_int(config.get("source_area_id"), "source_area_id")
-        source_cell_id = _as_int(config.get("source_cell_id"), "source_cell_id")
-        source_area = _load_area(db, source_area_id, "Area origen paso 2")
+        source_cell_id = _as_optional_int(config.get("source_cell_id"))
+        source_area = _load_area(db, source_area_id, f"Area origen paso {next_step}")
         if source_area.id == destination_area.id:
-            raise ValueError("El area origen y destino del paso 2 no pueden ser iguales")
-        source_cell = _load_cell(db, source_cell_id, source_area, "Celda origen paso 2")
-        rack, material = _select_rack_for_next_step(
+            raise ValueError(f"El area origen y destino del paso {next_step} no pueden ser iguales")
+        source_cell = (
+            _load_cell(db, source_cell_id, source_area, f"Celda origen paso {next_step}")
+            if source_cell_id else None
+        )
+        rack, material, source_cell = _select_rack_for_next_step(
             db,
             source_area=source_area,
             source_cell=source_cell,
             material_group_id=config.get("material_group_id"),
             fifo_material_policy=fifo_material_policy,
+            next_step=next_step,
         )
 
     now = datetime.utcnow()
@@ -254,20 +343,29 @@ def create_fifo_chain_next_step(db, completed_order: MovementOrder, config: dict
         priority=priority,
         agv_code=(str(config.get("agv_code") or "").strip() or None),
         task_typ=(str(config.get("task_typ") or "").strip() or None),
-        comment=f"Flujo doble FIFO paso 2 de orden {completed_order.id}",
+        comment=f"Flujo FIFO paso {next_step} de orden {completed_order.id}",
         status="pending_dispatch",
         created_by=(str(config.get("terminal_code") or config.get("scanner_code") or "fifo_chain").strip() or "fifo_chain"),
         route_mode="fifo_chain",
         route_points_json=json.dumps([
-            _route_point(1, "source_2", source_area, source_cell),
-            _route_point(2, "destination_2", destination_area, destination_cell),
+            _route_point(1, f"source_{next_step}", source_area, source_cell),
+            _route_point(2, f"destination_{next_step}", destination_area, destination_cell),
         ], ensure_ascii=False),
         fifo_chain_group_id=completed_order.fifo_chain_group_id,
-        fifo_chain_step=2,
-        fifo_chain_total_steps=2,
+        fifo_chain_step=next_step,
+        fifo_chain_total_steps=total_steps,
         fifo_chain_parent_order_id=completed_order.id,
         fifo_chain_status="active",
-        fifo_chain_next_config_json=None,
+        fifo_chain_next_config_json=(
+            json.dumps({
+                "current_step": next_step,
+                "next_step": next_step + 1,
+                "total_steps": total_steps,
+                "steps": config.get("_remaining_steps") or [],
+                "chain": config.get("_chain") or {},
+            }, ensure_ascii=False, default=str)
+            if config.get("_remaining_steps") else None
+        ),
         fifo_chain_select_policy=str(config.get("fifo_chain_select_policy") or completed_order.fifo_chain_select_policy or "any_available").strip() or "any_available",
         created_at=now,
         updated_at=now,
@@ -371,9 +469,9 @@ def trigger_fifo_chain_next_step_if_needed(db, completed_order_id: int, dispatch
         getattr(order, "fifo_chain_status", None),
     )
 
-    if (order.route_mode or "") != "fifo_chain" or int(order.fifo_chain_step or 0) != 1 or int(order.fifo_chain_total_steps or 0) != 2:
-        logger.info("FIFO_CHAIN_NEXT_STEP_SKIP fifo_chain_group_id=%s completed_order_id=%s reason=not_fifo_chain_step_1", order.fifo_chain_group_id, order.id)
-        return _result("skipped", "not_fifo_chain_step_1", completed_order_id=order.id)
+    if (order.route_mode or "") != "fifo_chain" or int(order.fifo_chain_step or 0) <= 0 or int(order.fifo_chain_total_steps or 0) <= 0:
+        logger.info("FIFO_CHAIN_NEXT_STEP_SKIP fifo_chain_group_id=%s completed_order_id=%s reason=not_fifo_chain", order.fifo_chain_group_id, order.id)
+        return _result("skipped", "not_fifo_chain", completed_order_id=order.id)
     if (order.status or "") != "completed":
         logger.info("FIFO_CHAIN_NEXT_STEP_SKIP fifo_chain_group_id=%s completed_order_id=%s reason=not_completed", order.fifo_chain_group_id, order.id)
         return _result("skipped", "not_completed", completed_order_id=order.id)
@@ -386,30 +484,51 @@ def trigger_fifo_chain_next_step_if_needed(db, completed_order_id: int, dispatch
     if not (order.fifo_chain_group_id or "").strip():
         logger.info("FIFO_CHAIN_NEXT_STEP_SKIP completed_order_id=%s reason=missing_group", order.id)
         return _result("skipped", "missing_group", completed_order_id=order.id)
+    current_step = int(order.fifo_chain_step)
+    total_steps = int(order.fifo_chain_total_steps)
+    if current_step >= total_steps:
+        order.fifo_chain_status = "completed"
+        order.updated_at = datetime.utcnow()
+        db.add(order)
+        db.commit()
+        logger.info("FIFO_CHAIN_NEXT_STEP_SKIP fifo_chain_group_id=%s completed_order_id=%s reason=chain_completed", order.fifo_chain_group_id, order.id)
+        return _result("skipped", "chain_completed", completed_order_id=order.id)
     if not (order.fifo_chain_next_config_json or "").strip():
         logger.info("FIFO_CHAIN_NEXT_STEP_SKIP fifo_chain_group_id=%s completed_order_id=%s reason=missing_next_config", order.fifo_chain_group_id, order.id)
         return _result("skipped", "missing_next_config", completed_order_id=order.id)
 
+    next_step = current_step + 1
     existing = db.execute(
         select(MovementOrder)
         .where(MovementOrder.fifo_chain_group_id == order.fifo_chain_group_id)
-        .where(MovementOrder.fifo_chain_step == 2)
+        .where(MovementOrder.fifo_chain_step == next_step)
     ).scalars().first()
     if existing:
         order.fifo_chain_status = "completed"
         order.updated_at = datetime.utcnow()
         db.add(order)
         db.commit()
-        logger.info("FIFO_CHAIN_NEXT_STEP_SKIP fifo_chain_group_id=%s completed_order_id=%s next_order_id=%s reason=step_2_exists", order.fifo_chain_group_id, order.id, existing.id)
-        return _result("existing_next_step", "step_2_exists", completed_order_id=order.id, next_order=existing)
+        logger.info("FIFO_CHAIN_NEXT_STEP_SKIP fifo_chain_group_id=%s completed_order_id=%s next_order_id=%s reason=next_step_exists", order.fifo_chain_group_id, order.id, existing.id)
+        return _result("existing_next_step", "next_step_exists", completed_order_id=order.id, next_order=existing)
     if str(order.fifo_chain_status or "").strip().lower() in {"completed", "failed", "cancelled", "canceled"}:
         logger.info("FIFO_CHAIN_NEXT_STEP_SKIP fifo_chain_group_id=%s completed_order_id=%s reason=already_processed", order.fifo_chain_group_id, order.id)
         return _result("skipped", "already_processed", completed_order_id=order.id)
 
     try:
-        config = json.loads(order.fifo_chain_next_config_json)
-        if not isinstance(config, dict):
+        payload = json.loads(order.fifo_chain_next_config_json)
+        if not isinstance(payload, dict):
             raise ValueError("fifo_chain_next_config_json no es un objeto")
+        if isinstance(payload.get("steps"), list):
+            pending_steps = [step for step in payload["steps"] if isinstance(step, dict)]
+            config = next((step for step in pending_steps if int(step.get("step") or 0) == next_step), None)
+            if not config:
+                raise ValueError(f"No existe configuracion pendiente para paso {next_step}")
+            config = dict(config)
+            config["_remaining_steps"] = [step for step in pending_steps if int(step.get("step") or 0) > next_step]
+            config["_chain"] = payload.get("chain") if isinstance(payload.get("chain"), dict) else {}
+        else:
+            # Compatibilidad con ordenes existentes cuyo JSON era directamente el paso 2.
+            config = payload
         next_order = create_fifo_chain_next_step(db, order, config, dispatch_func=dispatch_func)
         order = db.execute(select(MovementOrder).where(MovementOrder.id == completed_order_id)).scalar_one()
         order.fifo_chain_status = "completed"
@@ -423,7 +542,8 @@ def trigger_fifo_chain_next_step_if_needed(db, completed_order_id: int, dispatch
         order = db.execute(select(MovementOrder).where(MovementOrder.id == completed_order_id)).scalar_one_or_none()
         if order:
             order.fifo_chain_status = "failed"
-            order.rcs_message = ((order.rcs_message or "").strip() + f" | Flujo doble FIFO paso 2 fallido: {exc}").strip(" |")[:512]
+            failed_step = int(order.fifo_chain_step or 0) + 1
+            order.rcs_message = ((order.rcs_message or "").strip() + f" | Flujo FIFO paso {failed_step} fallido: {exc}").strip(" |")[:512]
             order.updated_at = datetime.utcnow()
             db.add(order)
             db.commit()

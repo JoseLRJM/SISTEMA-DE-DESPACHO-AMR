@@ -130,10 +130,37 @@ def _transition_rule_ref(row: Optional[QrTransitionRule]):
 
 
 def _latest_scan_event_for_order(db, movement_order_id: int) -> Optional[ScanEvent]:
-    return db.execute(
+    direct = db.execute(
         select(ScanEvent)
         .where(ScanEvent.movement_order_id == movement_order_id)
         .order_by(ScanEvent.created_at.desc(), ScanEvent.id.desc())
+    ).scalars().first()
+    if direct:
+        return direct
+
+    movement_order = db.execute(
+        select(MovementOrder).where(MovementOrder.id == movement_order_id)
+    ).scalar_one_or_none()
+    if not movement_order or _clean_text(getattr(movement_order, "route_mode", None)) != "fifo_chain":
+        return None
+    group_id = _clean_text(getattr(movement_order, "fifo_chain_group_id", None))
+    if not group_id:
+        return None
+    chain_order_ids = [
+        row[0]
+        for row in db.execute(
+            select(MovementOrder.id)
+            .where(MovementOrder.fifo_chain_group_id == group_id)
+            .order_by(MovementOrder.fifo_chain_step.asc(), MovementOrder.id.asc())
+        ).all()
+        if row and row[0] is not None
+    ]
+    if not chain_order_ids:
+        return None
+    return db.execute(
+        select(ScanEvent)
+        .where(ScanEvent.movement_order_id.in_(chain_order_ids))
+        .order_by(ScanEvent.created_at.asc(), ScanEvent.id.asc())
     ).scalars().first()
 
 
@@ -259,49 +286,77 @@ def _status_matches(rule_status: Optional[str], rack_status: Optional[str]) -> b
     return expected == _clean_text(rack_status).lower()
 
 
-def find_transition_rules_for_order(db, movement_order: MovementOrder):
+def _transition_context(db, movement_order: MovementOrder) -> dict:
     source_area_id = movement_order.source_area_id or _location_area_id(db, movement_order.source_cell_id)
     destination_area_id = movement_order.destination_area_id or _location_area_id(db, movement_order.destination_cell_id)
     rack = db.execute(select(Rack).where(Rack.id == movement_order.rack_id)).scalar_one_or_none() if movement_order.rack_id else None
     scan_event = _latest_scan_event_for_order(db, movement_order.id)
-    is_qr_pda_order = _is_qr_pda_scan_event(scan_event)
-    qr_action_rule_id = getattr(scan_event, "qr_action_rule_id", None)
-    scanner_station_id = getattr(scan_event, "scanner_station_id", None)
-    current_material_group_id = getattr(rack, "material_group_id", None) or movement_order.material_group_id
-    current_rack_status = getattr(rack, "status", None)
+    return {
+        "source_area_id": source_area_id,
+        "destination_area_id": destination_area_id,
+        "rack": rack,
+        "scan_event": scan_event,
+        "is_qr_pda_order": _is_qr_pda_scan_event(scan_event),
+        "qr_action_rule_id": getattr(scan_event, "qr_action_rule_id", None),
+        "scanner_station_id": getattr(scan_event, "scanner_station_id", None),
+        "terminal_id": getattr(scan_event, "terminal_id", None),
+        "current_material_group_id": getattr(rack, "material_group_id", None) or movement_order.material_group_id,
+        "current_rack_status": getattr(rack, "status", None),
+    }
 
+
+def _transition_rule_mismatch_reason(db, rule: QrTransitionRule, movement_order: MovementOrder, context: dict) -> Optional[str]:
+    if _rule_scope(rule) == "qr_pda" and not context["is_qr_pda_order"]:
+        return "scope qr_pda requiere ScanEvent o contexto QR/PDA de la cadena"
+    if rule.qr_action_rule_id and rule.qr_action_rule_id != context["qr_action_rule_id"]:
+        return f"qr_action_rule_id actual {context['qr_action_rule_id']} no coincide con {rule.qr_action_rule_id}"
+    if rule.scanner_station_id and rule.scanner_station_id != context["scanner_station_id"]:
+        return f"scanner_station_id actual {context['scanner_station_id']} no coincide con {rule.scanner_station_id}"
+    if _rule_source_match_mode(rule) == "configured_source":
+        if getattr(rule, "source_cell_id", None) and rule.source_cell_id != movement_order.source_cell_id:
+            return f"celda origen actual {movement_order.source_cell_id} no coincide con {rule.source_cell_id}"
+        if rule.source_area_id and rule.source_area_id != context["source_area_id"]:
+            return f"area origen actual {context['source_area_id']} no coincide con {rule.source_area_id}"
+    if getattr(rule, "destination_cell_id", None) and rule.destination_cell_id != movement_order.destination_cell_id:
+        return f"celda destino actual {movement_order.destination_cell_id} no coincide con {rule.destination_cell_id}"
+    if rule.destination_area_id and rule.destination_area_id != context["destination_area_id"]:
+        return f"area destino actual {context['destination_area_id']} no coincide con {rule.destination_area_id}"
+    if not int(getattr(rule, "ignore_current_material", 0) or 0) and rule.current_material_group_id and rule.current_material_group_id != context["current_material_group_id"]:
+        actual = db.execute(select(MaterialGroup).where(MaterialGroup.id == context["current_material_group_id"])).scalar_one_or_none() if context["current_material_group_id"] else None
+        expected = db.execute(select(MaterialGroup).where(MaterialGroup.id == rule.current_material_group_id)).scalar_one_or_none()
+        actual_label = getattr(actual, "code", None) or context["current_material_group_id"] or "sin material"
+        expected_label = getattr(expected, "code", None) or rule.current_material_group_id
+        return f"material actual {actual_label} no coincide con current_material_group_id {expected_label}"
+    if not _status_matches(rule.current_rack_status, context["current_rack_status"]):
+        return f"status actual {context['current_rack_status']} no coincide con {rule.current_rack_status}"
+    return None
+
+
+def _evaluate_transition_rules_for_order(db, movement_order: MovementOrder) -> dict:
+    context = _transition_context(db, movement_order)
     candidates = db.execute(
         select(QrTransitionRule)
         .where(QrTransitionRule.is_active == 1)
         .where(QrTransitionRule.apply_on == "movement_completed")
     ).scalars().all()
-
     matched = []
+    mismatches = []
     for rule in candidates:
-        scope = _rule_scope(rule)
-        if scope == "qr_pda" and not is_qr_pda_order:
-            continue
-        if rule.qr_action_rule_id and rule.qr_action_rule_id != qr_action_rule_id:
-            continue
-        if rule.scanner_station_id and rule.scanner_station_id != scanner_station_id:
-            continue
-        source_match_mode = _rule_source_match_mode(rule)
-        if source_match_mode == "configured_source":
-            if getattr(rule, "source_cell_id", None) and rule.source_cell_id != movement_order.source_cell_id:
-                continue
-            if rule.source_area_id and rule.source_area_id != source_area_id:
-                continue
-        if getattr(rule, "destination_cell_id", None) and rule.destination_cell_id != movement_order.destination_cell_id:
-            continue
-        if rule.destination_area_id and rule.destination_area_id != destination_area_id:
-            continue
-        if not int(getattr(rule, "ignore_current_material", 0) or 0) and rule.current_material_group_id and rule.current_material_group_id != current_material_group_id:
-            continue
-        if not _status_matches(rule.current_rack_status, current_rack_status):
-            continue
-        matched.append(rule)
+        reason = _transition_rule_mismatch_reason(db, rule, movement_order, context)
+        if reason:
+            mismatches.append((rule, reason))
+        else:
+            matched.append(rule)
+    return {
+        "context": context,
+        "candidates": candidates,
+        "matched": sorted(matched, key=lambda rule: (-_specificity(rule), -int(rule.priority or 0), int(rule.id or 0))),
+        "mismatches": mismatches,
+    }
 
-    return sorted(matched, key=lambda rule: (-_specificity(rule), -int(rule.priority or 0), int(rule.id or 0)))
+
+def find_transition_rules_for_order(db, movement_order: MovementOrder):
+    return _evaluate_transition_rules_for_order(db, movement_order)["matched"]
 
 
 def preview_transition_for_order(db, movement_order_id: int):
@@ -372,14 +427,54 @@ def apply_transition_for_completed_order(db, movement_order_id: int, reason: str
         "comment": getattr(rack, "comment", None),
     } if rack else {}
 
+    evaluation = _evaluate_transition_rules_for_order(db, movement_order)
+    context = evaluation["context"]
+    material_before = db.execute(
+        select(MaterialGroup).where(MaterialGroup.id == previous_values.get("material_group_id"))
+    ).scalar_one_or_none() if previous_values.get("material_group_id") else None
+    material_before_label = getattr(material_before, "code", None) or previous_values.get("material_group_id")
+    logger.info(
+        "TRANSITION_CHECK_FOR_COMPLETED_ORDER movement_order_id=%s order_code=%s route_mode=%s fifo_chain_group_id=%s fifo_chain_step=%s fifo_chain_total_steps=%s source_area_id=%s destination_area_id=%s rack_id=%s material_before_transition=%s scanner_station_id=%s qr_action_rule_id=%s terminal_id=%s",
+        movement_order.id,
+        movement_order.order_code,
+        movement_order.route_mode,
+        movement_order.fifo_chain_group_id,
+        movement_order.fifo_chain_step,
+        movement_order.fifo_chain_total_steps,
+        context["source_area_id"],
+        context["destination_area_id"],
+        getattr(rack, "id", None),
+        material_before_label,
+        context["scanner_station_id"],
+        context["qr_action_rule_id"],
+        context["terminal_id"],
+    )
+
+    def log_not_matched(reason_text: str):
+        mismatch_summary = "; ".join(
+            f"rule {candidate_rule.id}: {mismatch_reason}"
+            for candidate_rule, mismatch_reason in evaluation["mismatches"][:3]
+        )
+        logger.info(
+            "TRANSITION_NOT_MATCHED movement_order_id=%s reason=%s candidate_rules_count=%s route=%s->%s material_actual=%s mismatch_summary=%s",
+            movement_order.id,
+            reason_text,
+            len(evaluation["candidates"]),
+            context["source_area_id"],
+            context["destination_area_id"],
+            material_before_label,
+            mismatch_summary or "sin reglas coincidentes",
+        )
+
     if not is_movement_order_completed_for_transition(movement_order):
         message = "La orden no estÃ¡ completada correctamente; no se aplica transiciÃ³n."
         log = add_log("skipped", message, prev=previous_values)
         return _transition_result("skipped", message, order=movement_order, rack=rack, log=log)
 
-    any_completed_order_candidate = any(_rule_scope(rule) == "any_completed_order" for rule in find_transition_rules_for_order(db, movement_order))
+    any_completed_order_candidate = any(_rule_scope(rule) == "any_completed_order" for rule in evaluation["candidates"])
     if not _is_qr_pda_scan_event(scan_event) and not any_completed_order_candidate:
         message = "La orden no tiene ScanEvent QR/PDA asociado; no se aplica transiciÃ³n."
+        log_not_matched("scope qr_pda sin contexto QR/PDA")
         log = add_log("skipped", message, prev=previous_values)
         return _transition_result("skipped", message, order=movement_order, rack=rack, log=log)
 
@@ -405,10 +500,11 @@ def apply_transition_for_completed_order(db, movement_order_id: int, reason: str
         log = add_log("skipped", message, rule=applied_rule, prev=previous_values)
         return _transition_result("skipped", message, order=movement_order, rule=applied_rule, rack=rack, log=log)
 
-    rules = find_transition_rules_for_order(db, movement_order)
+    rules = evaluation["matched"]
     rule = rules[0] if rules else None
     if not rule:
         message = "No hay transiciÃ³n configurada para esta orden."
+        log_not_matched("ninguna regla coincide con el contexto actual")
         log = add_log("skipped", message, prev=previous_values)
         return _transition_result("skipped", message, order=movement_order, rack=rack, log=log)
 
@@ -471,6 +567,16 @@ def apply_transition_for_completed_order(db, movement_order_id: int, reason: str
             previous_values.get("material_group_id"),
             rack.material_group_id,
             reason,
+        )
+        logger.info(
+            "TRANSITION_APPLIED rule_id=%s movement_order_id=%s rack_id=%s material_before=%s material_after=%s status_before=%s status_after=%s",
+            rule.id,
+            movement_order.id,
+            rack.id,
+            previous_values.get("material_group_id"),
+            rack.material_group_id,
+            previous_values.get("status"),
+            rack.status,
         )
         return _transition_result("applied", message, order=movement_order, rule=rule, rack=rack, log=log)
     except Exception as exc:

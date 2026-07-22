@@ -1170,8 +1170,7 @@
     const mode = readableValue(data?.mode).toLowerCase();
     const message = readableValue(data?.message || data?.error_message || data?.rcs_message).toLowerCase();
     if (status === "duplicate" || data?.duplicate === true || message.includes("duplicad")) return "duplicate";
-    if (mode === "preview" || status === "preview" || (data?.ok === true && !firstValue(data?.movement_order_id, data?.existing_movement_order_id))) return "preview";
-    if (data?.ok === false || status === "error" || status === "dispatch_error" || status === "communication_error" || dispatchStatus === "error" || rcsStatus === "error" || (data?.error_message && data?.ok !== true)) return "error";
+    if (data?.ok === false || data?.error_code || status === "error" || status === "dispatch_error" || status === "communication_error" || dispatchStatus === "error" || rcsStatus === "error" || data?.error_message) return "error";
     if (isUnknownRcsStatus(rcsStatus) || dispatchStatus === "unknown") return "warning";
     if (data?.ok === true && ["success", "dispatched", "sent", "accepted", "in_progress", "completed"].includes(dispatchStatus || rcsStatus || status)) return "success";
     if (mode === "preview" || status === "preview" || (data?.ok === true && !firstValue(data?.movement_order_id, data?.existing_movement_order_id))) return "preview";
@@ -1192,6 +1191,12 @@
     const dispatch = view.rcs || {};
     const rollback = view.rollback || {};
     const message = readableValue(firstValue(data?.message, data?.rcs_message, data?.error_message));
+    if (data?.error_code) {
+      return {
+        title: "NO SE PUEDE EJECUTAR",
+        message: readableValue(firstValue(data?.operator_message, message, "No fue posible procesar la lectura.")),
+      };
+    }
     const statusText = `${readableValue(data?.status)} ${readableValue(dispatch.dispatchStatus)} ${readableValue(dispatch.rcsStatus)} ${message}`.toLowerCase();
     if (view.category === "success" && firstValue(dispatch.dispatchStatus, dispatch.rcsStatus)) {
       return {
@@ -1242,6 +1247,14 @@
   function areaCellLabel(group) {
     if (!group || typeof group !== "object") return "";
     return composeLabel(entityLabel(group.area), cellLabel(group.cell));
+  }
+
+  function diagnosisLocationLabel(group) {
+    if (!group || typeof group !== "object") return "";
+    return composeLabel(
+      firstValue(group.area_code, group.area_name),
+      group.cell_code
+    );
   }
 
   function appendConfirmRow(container, label, value) {
@@ -1328,7 +1341,7 @@
 
   function resolveRollbackInfo(data) {
     const raw = firstValue(data?.rollback, data?.result?.rollback, data?.order?.rollback);
-    if (!raw || typeof raw !== "object") return { exists: false };
+    if (!raw || typeof raw !== "object" || Object.keys(raw).length === 0) return { exists: false };
     const rawResult = firstValue(raw.result, raw.raw_result, raw.status);
     const mainRackId = firstValue(raw.rack_id, data?.rack_id, data?.movement_order?.rack_id, data?.order?.rack_id);
     const rackStatusAfter = readableValue(raw.rack_status_after).toLowerCase();
@@ -1394,6 +1407,7 @@
   }
 
   function buildScanResultView(data, context = {}) {
+    const diagnosis = data?.operator_diagnosis && typeof data.operator_diagnosis === "object" ? data.operator_diagnosis : {};
     const qr = data?.qr || data?.scan?.qr || {};
     const rule = data?.rule || data?.action || {};
     const material = data?.material || {};
@@ -1405,7 +1419,7 @@
     const category = classifyScanResult(data || {});
     const rcs = resolveDispatchInfo(data || {});
     const rollback = resolveRollbackInfo(data || {});
-    const requiresManualReview = requiresManualReviewFor(data || {}, rcs, rollback);
+    const requiresManualReview = data?.error_code ? false : requiresManualReviewFor(data || {}, rcs, rollback);
     const title = data?.status === "communication_error" ? "ERROR DE COMUNICACIÓN" : resultTitleForCategory(category);
     const view = {
       category,
@@ -1460,6 +1474,86 @@
         },
       ],
     };
+    const checkedDestinationLocations = Array.isArray(diagnosis?.checked_destination_locations)
+      ? diagnosis.checked_destination_locations.slice(0, 20)
+      : Array.isArray(data?.checked_destination_locations)
+      ? data.checked_destination_locations.slice(0, 20)
+      : [];
+    const checkedSourceLocations = Array.isArray(diagnosis?.checked_source_locations) ? diagnosis.checked_source_locations.slice(0, 20) : [];
+    const sameMaterialElsewhere = Array.isArray(diagnosis?.same_material_elsewhere) ? diagnosis.same_material_elsewhere.slice(0, 10) : [];
+    const projectionNotes = Array.isArray(diagnosis?.projection_notes) ? diagnosis.projection_notes : [];
+    if (data?.error_code || checkedDestinationLocations.length) {
+      const diagnosticSections = [];
+      if (data?.step || data?.destination_area_name || data?.destination_label) {
+        diagnosticSections.push({
+          title: "Destino",
+          rows: [
+            ["Tramo", data?.step ? `Tramo ${data.step}` : ""],
+            ["Destino", firstValue(data?.destination_area_name, entityLabel(data?.destination_area), data?.destination_label)],
+          ],
+        });
+      }
+      if (checkedDestinationLocations.length) {
+        diagnosticSections.push({
+          title: "Ubicaciones revisadas",
+          rows: checkedDestinationLocations.map((location) => [
+            firstValue(location?.location_code, `Ubicación ${location?.location_id || ""}`),
+            firstValue(location?.reason, formatOperationalStatus(location?.status)),
+          ]),
+        });
+      }
+      if (data?.suggested_action) {
+        diagnosticSections.push({ title: "Qué hacer", rows: [["Acción recomendada", data.suggested_action]] });
+      }
+      view.sections.push(...diagnosticSections);
+    }
+    if (pdaInterfaceMode === "operator" && category === "error") {
+      view.title = readableValue(diagnosis?.title || "NO SE PUEDE EJECUTAR").toUpperCase();
+      view.message = firstValue(diagnosis?.operator_message, data?.operator_message, data?.message, "No fue posible procesar la lectura.");
+      view.sections = [
+        {
+          title: "Lectura",
+          rows: [["QR leído", firstValue(data?.qr_value, qr.qr_value, context.qrValue)]],
+        },
+        {
+          title: "Operación",
+          rows: [
+            ["Material", firstValue(entityLabel(diagnosis?.material), data?.material_name, data?.material_code, material.name, material.code)],
+            ["Rack seleccionado", firstValue(data?.rack_code, rack.rack_code, rack.code)],
+            ["Origen", firstValue(diagnosisLocationLabel(diagnosis?.source), data?.source_name, data?.source_area_name, areaCellLabel(source))],
+            ["Destino", firstValue(diagnosisLocationLabel(diagnosis?.destination), data?.destination_area_name, data?.destination_name, data?.destination_area?.name, areaCellLabel(destination))],
+            ["Tramo que falló", firstValue(diagnosis?.step, data?.step) ? `Tramo ${firstValue(diagnosis?.step, data?.step)} de ${firstValue(diagnosis?.total_steps, data?.fifo_chain_total_steps, "?")}` : ""],
+          ],
+        },
+      ];
+      if (checkedSourceLocations.length) {
+        view.sections.push({
+          title: "Ubicaciones revisadas en origen",
+          rows: checkedSourceLocations.map((location) => [firstValue(location?.location_code, `Ubicación ${location?.location_id || ""}`), firstValue(location?.reason, formatOperationalStatus(location?.status))]),
+        });
+      }
+      if (sameMaterialElsewhere.length) {
+        view.sections.push({
+          title: "Mismo material en otras áreas",
+          rows: sameMaterialElsewhere.map((item) => [firstValue(item?.rack_code, `Rack ${item?.rack_id || ""}`), composeLabel(item?.area_name, item?.location_code)]),
+        });
+      }
+      if (checkedDestinationLocations.length) {
+        view.sections.push({
+          title: "Ubicaciones revisadas",
+          rows: checkedDestinationLocations.map((location) => [
+            firstValue(location?.location_code, `Ubicación ${location?.location_id || ""}`),
+            firstValue(location?.reason, formatOperationalStatus(location?.status)),
+          ]),
+        });
+      }
+      if (data?.suggested_action) {
+        view.sections.push({ title: "Qué hacer", rows: [["Acción recomendada", firstValue(diagnosis?.suggested_action, data.suggested_action)]] });
+      }
+      if (projectionNotes.length) {
+        view.sections.push({ title: "Proyección de la cadena", rows: projectionNotes.map((note) => [`Tramo ${note?.step || ""}`, note?.message]) });
+      }
+    }
     const headline = operationalHeadline(data || {}, view);
     if (headline) {
       if (headline.title === "ORDEN ENVIADA AL RCS") {
@@ -2145,6 +2239,12 @@
     return "preview";
   }
 
+  function requestedModeForSubmission() {
+    // El selector scanMode pertenece exclusivamente al modo desarrollador.
+    // En operador toda lectura debe preparar una ejecucion confirmada.
+    return pdaInterfaceMode === "operator" ? "execute" : currentMode();
+  }
+
   function syncModeWarning() {
     const execute = currentMode() === "execute";
     els.executeWarning?.classList.toggle("hidden", !execute);
@@ -2221,7 +2321,7 @@
 
   async function submitQr(source = "manual") {
     clearScanIdleTimer();
-    if (isConfirmModalOpen || isPdaExecuteConfirmModalOpen()) return;
+    if (isConfirmModalOpen || isPdaExecuteConfirmModalOpen() || pendingPreviewForExecution || pendingQrValue || isExecutingConfirmed) return;
     if (isProcessing) return;
     if (isConfigPanelOpen) {
       setConfigMessage("Termina de guardar o cancela la configuración antes de escanear.");
@@ -2256,7 +2356,7 @@
     lastSubmittedAt = now;
     clearScanIdleTimer();
     isProcessing = true;
-    const requestedMode = currentMode();
+    const requestedMode = requestedModeForSubmission();
     const submissionId = ++submissionSequence;
     activeSubmission = {
       id: submissionId,

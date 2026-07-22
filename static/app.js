@@ -116,6 +116,8 @@ let multiSelectedLocationIds = new Set();
 let multiSelectMode = false;
 let multiSelectBox = null;
 let adminToken = null;
+const ADMIN_TOKEN_STORAGE_KEY = "agvAdminToken";
+const ADMIN_EXPIRES_STORAGE_KEY = "agvAdminExpiresAt";
 let lastRackSyncData = null;
 let mapLayoutMode = "grid";
 let freeLayoutDrag = null;
@@ -521,6 +523,14 @@ const scannerFifoChainStep3SourceCell = $("scannerFifoChainStep3SourceCell");
 const scannerFifoChainStep3DestinationCell = $("scannerFifoChainStep3DestinationCell");
 const scannerFifoChainStep3SourceCellSummary = $("scannerFifoChainStep3SourceCellSummary");
 const scannerFifoChainStep3DestinationCellSummary = $("scannerFifoChainStep3DestinationCellSummary");
+const scannerFifoChainStep4SourceMode = $("scannerFifoChainStep4SourceMode");
+const scannerFifoChainStep4Material = $("scannerFifoChainStep4Material");
+const scannerFifoChainStep4SourceArea = $("scannerFifoChainStep4SourceArea");
+const scannerFifoChainStep4DestinationArea = $("scannerFifoChainStep4DestinationArea");
+const scannerFifoChainStep4SourceCell = $("scannerFifoChainStep4SourceCell");
+const scannerFifoChainStep4DestinationCell = $("scannerFifoChainStep4DestinationCell");
+const scannerFifoChainStep4SourceCellSummary = $("scannerFifoChainStep4SourceCellSummary");
+const scannerFifoChainStep4DestinationCellSummary = $("scannerFifoChainStep4DestinationCellSummary");
 const scannerAgvCode = $("scannerAgvCode");
 const scannerTaskTyp = $("scannerTaskTyp");
 const scannerPriority = $("scannerPriority");
@@ -554,6 +564,14 @@ const qrFifoChainStep3SourceCell = $("qrFifoChainStep3SourceCell");
 const qrFifoChainStep3DestinationCell = $("qrFifoChainStep3DestinationCell");
 const qrFifoChainStep3SourceCellSummary = $("qrFifoChainStep3SourceCellSummary");
 const qrFifoChainStep3DestinationCellSummary = $("qrFifoChainStep3DestinationCellSummary");
+const qrFifoChainStep4SourceMode = $("qrFifoChainStep4SourceMode");
+const qrFifoChainStep4Material = $("qrFifoChainStep4Material");
+const qrFifoChainStep4SourceArea = $("qrFifoChainStep4SourceArea");
+const qrFifoChainStep4DestinationArea = $("qrFifoChainStep4DestinationArea");
+const qrFifoChainStep4SourceCell = $("qrFifoChainStep4SourceCell");
+const qrFifoChainStep4DestinationCell = $("qrFifoChainStep4DestinationCell");
+const qrFifoChainStep4SourceCellSummary = $("qrFifoChainStep4SourceCellSummary");
+const qrFifoChainStep4DestinationCellSummary = $("qrFifoChainStep4DestinationCellSummary");
 const qrRack = $("qrRack");
 const qrRouteMode = $("qrRouteMode");
 const qrSourceArea = $("qrSourceArea");
@@ -873,6 +891,113 @@ function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
 function setConn(msg) { if (connStatus) connStatus.textContent = msg; }
 function isTypingInInput() { const el = document.activeElement; return !!el && ["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName); }
 function fetchHeaders(extra = {}) { return adminToken ? { ...extra, "X-Admin-Token": adminToken } : { ...extra }; }
+function clearAdminSession(reason = "") {
+  adminToken = null;
+  sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+  sessionStorage.removeItem(ADMIN_EXPIRES_STORAGE_KEY);
+  // Eliminar residuos de versiones anteriores que persistían la sesión entre pestañas.
+  localStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+  localStorage.removeItem(ADMIN_EXPIRES_STORAGE_KEY);
+  restorePendingRestart = false;
+  setAdminUI(false);
+  // Mantener los datos cargados visibles; al bloquear solo se deshabilita su edición.
+  renderScanQrScannerOptions();
+  if (cleanupHealthBadge) cleanupHealthBadge.classList.add("hidden");
+  if (reason && adminMsg) adminMsg.textContent = reason;
+}
+function persistAdminSession(token, expiresHours) {
+  const hours = Number(expiresHours || 0);
+  // Sesión aislada a la pestaña actual. Sobrevive un refresh, no el cierre de la pestaña.
+  sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, token);
+  sessionStorage.setItem(ADMIN_EXPIRES_STORAGE_KEY, String(Date.now() + Math.max(hours, 1) * 3600000));
+}
+function adminRequestInfo(url, options = {}) {
+  const parsed = new URL(String(url), window.location.origin);
+  const isAdminEndpoint = parsed.pathname.startsWith("/api/admin/");
+  return {
+    parsed,
+    isAdminEndpoint,
+    isLogin: parsed.pathname === "/api/admin/login",
+    method: String(options.method || "GET").toUpperCase(),
+  };
+}
+async function fetchWithAdminSession(url, options = {}) {
+  const info = adminRequestInfo(url, options);
+  const headers = new Headers(options.headers || {});
+  if (info.isAdminEndpoint && !info.isLogin && adminToken && !headers.has("X-Admin-Token")) {
+    headers.set("X-Admin-Token", adminToken);
+  }
+  const sentAdminToken = headers.has("X-Admin-Token");
+  const tokenPrefix = adminToken ? adminToken.slice(0, 6) : "-";
+  const response = await fetch(url, { ...options, headers });
+  if (response.status === 401 && info.isAdminEndpoint && !info.isLogin && sentAdminToken) {
+    let detail = "";
+    try {
+      const rejectedText = await response.clone().text();
+      const rejectedBody = rejectedText ? JSON.parse(rejectedText) : null;
+      detail = String(rejectedBody?.detail || rejectedText || "").trim();
+    } catch (_) {
+      detail = "";
+    }
+    const normalizedDetail = detail.toLowerCase();
+    const isTokenRejection = normalizedDetail.includes("admin token")
+      && (normalizedDetail.includes("inválido") || normalizedDetail.includes("invalido") || normalizedDetail.includes("expirado"));
+    console.warn("[admin-auth] rejected", {
+      endpoint: info.parsed.pathname,
+      method: info.method,
+      sentAdminToken,
+      tokenPrefix,
+      detail,
+    });
+    if (isTokenRejection) {
+      clearAdminSession("La sesión administrativa expiró. Vuelve a iniciar sesión.");
+    }
+  }
+  return response;
+}
+
+async function loadAllAdminDataAfterLogin(reason = "login") {
+  if (!adminToken) return false;
+  console.info("[admin-auth] loading admin data", { reason });
+  await adminLoadClientIp();
+  await adminLoadRcsConfig();
+  await loadCatalog();
+  await loadCleanupHealth();
+  await loadAdminOperatorWindows();
+  await loadQrAdminData();
+  await loadBackupStatus();
+  const selectedLocation = locations[idx(selected.x, selected.y)];
+  if (selectedLocation) fillCellForm(selectedLocation);
+  repairActionTabsLayout();
+  return true;
+}
+async function restoreAdminSession() {
+  const storedToken = sessionStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) || "";
+  const expiresAt = Number(sessionStorage.getItem(ADMIN_EXPIRES_STORAGE_KEY) || 0);
+  if (!storedToken || !expiresAt || expiresAt <= Date.now()) {
+    clearAdminSession();
+    return false;
+  }
+  adminToken = storedToken;
+  try {
+    const session = await fetchJson("/api/admin/session", { cache: "no-store" });
+    if (!session?.authenticated) throw new Error("Sesión administrativa no autenticada.");
+  } catch (err) {
+    if (adminToken) clearAdminSession("No fue posible restaurar la sesión administrativa. Vuelve a iniciar sesión.");
+    console.warn("[admin-auth] restore failed", err);
+    return false;
+  }
+  setAdminUI(true);
+  try {
+    await loadAllAdminDataAfterLogin("restore");
+    if (adminMsg) adminMsg.textContent = "Admin habilitado.";
+  } catch (err) {
+    // Un fallo de red o de carga no invalida una sesión que ya fue validada.
+    console.warn("[admin-auth] admin data reload failed", err);
+    if (adminToken && adminMsg) adminMsg.textContent = "Admin habilitado; algunos datos no pudieron actualizarse. Intenta nuevamente.";
+  }
+  return !!adminToken;
+}
 function toLocalInputValue(dt) {
   if (!dt) return "";
   const d = new Date(dt);
@@ -2697,7 +2822,7 @@ function zoomAtPoint(nextScale, mx, my) {
 }
 async function fetchJson(url, options = {}) {
   const finalOptions = { cache: 'no-store', ...options };
-  const res = await fetch(url, finalOptions);
+  const res = await fetchWithAdminSession(url, finalOptions);
   const text = await res.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch (_) {}
@@ -2874,7 +2999,7 @@ async function loadCleanupDiagnosis() {
   if (btnRefreshCleanupDiagnosis) btnRefreshCleanupDiagnosis.disabled = true;
   setCleanupActionButtonsDisabled(true);
   try {
-    const response = await fetch("/api/admin/cleanup-diagnosis", {
+    const response = await fetchWithAdminSession("/api/admin/cleanup-diagnosis", {
       headers: adminToken ? { "X-Admin-Token": adminToken } : {}
     });
     const data = await response.json();
@@ -3286,7 +3411,7 @@ async function downloadAdminFile(downloadUrl, button, fallbackName, failureMessa
   if (dbBackupsMsg) dbBackupsMsg.textContent = "";
   if (button) button.disabled = true;
   try {
-    const response = await fetch(downloadUrl, {
+    const response = await fetchWithAdminSession(downloadUrl, {
       method: "GET",
       headers: fetchHeaders(),
     });
@@ -3747,12 +3872,16 @@ function renderQrCellSummaries() {
   renderQrCellSummary(scannerSecondDestinationCell, scannerSecondDestinationCellSummary);
   renderQrCellSummary(scannerFifoChainStep3SourceCell, scannerFifoChainStep3SourceCellSummary);
   renderQrCellSummary(scannerFifoChainStep3DestinationCell, scannerFifoChainStep3DestinationCellSummary);
+  renderQrCellSummary(scannerFifoChainStep4SourceCell, scannerFifoChainStep4SourceCellSummary);
+  renderQrCellSummary(scannerFifoChainStep4DestinationCell, scannerFifoChainStep4DestinationCellSummary);
   renderQrCellSummary(qrSourceCell, qrSourceCellSummary);
   renderQrCellSummary(qrDestinationCell, qrDestinationCellSummary);
   renderQrCellSummary(qrSecondSourceCell, qrSecondSourceCellSummary);
   renderQrCellSummary(qrSecondDestinationCell, qrSecondDestinationCellSummary);
   renderQrCellSummary(qrFifoChainStep3SourceCell, qrFifoChainStep3SourceCellSummary);
   renderQrCellSummary(qrFifoChainStep3DestinationCell, qrFifoChainStep3DestinationCellSummary);
+  renderQrCellSummary(qrFifoChainStep4SourceCell, qrFifoChainStep4SourceCellSummary);
+  renderQrCellSummary(qrFifoChainStep4DestinationCell, qrFifoChainStep4DestinationCellSummary);
 }
 function normalizeRouteMode(value) {
   if (value === "fifo_chain" || value === "trmx_doble") return "fifo_chain";
@@ -3765,7 +3894,8 @@ function routeModeLabel(value) {
 }
 function fifoChainFlowLabel(item) {
   if (normalizeRouteMode(item?.route_mode) !== "fifo_chain") return routeModeLabel(item?.route_mode);
-  return normalizeFifoChainTotalSteps(item?.fifo_chain_total_steps) === 3 ? "Flujo triple FIFO" : "Flujo doble FIFO";
+  const total = normalizeFifoChainTotalSteps(item?.fifo_chain_total_steps);
+  return total === 4 ? "Flujo FIFO de 4 tramos" : (total === 3 ? "Flujo triple FIFO" : "Flujo doble FIFO");
 }
 function normalizeFifoMaterialPolicy(value) {
   return value === "any_available_from_source" ? "any_available_from_source" : "specific_material";
@@ -3781,7 +3911,7 @@ function normalizeFifoChainStep2SourceMode(value) {
 }
 function normalizeFifoChainTotalSteps(value) {
   const total = Number(value || 2);
-  return total === 3 ? 3 : 2;
+  return [2, 3, 4].includes(total) ? total : 2;
 }
 function fifoChainSourceModeLabel(value) {
   return normalizeFifoChainSourceMode(value) === "any_area_by_material" ? "Cualquier area por material" : "Area origen configurada";
@@ -3807,6 +3937,11 @@ function fifoChainStep3MaterialDisplay(item) {
   if (item?.fifo_chain_step3_material_group_id) return `Material ID ${item.fifo_chain_step3_material_group_id}`;
   return "-";
 }
+function fifoChainStep4MaterialDisplay(item) {
+  if (item?.fifo_chain_step4_material_group_name) return item.fifo_chain_step4_material_group_name;
+  if (item?.fifo_chain_step4_material_group_id) return `Material ID ${item.fifo_chain_step4_material_group_id}`;
+  return "-";
+}
 function syncFifoMaterialPolicyHelp() {
   const anyQr = normalizeFifoMaterialPolicy(qrFifoMaterialPolicy?.value) === "any_available_from_source" && (qrActionType?.value || "") === "fifo_request";
   if (qrFifoMaterialPolicyHelp) qrFifoMaterialPolicyHelp.classList.toggle("hidden", !anyQr);
@@ -3817,29 +3952,39 @@ function setFifoChainEndpointDisabled(ids, disabled) {
     if (el) el.disabled = !!disabled || !adminToken;
   });
 }
-function syncFifoChainUi(owner, routeMode, totalSteps, step1SourceMode, step2SourceMode, step3SourceMode) {
+function syncFifoChainUi(owner, routeMode, totalSteps, step1SourceMode, step2SourceMode, step3SourceMode, step4SourceMode) {
   const isFifoChain = normalizeRouteMode(routeMode) === "fifo_chain";
-  const isTriple = isFifoChain && normalizeFifoChainTotalSteps(totalSteps) === 3;
+  const normalizedTotal = normalizeFifoChainTotalSteps(totalSteps);
+  const hasStep3 = isFifoChain && normalizedTotal >= 3;
+  const hasStep4 = isFifoChain && normalizedTotal >= 4;
   const isGlobalStep1 = isFifoChain && normalizeFifoChainSourceMode(step1SourceMode) === "any_area_by_material";
   const isGlobalStep2 = isFifoChain && normalizeFifoChainSourceMode(step2SourceMode) === "any_area_by_material";
-  const isGlobalStep3 = isTriple && normalizeFifoChainSourceMode(step3SourceMode) === "any_area_by_material";
+  const isGlobalStep3 = hasStep3 && normalizeFifoChainSourceMode(step3SourceMode) === "any_area_by_material";
+  const isGlobalStep4 = hasStep4 && normalizeFifoChainSourceMode(step4SourceMode) === "any_area_by_material";
   document.querySelectorAll(`[data-fifo-chain-source1="${owner}"]`).forEach(el => el.classList.toggle("hidden", isGlobalStep1));
   document.querySelectorAll(`[data-fifo-chain-source2="${owner}"]`).forEach(el => el.classList.toggle("hidden", isGlobalStep2));
   document.querySelectorAll(`[data-fifo-chain-source3="${owner}"]`).forEach(el => el.classList.toggle("hidden", isGlobalStep3));
-  document.querySelectorAll(`[data-fifo-chain-step3="${owner}"]`).forEach(el => el.classList.toggle("hidden", !isTriple));
+  document.querySelectorAll(`[data-fifo-chain-source4="${owner}"]`).forEach(el => el.classList.toggle("hidden", isGlobalStep4));
+  document.querySelectorAll(`[data-fifo-chain-step3="${owner}"]`).forEach(el => el.classList.toggle("hidden", !hasStep3));
+  document.querySelectorAll(`[data-fifo-chain-step4="${owner}"]`).forEach(el => el.classList.toggle("hidden", !hasStep4));
   document.querySelectorAll(`[data-fifo-chain-global-note="${owner}_step1"]`).forEach(el => el.classList.toggle("hidden", !isGlobalStep1));
   document.querySelectorAll(`[data-fifo-chain-global-note="${owner}_step2"]`).forEach(el => el.classList.toggle("hidden", !isGlobalStep2));
   document.querySelectorAll(`[data-fifo-chain-global-note="${owner}_step3"]`).forEach(el => el.classList.toggle("hidden", !isGlobalStep3));
+  document.querySelectorAll(`[data-fifo-chain-global-note="${owner}_step4"]`).forEach(el => el.classList.toggle("hidden", !isGlobalStep4));
   if (owner === "scanner") {
     setFifoChainEndpointDisabled(["scannerSourceArea", "scannerSourceCell"], isGlobalStep1);
     setFifoChainEndpointDisabled(["scannerSecondSourceArea", "scannerSecondSourceCell"], isGlobalStep2);
-    setFifoChainEndpointDisabled(["scannerFifoChainStep3SourceArea", "scannerFifoChainStep3SourceCell"], isGlobalStep3 || !isTriple);
-    setFifoChainEndpointDisabled(["scannerFifoChainStep3DestinationArea", "scannerFifoChainStep3DestinationCell"], !isTriple);
+    setFifoChainEndpointDisabled(["scannerFifoChainStep3SourceArea", "scannerFifoChainStep3SourceCell"], isGlobalStep3 || !hasStep3);
+    setFifoChainEndpointDisabled(["scannerFifoChainStep3DestinationArea", "scannerFifoChainStep3DestinationCell"], !hasStep3);
+    setFifoChainEndpointDisabled(["scannerFifoChainStep4SourceArea", "scannerFifoChainStep4SourceCell"], isGlobalStep4 || !hasStep4);
+    setFifoChainEndpointDisabled(["scannerFifoChainStep4DestinationArea", "scannerFifoChainStep4DestinationCell"], !hasStep4);
   } else if (owner === "qr") {
     setFifoChainEndpointDisabled(["qrSourceArea", "qrSourceCell"], isGlobalStep1);
     setFifoChainEndpointDisabled(["qrSecondSourceArea", "qrSecondSourceCell"], isGlobalStep2);
-    setFifoChainEndpointDisabled(["qrFifoChainStep3SourceArea", "qrFifoChainStep3SourceCell"], isGlobalStep3 || !isTriple);
-    setFifoChainEndpointDisabled(["qrFifoChainStep3DestinationArea", "qrFifoChainStep3DestinationCell"], !isTriple);
+    setFifoChainEndpointDisabled(["qrFifoChainStep3SourceArea", "qrFifoChainStep3SourceCell"], isGlobalStep3 || !hasStep3);
+    setFifoChainEndpointDisabled(["qrFifoChainStep3DestinationArea", "qrFifoChainStep3DestinationCell"], !hasStep3);
+    setFifoChainEndpointDisabled(["qrFifoChainStep4SourceArea", "qrFifoChainStep4SourceCell"], isGlobalStep4 || !hasStep4);
+    setFifoChainEndpointDisabled(["qrFifoChainStep4DestinationArea", "qrFifoChainStep4DestinationCell"], !hasStep4);
   }
 }
 function syncRouteModeSections() {
@@ -3849,8 +3994,15 @@ function syncRouteModeSections() {
   document.querySelectorAll('[data-route-owner="qr"]').forEach(el => el.classList.toggle("hidden", !["double_area", "fifo_chain"].includes(qrMode)));
   document.querySelectorAll('[data-fifo-chain-owner="scanner"]').forEach(el => el.classList.toggle("hidden", scannerMode !== "fifo_chain"));
   document.querySelectorAll('[data-fifo-chain-owner="qr"]').forEach(el => el.classList.toggle("hidden", qrMode !== "fifo_chain"));
-  syncFifoChainUi("scanner", scannerMode, scannerFifoChainTotalSteps?.value, scannerFifoChainStep1SourceMode?.value, scannerFifoChainStep2SourceMode?.value, scannerFifoChainStep3SourceMode?.value);
-  syncFifoChainUi("qr", qrMode, qrFifoChainTotalSteps?.value, qrFifoChainStep1SourceMode?.value, qrFifoChainStep2SourceMode?.value, qrFifoChainStep3SourceMode?.value);
+  document.querySelectorAll('[data-fifo-chain-general="scanner"]').forEach(el => el.classList.toggle("hidden", scannerMode === "fifo_chain"));
+  document.querySelectorAll('[data-fifo-chain-general="qr"]').forEach(el => el.classList.toggle("hidden", qrMode === "fifo_chain"));
+  if (scannerDefaultMaterial) scannerDefaultMaterial.disabled = scannerMode === "fifo_chain" || !adminToken;
+  if (scannerFifoMaterialPolicy) scannerFifoMaterialPolicy.disabled = scannerMode === "fifo_chain" || !adminToken;
+  if (qrMaterial) qrMaterial.disabled = qrMode === "fifo_chain" || !adminToken;
+  if (qrRack) qrRack.disabled = qrMode === "fifo_chain" || !adminToken;
+  if (qrFifoMaterialPolicy) qrFifoMaterialPolicy.disabled = qrMode === "fifo_chain" || !adminToken;
+  syncFifoChainUi("scanner", scannerMode, scannerFifoChainTotalSteps?.value, scannerFifoChainStep1SourceMode?.value, scannerFifoChainStep2SourceMode?.value, scannerFifoChainStep3SourceMode?.value, scannerFifoChainStep4SourceMode?.value);
+  syncFifoChainUi("qr", qrMode, qrFifoChainTotalSteps?.value, qrFifoChainStep1SourceMode?.value, qrFifoChainStep2SourceMode?.value, qrFifoChainStep3SourceMode?.value, qrFifoChainStep4SourceMode?.value);
 }
 function validateRouteConfig(prefix, payload) {
   const mode = normalizeRouteMode(payload.route_mode);
@@ -3865,12 +4017,23 @@ function validateRouteConfig(prefix, payload) {
     const step1SourceMode = normalizeFifoChainSourceMode(payload.fifo_chain_step1_source_mode);
     const step2SourceMode = normalizeFifoChainSourceMode(payload.fifo_chain_step2_source_mode);
     const step3SourceMode = normalizeFifoChainSourceMode(payload.fifo_chain_step3_source_mode);
+    const step4SourceMode = normalizeFifoChainSourceMode(payload.fifo_chain_step4_source_mode);
     const hasSource3 = !!payload.fifo_chain_step3_source_area_id || !!payload.fifo_chain_step3_source_cell_id;
     const hasDestination3 = !!payload.fifo_chain_step3_destination_area_id || !!payload.fifo_chain_step3_destination_cell_id;
+    const hasSource4 = !!payload.fifo_chain_step4_source_area_id || !!payload.fifo_chain_step4_source_cell_id;
+    const hasDestination4 = !!payload.fifo_chain_step4_destination_area_id || !!payload.fifo_chain_step4_destination_cell_id;
     payload.fifo_chain_total_steps = totalSteps;
     payload.fifo_chain_step1_source_mode = step1SourceMode;
     payload.fifo_chain_step2_source_mode = step2SourceMode;
     payload.fifo_chain_step3_source_mode = step3SourceMode;
+    payload.fifo_chain_step4_source_mode = step4SourceMode;
+    payload.material_group_id = null;
+    payload.rack_id = null;
+    payload.default_material_group_id = null;
+    payload.fifo_material_policy = "specific_material";
+    if (!payload.fifo_chain_step1_material_group_id) {
+      throw new Error("El tramo 1 requiere Material requerido tramo 1.");
+    }
     if (!hasDestination1) {
       throw new Error(step1SourceMode === "any_area_by_material" ? "El tramo 1 por material requiere destino 1." : `${prefix}: Flujo doble FIFO requiere destino para tramo 1.`);
     }
@@ -3882,8 +4045,6 @@ function validateRouteConfig(prefix, payload) {
       payload.source_cell_id = null;
     } else if (!hasSource1) {
       throw new Error(`${prefix}: Flujo doble FIFO requiere origen para tramo 1.`);
-    } else {
-      payload.fifo_chain_step1_material_group_id = null;
     }
     if (!hasDestination2) {
       throw new Error(step2SourceMode === "any_area_by_material" ? "El tramo 2 por material requiere destino 2." : `${prefix}: Flujo doble FIFO requiere destino para tramo 2.`);
@@ -3895,7 +4056,6 @@ function validateRouteConfig(prefix, payload) {
       payload.second_source_area_id = null;
       payload.second_source_cell_id = null;
     } else {
-      payload.fifo_chain_step2_material_group_id = null;
       if (!hasSource2) {
         throw new Error(`${prefix}: Flujo doble FIFO requiere origen para tramo 2.`);
       }
@@ -3907,6 +4067,12 @@ function validateRouteConfig(prefix, payload) {
       payload.fifo_chain_step3_source_cell_id = null;
       payload.fifo_chain_step3_destination_area_id = null;
       payload.fifo_chain_step3_destination_cell_id = null;
+      payload.fifo_chain_step4_source_mode = "configured_area";
+      payload.fifo_chain_step4_material_group_id = null;
+      payload.fifo_chain_step4_source_area_id = null;
+      payload.fifo_chain_step4_source_cell_id = null;
+      payload.fifo_chain_step4_destination_area_id = null;
+      payload.fifo_chain_step4_destination_cell_id = null;
       return;
     }
     if (step3SourceMode === "any_area_by_material") {
@@ -3918,11 +4084,33 @@ function validateRouteConfig(prefix, payload) {
       }
       payload.fifo_chain_step3_source_area_id = null;
       payload.fifo_chain_step3_source_cell_id = null;
+    } else {
+      if (!hasSource3 || !hasDestination3) {
+        throw new Error("El tramo 3 requiere origen y destino.");
+      }
+    }
+    if (totalSteps < 4) {
+      payload.fifo_chain_step4_source_mode = "configured_area";
+      payload.fifo_chain_step4_material_group_id = null;
+      payload.fifo_chain_step4_source_area_id = null;
+      payload.fifo_chain_step4_source_cell_id = null;
+      payload.fifo_chain_step4_destination_area_id = null;
+      payload.fifo_chain_step4_destination_cell_id = null;
       return;
     }
-    payload.fifo_chain_step3_material_group_id = null;
-    if (!hasSource3 || !hasDestination3) {
-      throw new Error("El tramo 3 requiere origen y destino.");
+    if (step4SourceMode === "any_area_by_material") {
+      if (!payload.fifo_chain_step4_material_group_id) {
+        throw new Error("El tramo 4 por material requiere Material requerido tramo 4.");
+      }
+      if (!hasDestination4) {
+        throw new Error("El tramo 4 por material requiere destino 4.");
+      }
+      payload.fifo_chain_step4_source_area_id = null;
+      payload.fifo_chain_step4_source_cell_id = null;
+      return;
+    }
+    if (!hasSource4 || !hasDestination4) {
+      throw new Error("Tramo 4 requiere origen y destino.");
     }
     return;
   }
@@ -3934,7 +4122,7 @@ function validateRouteConfig(prefix, payload) {
   }
 }
 function renderQrCatalogOptions() {
-  [scannerSourceArea, scannerDestinationArea, scannerSecondSourceArea, scannerSecondDestinationArea, scannerFifoChainStep3SourceArea, scannerFifoChainStep3DestinationArea, scannerStorageArea, scannerEmptyRackArea, qrSourceArea, qrDestinationArea, qrSecondSourceArea, qrSecondDestinationArea, qrFifoChainStep3SourceArea, qrFifoChainStep3DestinationArea, qrTransitionSourceArea, qrTransitionDestinationArea].forEach((el) => {
+  [scannerSourceArea, scannerDestinationArea, scannerSecondSourceArea, scannerSecondDestinationArea, scannerFifoChainStep3SourceArea, scannerFifoChainStep3DestinationArea, scannerFifoChainStep4SourceArea, scannerFifoChainStep4DestinationArea, scannerStorageArea, scannerEmptyRackArea, qrSourceArea, qrDestinationArea, qrSecondSourceArea, qrSecondDestinationArea, qrFifoChainStep3SourceArea, qrFifoChainStep3DestinationArea, qrFifoChainStep4SourceArea, qrFifoChainStep4DestinationArea, qrTransitionSourceArea, qrTransitionDestinationArea].forEach((el) => {
     if (!el) return;
     const cur = el.value;
     el.innerHTML = buildAreaOptions(cur);
@@ -3944,7 +4132,7 @@ function renderQrCatalogOptions() {
     scannerCancelReturnArea.innerHTML = buildScannerCancelReturnAreaOptions(cur);
     renderScannerCancelReturnAreaWarning();
   }
-  [scannerDefaultMaterial, scannerFifoChainStep1Material, scannerFifoChainStep2Material, scannerFifoChainStep3Material, qrMaterial, qrFifoChainStep1Material, qrFifoChainStep2Material, qrFifoChainStep3Material, qrTransitionCurrentMaterial, qrTransitionNextMaterial].forEach((el) => {
+  [scannerDefaultMaterial, scannerFifoChainStep1Material, scannerFifoChainStep2Material, scannerFifoChainStep3Material, scannerFifoChainStep4Material, qrMaterial, qrFifoChainStep1Material, qrFifoChainStep2Material, qrFifoChainStep3Material, qrFifoChainStep4Material, qrTransitionCurrentMaterial, qrTransitionNextMaterial].forEach((el) => {
     if (!el) return;
     const cur = el.value;
     el.innerHTML = buildMaterialOptions(cur);
@@ -3953,7 +4141,7 @@ function renderQrCatalogOptions() {
     const cur = qrRack.value;
     qrRack.innerHTML = buildRackSelectOptions(cur);
   }
-  [scannerSourceCell, scannerDestinationCell, scannerSecondSourceCell, scannerSecondDestinationCell, scannerFifoChainStep3SourceCell, scannerFifoChainStep3DestinationCell, qrSourceCell, qrDestinationCell, qrSecondSourceCell, qrSecondDestinationCell, qrFifoChainStep3SourceCell, qrFifoChainStep3DestinationCell, qrTransitionSourceCell, qrTransitionDestinationCell].forEach((el) => {
+  [scannerSourceCell, scannerDestinationCell, scannerSecondSourceCell, scannerSecondDestinationCell, scannerFifoChainStep3SourceCell, scannerFifoChainStep3DestinationCell, scannerFifoChainStep4SourceCell, scannerFifoChainStep4DestinationCell, qrSourceCell, qrDestinationCell, qrSecondSourceCell, qrSecondDestinationCell, qrFifoChainStep3SourceCell, qrFifoChainStep3DestinationCell, qrFifoChainStep4SourceCell, qrFifoChainStep4DestinationCell, qrTransitionSourceCell, qrTransitionDestinationCell].forEach((el) => {
     if (!el) return;
     const cur = el.value;
     el.innerHTML = buildCellOptions(cur);
@@ -3998,6 +4186,12 @@ function clearScannerStationForm() {
   if (scannerFifoChainStep3DestinationArea) scannerFifoChainStep3DestinationArea.value = "";
   if (scannerFifoChainStep3SourceCell) scannerFifoChainStep3SourceCell.value = "";
   if (scannerFifoChainStep3DestinationCell) scannerFifoChainStep3DestinationCell.value = "";
+  if (scannerFifoChainStep4SourceMode) scannerFifoChainStep4SourceMode.value = "configured_area";
+  if (scannerFifoChainStep4Material) scannerFifoChainStep4Material.value = "";
+  if (scannerFifoChainStep4SourceArea) scannerFifoChainStep4SourceArea.value = "";
+  if (scannerFifoChainStep4DestinationArea) scannerFifoChainStep4DestinationArea.value = "";
+  if (scannerFifoChainStep4SourceCell) scannerFifoChainStep4SourceCell.value = "";
+  if (scannerFifoChainStep4DestinationCell) scannerFifoChainStep4DestinationCell.value = "";
   scannerAgvCode.value = "";
   scannerTaskTyp.value = "";
   scannerPriority.value = 0;
@@ -4061,6 +4255,18 @@ function loadScannerStationForm(id) {
     scannerFifoChainStep3DestinationCell.innerHTML = buildCellOptions(item.fifo_chain_step3_destination_cell_id || "");
     scannerFifoChainStep3DestinationCell.value = item.fifo_chain_step3_destination_cell_id || "";
   }
+  if (scannerFifoChainStep4SourceMode) scannerFifoChainStep4SourceMode.value = normalizeFifoChainSourceMode(item.fifo_chain_step4_source_mode);
+  if (scannerFifoChainStep4Material) scannerFifoChainStep4Material.value = item.fifo_chain_step4_material_group_id || "";
+  if (scannerFifoChainStep4SourceArea) scannerFifoChainStep4SourceArea.value = item.fifo_chain_step4_source_area_id || "";
+  if (scannerFifoChainStep4DestinationArea) scannerFifoChainStep4DestinationArea.value = item.fifo_chain_step4_destination_area_id || "";
+  if (scannerFifoChainStep4SourceCell) {
+    scannerFifoChainStep4SourceCell.innerHTML = buildCellOptions(item.fifo_chain_step4_source_cell_id || "");
+    scannerFifoChainStep4SourceCell.value = item.fifo_chain_step4_source_cell_id || "";
+  }
+  if (scannerFifoChainStep4DestinationCell) {
+    scannerFifoChainStep4DestinationCell.innerHTML = buildCellOptions(item.fifo_chain_step4_destination_cell_id || "");
+    scannerFifoChainStep4DestinationCell.value = item.fifo_chain_step4_destination_cell_id || "";
+  }
   syncRouteModeSections();
   scannerAgvCode.value = item.agv_code || "";
   scannerTaskTyp.value = item.task_typ || "";
@@ -4092,6 +4298,12 @@ function scannerStationPayload() {
     fifo_chain_step3_source_cell_id: scannerFifoChainStep3SourceCell?.value ? Number(scannerFifoChainStep3SourceCell.value) : null,
     fifo_chain_step3_destination_area_id: scannerFifoChainStep3DestinationArea?.value ? Number(scannerFifoChainStep3DestinationArea.value) : null,
     fifo_chain_step3_destination_cell_id: scannerFifoChainStep3DestinationCell?.value ? Number(scannerFifoChainStep3DestinationCell.value) : null,
+    fifo_chain_step4_source_mode: normalizeFifoChainSourceMode(scannerFifoChainStep4SourceMode?.value),
+    fifo_chain_step4_material_group_id: scannerFifoChainStep4Material?.value ? Number(scannerFifoChainStep4Material.value) : null,
+    fifo_chain_step4_source_area_id: scannerFifoChainStep4SourceArea?.value ? Number(scannerFifoChainStep4SourceArea.value) : null,
+    fifo_chain_step4_source_cell_id: scannerFifoChainStep4SourceCell?.value ? Number(scannerFifoChainStep4SourceCell.value) : null,
+    fifo_chain_step4_destination_area_id: scannerFifoChainStep4DestinationArea?.value ? Number(scannerFifoChainStep4DestinationArea.value) : null,
+    fifo_chain_step4_destination_cell_id: scannerFifoChainStep4DestinationCell?.value ? Number(scannerFifoChainStep4DestinationCell.value) : null,
     second_source_area_id: scannerSecondSourceArea?.value ? Number(scannerSecondSourceArea.value) : null,
     second_destination_area_id: scannerSecondDestinationArea?.value ? Number(scannerSecondDestinationArea.value) : null,
     second_source_cell_id: scannerSecondSourceCell?.value ? Number(scannerSecondSourceCell.value) : null,
@@ -4130,11 +4342,14 @@ function renderScannerStationsList() {
       <td>${escapeHtml(fifoChainStep3EndpointLabel(s, "source"))}</td>
       <td>${escapeHtml(fifoChainStep3EndpointLabel(s, "destination"))}</td>
       <td>${escapeHtml(fifoChainStep3MaterialDisplayForList(s))}</td>
+      <td>${escapeHtml(fifoChainStep4EndpointLabel(s, "source"))}</td>
+      <td>${escapeHtml(fifoChainStep4EndpointLabel(s, "destination"))}</td>
+      <td>${escapeHtml(fifoChainStep4MaterialDisplayForList(s))}</td>
       <td>${escapeHtml(s.default_action || "-")}</td>
       <td>${escapeHtml(fifoMaterialPolicyLabel(s.fifo_material_policy))}</td>
       <td>${Number(s.is_active ?? 0) ? "Activo" : "Inactivo"}</td>
     </tr>`).join("");
-  scannerStationsList.innerHTML = `<table class="diagnosis-table qr-route-table"><thead><tr><th>C&oacute;digo scanner</th><th>Modo de ruta</th><th>Origen 1</th><th>Destino 1</th><th>Material tramo 1</th><th>Origen 2</th><th>Destino 2</th><th>Material tramo 2</th><th>Origen 3</th><th>Destino 3</th><th>Material tramo 3</th><th>Default action</th><th>Modo selecci&oacute;n</th><th>Activo</th></tr></thead><tbody>${rows}</tbody></table>`;
+  scannerStationsList.innerHTML = `<table class="diagnosis-table qr-route-table"><thead><tr><th>C&oacute;digo scanner</th><th>Modo de ruta</th><th>Origen 1</th><th>Destino 1</th><th>Material tramo 1</th><th>Origen 2</th><th>Destino 2</th><th>Material tramo 2</th><th>Origen 3</th><th>Destino 3</th><th>Material tramo 3</th><th>Origen 4</th><th>Destino 4</th><th>Material tramo 4</th><th>Default action</th><th>Modo selecci&oacute;n</th><th>Activo</th></tr></thead><tbody>${rows}</tbody></table>`;
   scannerStationsList.querySelectorAll("[data-scanner-id]").forEach(btn => btn.addEventListener("click", () => loadScannerStationForm(Number(btn.dataset.scannerId))));
 }
 function buildScannerStationOptions(selectedValue = "") {
@@ -4212,6 +4427,12 @@ function clearQrRuleForm() {
   if (qrFifoChainStep3DestinationArea) qrFifoChainStep3DestinationArea.value = "";
   if (qrFifoChainStep3SourceCell) qrFifoChainStep3SourceCell.value = "";
   if (qrFifoChainStep3DestinationCell) qrFifoChainStep3DestinationCell.value = "";
+  if (qrFifoChainStep4SourceMode) qrFifoChainStep4SourceMode.value = "configured_area";
+  if (qrFifoChainStep4Material) qrFifoChainStep4Material.value = "";
+  if (qrFifoChainStep4SourceArea) qrFifoChainStep4SourceArea.value = "";
+  if (qrFifoChainStep4DestinationArea) qrFifoChainStep4DestinationArea.value = "";
+  if (qrFifoChainStep4SourceCell) qrFifoChainStep4SourceCell.value = "";
+  if (qrFifoChainStep4DestinationCell) qrFifoChainStep4DestinationCell.value = "";
   qrRack.value = "";
   if (qrRouteMode) qrRouteMode.value = "simple_area";
   qrSourceArea.value = "";
@@ -4278,6 +4499,18 @@ function loadQrRuleForm(id) {
     qrFifoChainStep3DestinationCell.innerHTML = buildCellOptions(item.fifo_chain_step3_destination_cell_id || "");
     qrFifoChainStep3DestinationCell.value = item.fifo_chain_step3_destination_cell_id || "";
   }
+  if (qrFifoChainStep4SourceMode) qrFifoChainStep4SourceMode.value = normalizeFifoChainSourceMode(item.fifo_chain_step4_source_mode);
+  if (qrFifoChainStep4Material) qrFifoChainStep4Material.value = item.fifo_chain_step4_material_group_id || "";
+  if (qrFifoChainStep4SourceArea) qrFifoChainStep4SourceArea.value = item.fifo_chain_step4_source_area_id || "";
+  if (qrFifoChainStep4DestinationArea) qrFifoChainStep4DestinationArea.value = item.fifo_chain_step4_destination_area_id || "";
+  if (qrFifoChainStep4SourceCell) {
+    qrFifoChainStep4SourceCell.innerHTML = buildCellOptions(item.fifo_chain_step4_source_cell_id || "");
+    qrFifoChainStep4SourceCell.value = item.fifo_chain_step4_source_cell_id || "";
+  }
+  if (qrFifoChainStep4DestinationCell) {
+    qrFifoChainStep4DestinationCell.innerHTML = buildCellOptions(item.fifo_chain_step4_destination_cell_id || "");
+    qrFifoChainStep4DestinationCell.value = item.fifo_chain_step4_destination_cell_id || "";
+  }
   renderQrCellSummaries();
   syncRouteModeSections();
   qrPriority.value = item.priority ?? "";
@@ -4308,6 +4541,12 @@ function qrRulePayload() {
     fifo_chain_step3_source_cell_id: qrFifoChainStep3SourceCell?.value ? Number(qrFifoChainStep3SourceCell.value) : null,
     fifo_chain_step3_destination_area_id: qrFifoChainStep3DestinationArea?.value ? Number(qrFifoChainStep3DestinationArea.value) : null,
     fifo_chain_step3_destination_cell_id: qrFifoChainStep3DestinationCell?.value ? Number(qrFifoChainStep3DestinationCell.value) : null,
+    fifo_chain_step4_source_mode: normalizeFifoChainSourceMode(qrFifoChainStep4SourceMode?.value),
+    fifo_chain_step4_material_group_id: qrFifoChainStep4Material?.value ? Number(qrFifoChainStep4Material.value) : null,
+    fifo_chain_step4_source_area_id: qrFifoChainStep4SourceArea?.value ? Number(qrFifoChainStep4SourceArea.value) : null,
+    fifo_chain_step4_source_cell_id: qrFifoChainStep4SourceCell?.value ? Number(qrFifoChainStep4SourceCell.value) : null,
+    fifo_chain_step4_destination_area_id: qrFifoChainStep4DestinationArea?.value ? Number(qrFifoChainStep4DestinationArea.value) : null,
+    fifo_chain_step4_destination_cell_id: qrFifoChainStep4DestinationCell?.value ? Number(qrFifoChainStep4DestinationCell.value) : null,
     rack_id: qrRack.value ? Number(qrRack.value) : null,
     route_mode: normalizeRouteMode(qrRouteMode?.value),
     source_area_id: qrSourceArea.value ? Number(qrSourceArea.value) : null,
@@ -4338,7 +4577,7 @@ function revokeQrRuleModalImageUrl() {
   }
 }
 async function fetchQrRuleImageObjectUrl(ruleId, size) {
-  const res = await fetch(API.adminQrActionRuleImage(ruleId, size), {
+  const res = await fetchWithAdminSession(API.adminQrActionRuleImage(ruleId, size), {
     cache: "no-store",
     headers: fetchHeaders(),
   });
@@ -4396,7 +4635,7 @@ function secondaryRouteEndpointLabel(item, kind) {
   return routeEndpointLabel(item, kind);
 }
 function fifoChainStep3EndpointLabel(item, kind) {
-  if (normalizeRouteMode(item?.route_mode) !== "fifo_chain" || normalizeFifoChainTotalSteps(item?.fifo_chain_total_steps) !== 3) return "-";
+  if (normalizeRouteMode(item?.route_mode) !== "fifo_chain" || normalizeFifoChainTotalSteps(item?.fifo_chain_total_steps) < 3) return "-";
   if (kind === "source" && normalizeFifoChainSourceMode(item?.fifo_chain_step3_source_mode) === "any_area_by_material") {
     return "Cualquier area por material";
   }
@@ -4411,8 +4650,27 @@ function fifoChainStep3EndpointLabel(item, kind) {
   return area || cell || "-";
 }
 function fifoChainStep3MaterialDisplayForList(item) {
-  if (normalizeRouteMode(item?.route_mode) !== "fifo_chain" || normalizeFifoChainTotalSteps(item?.fifo_chain_total_steps) !== 3) return "-";
+  if (normalizeRouteMode(item?.route_mode) !== "fifo_chain" || normalizeFifoChainTotalSteps(item?.fifo_chain_total_steps) < 3) return "-";
   return fifoChainStep3MaterialDisplay(item);
+}
+function fifoChainStep4EndpointLabel(item, kind) {
+  if (normalizeRouteMode(item?.route_mode) !== "fifo_chain" || normalizeFifoChainTotalSteps(item?.fifo_chain_total_steps) < 4) return "-";
+  if (kind === "source" && normalizeFifoChainSourceMode(item?.fifo_chain_step4_source_mode) === "any_area_by_material") {
+    return `Cualquier area por material ${fifoChainStep4MaterialDisplay(item)}`;
+  }
+  const prefix = kind === "source" ? "fifo_chain_step4_source" : "fifo_chain_step4_destination";
+  const areaName = item?.[`${prefix}_area_name`];
+  const areaId = item?.[`${prefix}_area_id`];
+  const cellCode = item?.[`${prefix}_cell_code`];
+  const cellId = item?.[`${prefix}_cell_id`];
+  const area = areaName || (areaId ? `Area ID ${areaId}` : "");
+  const cell = cellCode || (cellId ? `Celda ID ${cellId}` : "");
+  if (area && cell) return `${area} / ${cell}`;
+  return area || cell || "-";
+}
+function fifoChainStep4MaterialDisplayForList(item) {
+  if (normalizeRouteMode(item?.route_mode) !== "fifo_chain" || normalizeFifoChainTotalSteps(item?.fifo_chain_total_steps) < 4) return "-";
+  return fifoChainStep4MaterialDisplay(item);
 }
 function renderQrRuleMetaHtml(q) {
   const rows = [
@@ -4433,6 +4691,9 @@ function renderQrRuleMetaHtml(q) {
     ["Origen tramo 3", fifoChainStep3EndpointLabel(q, "source")],
     ["Material tramo 3", fifoChainStep3MaterialDisplayForList(q)],
     ["Destino tramo 3", fifoChainStep3EndpointLabel(q, "destination")],
+    ["Origen tramo 4", fifoChainStep4EndpointLabel(q, "source")],
+    ["Material tramo 4", fifoChainStep4MaterialDisplayForList(q)],
+    ["Destino tramo 4", fifoChainStep4EndpointLabel(q, "destination")],
     ["Scanner requerido", Number(q?.requires_scanner_station ?? 0) ? "Sí" : "No"],
     ["Estado", Number(q?.is_active ?? 0) ? "Activo" : "Inactivo"],
   ];
@@ -4560,11 +4821,14 @@ function renderQrRulesList() {
       <td>${escapeHtml(fifoChainStep3EndpointLabel(q, "source"))}</td>
       <td>${escapeHtml(fifoChainStep3EndpointLabel(q, "destination"))}</td>
       <td>${escapeHtml(fifoChainStep3MaterialDisplayForList(q))}</td>
+      <td>${escapeHtml(fifoChainStep4EndpointLabel(q, "source"))}</td>
+      <td>${escapeHtml(fifoChainStep4EndpointLabel(q, "destination"))}</td>
+      <td>${escapeHtml(fifoChainStep4MaterialDisplayForList(q))}</td>
       <td>${escapeHtml(q.agv_code || "-")}</td>
       <td>${escapeHtml(q.task_typ || "-")}</td>
       <td>${Number(q.is_active ?? 0) ? "Activo" : "Inactivo"}</td>
     </tr>`).join("");
-  qrRulesList.innerHTML = `<table class="diagnosis-table qr-route-table"><thead><tr><th>QR le&iacute;do</th><th>Valor</th><th>Acci&oacute;n</th><th>Material</th><th>Modo selecci&oacute;n</th><th>Modo de ruta</th><th>Origen tramo 1</th><th>Destino 1</th><th>Material tramo 1</th><th>Origen 2</th><th>Destino 2</th><th>Material tramo 2</th><th>Origen 3</th><th>Destino 3</th><th>Material tramo 3</th><th>AGV</th><th>Task type</th><th>Activo</th></tr></thead><tbody>${rows}</tbody></table>`;
+  qrRulesList.innerHTML = `<table class="diagnosis-table qr-route-table"><thead><tr><th>QR le&iacute;do</th><th>Valor</th><th>Acci&oacute;n</th><th>Material</th><th>Modo selecci&oacute;n</th><th>Modo de ruta</th><th>Origen tramo 1</th><th>Destino 1</th><th>Material tramo 1</th><th>Origen 2</th><th>Destino 2</th><th>Material tramo 2</th><th>Origen 3</th><th>Destino 3</th><th>Material tramo 3</th><th>Origen 4</th><th>Destino 4</th><th>Material tramo 4</th><th>AGV</th><th>Task type</th><th>Activo</th></tr></thead><tbody>${rows}</tbody></table>`;
   qrRulesList.querySelectorAll("[data-qr-rule-id]").forEach(row => {
     row.addEventListener("click", (ev) => {
       if (ev.target.closest("[data-qr-preview-id]")) return;
@@ -5071,7 +5335,7 @@ function previewRoutePointsRows(result) {
 function previewFifoChainStepsRows(result) {
   const steps = Array.isArray(result?.fifo_chain_steps) ? result.fifo_chain_steps.slice() : (Array.isArray(result?.trmx_steps) ? result.trmx_steps.slice() : []);
   const totalSteps = normalizeFifoChainTotalSteps(result?.fifo_chain_total_steps ?? result?.trmx_total_steps);
-  if (totalSteps === 3 && !steps.some(step => Number(step?.step || 0) === 3)) {
+  if (totalSteps >= 3 && !steps.some(step => Number(step?.step || 0) === 3)) {
     steps.push({
       step: 3,
       source_mode: result?.fifo_chain_step3_source_mode,
@@ -5080,14 +5344,24 @@ function previewFifoChainStepsRows(result) {
       destination: result?.fifo_chain_step3_destination,
     });
   }
+  if (totalSteps >= 4 && !steps.some(step => Number(step?.step || 0) === 4)) {
+    steps.push({
+      step: 4,
+      source_mode: result?.fifo_chain_step4_source_mode,
+      step4_material: result?.fifo_chain_step4_material,
+      source: result?.fifo_chain_step4_source,
+      destination: result?.fifo_chain_step4_destination,
+    });
+  }
   if (!steps.length) return "";
   return steps.map((step) => {
     const sourceMode = normalizeFifoChainStep2SourceMode(step?.source_mode || step?.source?.source_mode);
     const isGlobalStep1 = Number(step?.step || 0) === 1 && sourceMode === "any_area_by_material";
     const isGlobalStep2 = Number(step?.step || 0) === 2 && sourceMode === "any_area_by_material";
     const isGlobalStep3 = Number(step?.step || 0) === 3 && sourceMode === "any_area_by_material";
-    const materialLabel = entityLabel(step?.step1_material || step?.step2_material || step?.step3_material || result?.fifo_chain_step1_material || result?.fifo_chain_step2_material || result?.fifo_chain_step3_material, "");
-    const source = isGlobalStep1 || isGlobalStep2 || isGlobalStep3
+    const isGlobalStep4 = Number(step?.step || 0) === 4 && sourceMode === "any_area_by_material";
+    const materialLabel = entityLabel(step?.step1_material || step?.step2_material || step?.step3_material || step?.step4_material || result?.fifo_chain_step1_material || result?.fifo_chain_step2_material || result?.fifo_chain_step3_material || result?.fifo_chain_step4_material, "");
+    const source = isGlobalStep1 || isGlobalStep2 || isGlobalStep3 || isGlobalStep4
       ? `Cualquier area con material ${materialLabel || "-"}`
       : `${entityLabel(step?.source?.area, "") || "-"} / ${cellPayloadLabel(step?.source?.cell)}`;
     const destination = `${entityLabel(step?.destination?.area, "") || "-"} / ${cellPayloadLabel(step?.destination?.cell)}`;
@@ -5102,6 +5376,7 @@ function previewFifoChainStepsRows(result) {
     }
     if (isGlobalStep2) return row + previewDetailRow("Nota tramo 2", "El rack del tramo 2 se revalidara al finalizar el tramo 1.");
     if (isGlobalStep3) return row + previewDetailRow("Nota tramo 3", "El rack del tramo 3 se revalidara al finalizar el tramo 2.");
+    if (isGlobalStep4) return row + previewDetailRow("Nota tramo 4", "El rack se revalidara al finalizar el tramo anterior.");
     return row;
   }).join("");
 }
@@ -7622,20 +7897,13 @@ btnAdminLogin?.addEventListener("click", async () => {
   try {
     const data = await fetchJson(API.adminLogin, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: adminPwd.value || "" }) });
     adminToken = data.token;
+    persistAdminSession(adminToken, data.expires_hours);
     setAdminUI(true);
     adminMsg.textContent = "Admin habilitado.";
-    await adminLoadClientIp();
-    await adminLoadRcsConfig();
-    await loadCatalog();
-    await loadCleanupHealth();
-    await loadAdminOperatorWindows();
-    await loadQrAdminData();
-    await loadBackupStatus();
-    fillCellForm(locations[idx(selected.x, selected.y)]);
-    repairActionTabsLayout();
+    await loadAllAdminDataAfterLogin("login");
   } catch (err) { adminMsg.textContent = `Error: ${String(err)}`; }
 });
-btnAdminLock?.addEventListener("click", () => { adminToken = null; restorePendingRestart = false; setAdminUI(false); clearAdminOperatorWindowForm(); renderScanQrScannerOptions(); if (cleanupHealthBadge) cleanupHealthBadge.classList.add("hidden"); adminMsg.textContent = "Admin bloqueado."; });
+btnAdminLock?.addEventListener("click", () => clearAdminSession("Admin bloqueado."));
 btnOpenDbBackupsModal?.addEventListener("click", () => openDbBackupsModal());
 btnCloseDbBackupsModal?.addEventListener("click", () => closeDbBackupsModal());
 btnDownloadDb?.addEventListener("click", () => downloadDatabaseBackup());
@@ -7874,6 +8142,7 @@ scannerFifoChainTotalSteps?.addEventListener("change", syncRouteModeSections);
 scannerFifoChainStep1SourceMode?.addEventListener("change", syncRouteModeSections);
 scannerFifoChainStep2SourceMode?.addEventListener("change", syncRouteModeSections);
 scannerFifoChainStep3SourceMode?.addEventListener("change", syncRouteModeSections);
+scannerFifoChainStep4SourceMode?.addEventListener("change", syncRouteModeSections);
 btnNewQrRule?.addEventListener("click", () => { clearQrRuleForm(); if (qrAdminMsg) qrAdminMsg.textContent = ""; });
 btnSaveQrRule?.addEventListener("click", () => saveQrRule().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
 btnDisableQrRule?.addEventListener("click", () => disableQrRule().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
@@ -7882,6 +8151,7 @@ qrFifoChainTotalSteps?.addEventListener("change", syncRouteModeSections);
 qrFifoChainStep1SourceMode?.addEventListener("change", syncRouteModeSections);
 qrFifoChainStep2SourceMode?.addEventListener("change", syncRouteModeSections);
 qrFifoChainStep3SourceMode?.addEventListener("change", syncRouteModeSections);
+qrFifoChainStep4SourceMode?.addEventListener("change", syncRouteModeSections);
 qrActionType?.addEventListener("change", syncFifoMaterialPolicyHelp);
 qrFifoMaterialPolicy?.addEventListener("change", syncFifoMaterialPolicyHelp);
 btnNewQrTransitionRule?.addEventListener("click", () => { clearQrTransitionRuleForm(); renderQrTransitionQrOptions(); renderQrTransitionScannerOptions(); renderQrCatalogOptions(); if (qrAdminMsg) qrAdminMsg.textContent = ""; });
@@ -7898,7 +8168,7 @@ btnSaveScanTerminal?.addEventListener("click", () => saveScanTerminal().catch(er
 btnRefreshScanTerminals?.addEventListener("click", () => loadScanTerminals().then(() => { if (qrAdminMsg) qrAdminMsg.textContent = "Terminales PDA actualizados."; }).catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
 btnDisableScanTerminal?.addEventListener("click", () => disableScanTerminal().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
 btnRefreshScanEvents?.addEventListener("click", () => loadScanEvents().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
-[scannerSourceCell, scannerDestinationCell, scannerSecondSourceCell, scannerSecondDestinationCell, scannerFifoChainStep3SourceCell, scannerFifoChainStep3DestinationCell, qrSourceCell, qrDestinationCell, qrSecondSourceCell, qrSecondDestinationCell, qrFifoChainStep3SourceCell, qrFifoChainStep3DestinationCell].forEach(el => el?.addEventListener("change", renderQrCellSummaries));
+[scannerSourceCell, scannerDestinationCell, scannerSecondSourceCell, scannerSecondDestinationCell, scannerFifoChainStep3SourceCell, scannerFifoChainStep3DestinationCell, scannerFifoChainStep4SourceCell, scannerFifoChainStep4DestinationCell, qrSourceCell, qrDestinationCell, qrSecondSourceCell, qrSecondDestinationCell, qrFifoChainStep3SourceCell, qrFifoChainStep3DestinationCell, qrFifoChainStep4SourceCell, qrFifoChainStep4DestinationCell].forEach(el => el?.addEventListener("change", renderQrCellSummaries));
 btnScanQrPreview?.addEventListener("click", () => runScanQrPreview());
 btnScanQrExecute?.addEventListener("click", () => runScanQrPreview("execute"));
 scanQrValue?.addEventListener("keydown", (ev) => {
@@ -8095,6 +8365,7 @@ if (operatorActionDynamicFields) operatorActionDynamicFields.addEventListener('i
     reorderActionCards();
     initActionCardsLayout();
     setAdminUI(false);
+    await restoreAdminSession();
     initSplitter();
     initVerticalSplitter();
     ensureSplitterMode();
@@ -8184,7 +8455,7 @@ async function validateSoftwareUpdatePackage() {
   if (resultBox) resultBox.textContent = "Validando paquete...";
 
   try {
-    const response = await fetch("/api/admin/software-update/validate", {
+    const response = await fetchWithAdminSession("/api/admin/software-update/validate", {
       method: "POST",
       headers: adminToken ? { "X-Admin-Token": adminToken } : {},
       body: formData
@@ -8228,7 +8499,7 @@ async function applyValidatedSoftwareUpdate() {
   if (applyBtn) applyBtn.disabled = true;
 
   try {
-    const response = await fetch("/api/admin/software-update/apply", {
+    const response = await fetchWithAdminSession("/api/admin/software-update/apply", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -8295,7 +8566,7 @@ async function restartSoftwareUpdateApp() {
   if (restartBtn) restartBtn.disabled = true;
 
   try {
-    const response = await fetch("/api/admin/software-update/restart", {
+    const response = await fetchWithAdminSession("/api/admin/software-update/restart", {
       method: "POST",
       headers: adminToken ? { "X-Admin-Token": adminToken } : {}
     });

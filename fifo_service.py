@@ -184,6 +184,75 @@ def _reserved_destination_cell_ids(db) -> set[int]:
     return {row[0] for row in rows if row and row[0] is not None}
 
 
+def _destination_area_full_detail(db, destination_area: Area, reserved_cell_ids: set[int], limit: int = 20) -> dict:
+    locations = db.execute(
+        select(Location)
+        .where(Location.area_id == destination_area.id)
+        .order_by(Location.y.asc(), Location.x.asc())
+        .limit(limit)
+    ).scalars().all()
+    rack_ids = {cell.rack_id for cell in locations if cell.rack_id is not None}
+    racks = db.execute(select(Rack).where(Rack.id.in_(rack_ids))).scalars().all() if rack_ids else []
+    rack_by_id = {rack.id: rack for rack in racks}
+    active_orders = db.execute(
+        select(MovementOrder.destination_cell_id, MovementOrder.id)
+        .where(MovementOrder.destination_cell_id.in_(reserved_cell_ids))
+        .where(MovementOrder.status.in_(tuple(ORDER_STATUSES_WITH_DESTINATION_RESERVATION)))
+    ).all() if reserved_cell_ids else []
+    order_by_cell = {cell_id: order_id for cell_id, order_id in active_orders if cell_id is not None}
+    checked = []
+    for cell in locations:
+        rack = rack_by_id.get(cell.rack_id)
+        location_code = str(cell.code or "").strip() or f"({cell.x},{cell.y})"
+        if int(cell.enabled or 0) != 1:
+            status, reason = "disabled", "Ubicación deshabilitada"
+        elif int(cell.is_visible or 0) != 1:
+            status, reason = "hidden", "Ubicación oculta"
+        elif not str(cell.code or "").strip():
+            status, reason = "invalid", "Ubicación sin código operativo"
+        elif cell.rack_id is not None:
+            rack_label = str(getattr(rack, "code", None) or cell.rack_id)
+            status, reason = "occupied", f"Ubicación ocupada por rack {rack_label}"
+        elif cell.id in reserved_cell_ids:
+            order_id = order_by_cell.get(cell.id)
+            suffix = f" {order_id}" if order_id is not None else " activa"
+            status, reason = "occupied", f"Ubicación reservada por orden{suffix}"
+        else:
+            status, reason = "available", "Ubicación disponible"
+        checked.append({
+            "location_id": cell.id,
+            "location_code": location_code,
+            "area_id": destination_area.id,
+            "area_name": destination_area.name,
+            "status": status,
+            "enabled": int(cell.enabled or 0) == 1,
+            "visible": int(cell.is_visible or 0) == 1,
+            "rack_id": cell.rack_id,
+            "rack_code": getattr(rack, "code", None),
+            "reason": reason,
+        })
+    area_label = str(destination_area.name or destination_area.code or destination_area.id)
+    has_operational_locations = any(
+        int(cell.enabled or 0) == 1 and int(cell.is_visible or 0) == 1 and bool(str(cell.code or "").strip())
+        for cell in locations
+    )
+    if has_operational_locations:
+        operator_message = f"No hay espacio libre en el área destino {area_label}."
+        suggested_action = "Libera una ubicación destino o cambia el área destino configurada en el QR."
+    else:
+        operator_message = f"El área destino {area_label} no tiene ubicaciones operativas configuradas."
+        suggested_action = "Configura ubicaciones visibles y habilitadas para esa área."
+    return {
+        "error_code": "destination_area_full",
+        "operator_message": operator_message,
+        "technical_message": "No hay espacio disponible en el área destino",
+        "destination_area": {"id": destination_area.id, "code": destination_area.code, "name": destination_area.name},
+        "destination_area_name": area_label,
+        "checked_destination_locations": checked,
+        "suggested_action": suggested_action,
+    }
+
+
 def _find_destination_cell(db, destination_area: Area) -> Location:
     reserved_cell_ids = _reserved_destination_cell_ids(db)
     rows = (
@@ -201,7 +270,7 @@ def _find_destination_cell(db, destination_area: Area) -> Location:
         if cell.id in reserved_cell_ids:
             continue
         return cell
-    raise HTTPException(status_code=400, detail="No hay espacio disponible en el área destino")
+    raise HTTPException(status_code=400, detail=_destination_area_full_detail(db, destination_area, reserved_cell_ids))
 
 
 def resolve_fifo_request(db, source_area_id: int, destination_area_id: int, material_group_id: Optional[int], priority: Optional[str] = None) -> FifoSelection:
@@ -606,6 +675,10 @@ def simulate_order_completed(db, order_id: int) -> MovementOrder:
     db.add(destination_cell)
     db.add(rack)
     db.add(order)
+    # SessionLocal usa autoflush=False. Persistir el movimiento y el estado completed
+    # dentro de la transaccion permite que el motor de transiciones lea el estado real
+    # antes de seleccionar el siguiente tramo fifo_chain.
+    db.flush()
     try:
         transition_result = apply_transition_for_completed_order(db, order.id, reason="movement_completed")
         logger.info(
