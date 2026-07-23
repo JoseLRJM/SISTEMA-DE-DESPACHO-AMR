@@ -47,6 +47,27 @@ def _as_optional_int(value) -> Optional[int]:
     return parsed if parsed > 0 else None
 
 
+def _area_ids(value, field_name: str) -> list[int]:
+    if value in (None, "", []):
+        return []
+    raw = value
+    if isinstance(value, str):
+        try:
+            raw = json.loads(value)
+        except Exception as exc:
+            raise ValueError(f"{field_name} no es JSON valido") from exc
+    if not isinstance(raw, list):
+        raise ValueError(f"{field_name} debe ser una lista")
+    result = []
+    for item in raw:
+        area_id = _as_optional_int(item)
+        if area_id is None:
+            raise ValueError(f"{field_name} contiene un ID invalido")
+        if area_id not in result:
+            result.append(area_id)
+    return result
+
+
 def _load_area(db, area_id: int, label: str) -> Area:
     area = db.execute(select(Area).where(Area.id == area_id)).scalar_one_or_none()
     if not area or int(getattr(area, "is_active", 0) or 0) != 1:
@@ -115,6 +136,44 @@ def _select_destination_cell_for_next_step(
             return cell
     area_label = destination_area.name or destination_area.code or destination_area.id
     raise ValueError(f"Paso {next_step}: no hay espacio libre en el area destino {area_label}.")
+
+
+def resolve_destination_cell_for_step(
+    db,
+    *,
+    destination_mode: str,
+    destination_area_id=None,
+    destination_cell_id=None,
+    destination_area_ids=None,
+    next_step: int,
+) -> tuple[Area, Location]:
+    mode = str(destination_mode or "configured_area").strip() or "configured_area"
+    if mode == "configured_area":
+        area = _load_area(db, _as_int(destination_area_id, "destination_area_id"), f"Area destino paso {next_step}")
+        return area, _select_destination_cell_for_next_step(
+            db, destination_area=area, destination_cell_id=_as_optional_int(destination_cell_id), next_step=next_step
+        )
+    if mode not in {"any_area_with_space", "selected_areas_with_space"}:
+        raise ValueError(f"destination_mode invalido para paso {next_step}: {mode}")
+    selected_ids = _area_ids(destination_area_ids, "destination_area_ids_json") if mode == "selected_areas_with_space" else []
+    if mode == "selected_areas_with_space" and not selected_ids:
+        raise ValueError("No se configuraron areas validas para esta seleccion de destino")
+    areas = db.execute(select(Area).where(Area.is_active == 1).order_by(Area.id.asc())).scalars().all()
+    area_by_id = {area.id: area for area in areas}
+    ordered_areas = [area_by_id[area_id] for area_id in selected_ids if area_id in area_by_id] if selected_ids else areas
+    if mode == "selected_areas_with_space" and len(ordered_areas) != len(selected_ids):
+        raise ValueError("La seleccion de destino contiene areas inexistentes o inactivas")
+    for area in ordered_areas:
+        try:
+            cell = _select_destination_cell_for_next_step(
+                db, destination_area=area, destination_cell_id=None, next_step=next_step
+            )
+            return area, cell
+        except ValueError:
+            continue
+    if mode == "selected_areas_with_space":
+        raise ValueError("No hay espacio disponible en las areas destino seleccionadas.")
+    raise ValueError("No hay espacio disponible en ninguna area operativa.")
 
 
 def _select_rack_for_next_step(
@@ -211,6 +270,48 @@ def resolve_fifo_request_by_material_any_area(db, material_group_id) -> tuple[Ra
     raise ValueError(f"No hay rack disponible con material {material.code or material.id} en ninguna area operativa para paso 2.")
 
 
+def resolve_fifo_request_by_material_selected_areas(
+    db, material_group_id, source_area_ids, *, excluded_area_id=None
+) -> tuple[Rack, Location, Area]:
+    material = _resolve_material_group_for_fifo(db, material_group_id)
+    area_ids = _area_ids(source_area_ids, "source_area_ids_json")
+    if not area_ids:
+        raise ValueError("No se configuraron areas validas para esta seleccion de origen")
+    valid_areas = db.execute(select(Area).where(Area.id.in_(area_ids), Area.is_active == 1)).scalars().all()
+    if {area.id for area in valid_areas} != set(area_ids):
+        raise ValueError("La seleccion de origen contiene areas inexistentes o inactivas")
+    active_rack_ids = {
+        int(row[0]) for row in db.execute(
+            select(MovementOrder.rack_id).where(
+                MovementOrder.rack_id.is_not(None),
+                MovementOrder.status.in_(RACK_RESERVATION_ACTIVE_STATUSES),
+            )
+        ).all() if row and row[0] is not None
+    }
+    rows = db.execute(
+        select(Rack, Location, Area)
+        .join(Location, Location.rack_id == Rack.id)
+        .join(Area, Area.id == Location.area_id)
+        .where(Rack.material_group_id == material.id)
+        .where(Area.id.in_(area_ids))
+        .where(Location.enabled == 1)
+        .where(Location.is_visible == 1)
+        .where(Location.code.is_not(None))
+        .where(Area.is_active == 1)
+        .order_by(Rack.fifo_entered_at.asc().nullslast(), Rack.code.asc(), Location.y.asc(), Location.x.asc())
+    ).all()
+    for rack, cell, area in rows:
+        if excluded_area_id is not None and area.id == int(excluded_area_id):
+            continue
+        status = _normalize_rack_status(rack.status)
+        if rack.id in active_rack_ids or status in INACTIVE_RACK_STATUSES or (status and status not in ACTIVE_RACK_STATUSES):
+            continue
+        if not str(cell.code or "").strip():
+            continue
+        return rack, cell, area
+    raise ValueError(f"No se encontro material {material.code or material.id} disponible en las areas seleccionadas.")
+
+
 def _select_rack_for_next_step_global_material(db, *, material_group_id, destination_area: Area, next_step: int) -> tuple[Rack, MaterialGroup, Area, Location]:
     material = _resolve_material_group_for_fifo(db, material_group_id)
     rack, cell, area = resolve_fifo_request_by_material_any_area(db, material.id)
@@ -291,16 +392,15 @@ def create_fifo_chain_next_step(db, completed_order: MovementOrder, config: dict
     if configured_step != next_step:
         raise ValueError(f"Configuracion esperada para paso {next_step}, recibida para paso {configured_step}")
     source_mode = str(config.get("source_mode") or "configured_area").strip() or "configured_area"
-    destination_area_id = _as_int(config.get("destination_area_id"), "destination_area_id")
-    destination_cell_id = _as_optional_int(config.get("destination_cell_id"))
+    destination_mode = str(config.get("destination_mode") or "configured_area").strip() or "configured_area"
     fifo_material_policy = str(config.get("fifo_material_policy") or "any_available_from_source").strip() or "any_available_from_source"
     priority = _normalize_priority(str(config.get("priority") or "normal"))
 
-    destination_area = _load_area(db, destination_area_id, f"Area destino paso {next_step}")
-    destination_cell = _select_destination_cell_for_next_step(
-        db,
-        destination_area=destination_area,
-        destination_cell_id=destination_cell_id,
+    destination_area, destination_cell = resolve_destination_cell_for_step(
+        db, destination_mode=destination_mode,
+        destination_area_id=config.get("destination_area_id"),
+        destination_cell_id=config.get("destination_cell_id"),
+        destination_area_ids=config.get("destination_area_ids_json"),
         next_step=next_step,
     )
 
@@ -311,6 +411,12 @@ def create_fifo_chain_next_step(db, completed_order: MovementOrder, config: dict
             destination_area=destination_area,
             next_step=next_step,
         )
+    elif source_mode == "selected_areas_by_material":
+        rack, source_cell, source_area = resolve_fifo_request_by_material_selected_areas(
+            db, config.get("material_group_id"), config.get("source_area_ids_json"),
+            excluded_area_id=destination_area.id,
+        )
+        material = _resolve_material_group_for_fifo(db, config.get("material_group_id"))
     else:
         source_area_id = _as_int(config.get("source_area_id"), "source_area_id")
         source_cell_id = _as_optional_int(config.get("source_cell_id"))

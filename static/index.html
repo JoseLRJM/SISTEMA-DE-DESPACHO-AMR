@@ -568,7 +568,7 @@
 </div>
 <div class="row two-col">
 <div><label>Modo de ruta</label><select disabled="" id="scannerRouteMode"><option value="simple_area">Simple por origen/destino</option><option value="double_area">Doble &aacute;rea / multipunto</option><option value="fifo_chain">Flujo doble FIFO / tareas encadenadas</option></select></div>
-<div class="hidden" data-fifo-chain-owner="scanner"><label>Cantidad de tramos</label><select disabled="" id="scannerFifoChainTotalSteps"><option value="2">2 tramos</option><option value="3">3 tramos</option><option value="4">4 tramos</option></select><div class="small">El QR tiene prioridad. El scanner se usa como respaldo.</div></div>
+<div class="hidden" data-fifo-chain-owner="scanner"><label>Cantidad de tramos</label><select disabled="" id="scannerFifoChainTotalSteps"><option value="2">2 tramos</option><option value="3">3 tramos</option><option value="4">4 tramos</option><option value="5">5 tramos</option></select><div class="small">El QR tiene prioridad. El scanner se usa como respaldo.</div></div>
 </div>
 <div class="small">Los valores del QR tienen prioridad. La estaci&oacute;n/scanner se usa como respaldo cuando el QR no trae una configuraci&oacute;n.</div>
 <div class="qr-section-title">Tramo 1</div>
@@ -624,6 +624,13 @@
 <div class="qr-fifo-chain-global-note hidden" data-fifo-chain-global-note="scanner_step4">El paso 4 buscar&aacute; un rack disponible con este material en cualquier &aacute;rea operativa. El origen real se decidir&aacute; cuando finalice el paso 3.</div>
 <div class="row two-col"><div data-fifo-chain-source4="scanner"><label>&Aacute;rea origen 4</label><select disabled="" id="scannerFifoChainStep4SourceArea"><option value="">Sin &aacute;rea</option></select></div><div><label>&Aacute;rea destino 4</label><select disabled="" id="scannerFifoChainStep4DestinationArea"><option value="">Sin &aacute;rea</option></select></div></div>
 <div class="row two-col"><div data-fifo-chain-source4="scanner"><label>Celda origen 4 opcional</label><select disabled="" id="scannerFifoChainStep4SourceCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="scannerFifoChainStep4SourceCellSummary">No hay celda seleccionada.</div></div><div><label>Celda destino 4 opcional</label><select disabled="" id="scannerFifoChainStep4DestinationCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="scannerFifoChainStep4DestinationCellSummary">No hay celda seleccionada.</div></div></div>
+</div>
+<div class="qr-route-quad hidden" data-fifo-chain-step5="scanner">
+<div class="qr-section-title">TRAMO 5</div>
+<div class="row two-col"><div><label>Origen tramo 5</label><select disabled="" id="scannerFifoChainStep5SourceMode"><option value="configured_area">&Aacute;rea origen configurada</option><option value="any_area_by_material">Cualquier &aacute;rea por material</option></select><div class="small">El QR tiene prioridad. El scanner se usa como respaldo.</div></div><div><label>Material requerido tramo 5</label><select disabled="" id="scannerFifoChainStep5Material"><option value="">Sin material</option></select><div class="small">El QR tiene prioridad. El scanner se usa como respaldo.</div></div></div>
+<div class="qr-fifo-chain-global-note hidden" data-fifo-chain-global-note="scanner_step5">El paso 5 buscar&aacute; un rack disponible con este material en cualquier &aacute;rea operativa. El origen real se decidir&aacute; cuando finalice el paso 4.</div>
+<div class="row two-col"><div data-fifo-chain-source5="scanner"><label>&Aacute;rea origen 5</label><select disabled="" id="scannerFifoChainStep5SourceArea"><option value="">Sin &aacute;rea</option></select></div><div><label>&Aacute;rea destino 5</label><select disabled="" id="scannerFifoChainStep5DestinationArea"><option value="">Sin &aacute;rea</option></select></div></div>
+<div class="row two-col"><div data-fifo-chain-source5="scanner"><label>Celda origen 5 opcional</label><select disabled="" id="scannerFifoChainStep5SourceCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="scannerFifoChainStep5SourceCellSummary">No hay celda seleccionada.</div></div><div><label>Celda destino 5 opcional</label><select disabled="" id="scannerFifoChainStep5DestinationCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="scannerFifoChainStep5DestinationCellSummary">No hay celda seleccionada.</div></div></div>
 </div>
 <div class="row two-col">
 <div><label>&Aacute;rea almacenamiento</label><select disabled="" id="scannerStorageArea"><option value="">Sin &aacute;rea</option></select></div>
@@ -681,7 +688,7 @@
 </div>
 <div class="row two-col">
 <div><label>Modo de ruta</label><select disabled="" id="qrRouteMode"><option value="simple_area">Simple por origen/destino</option><option value="double_area">Doble &aacute;rea / multipunto</option><option value="fifo_chain">Flujo doble FIFO / tareas encadenadas</option></select></div>
-<div class="hidden" data-fifo-chain-owner="qr"><label>Cantidad de tramos</label><select disabled="" id="qrFifoChainTotalSteps"><option value="2">2 tramos</option><option value="3">3 tramos</option><option value="4">4 tramos</option></select></div>
+<div class="hidden" data-fifo-chain-owner="qr"><label>Cantidad de tramos</label><select disabled="" id="qrFifoChainTotalSteps"><option value="2">2 tramos</option><option value="3">3 tramos</option><option value="4">4 tramos</option><option value="5">5 tramos</option></select></div>
 </div>
 <div class="small">Si el QR trae ruta configurada, tiene prioridad sobre los valores default del scanner.</div>
 <div class="qr-section-title">Tramo 1</div>
@@ -737,6 +744,13 @@
 <div class="qr-fifo-chain-global-note hidden" data-fifo-chain-global-note="qr_step4">El paso 4 buscar&aacute; un rack disponible con este material en cualquier &aacute;rea operativa. El origen real se decidir&aacute; cuando finalice el paso 3.</div>
 <div class="row two-col"><div data-fifo-chain-source4="qr"><label>&Aacute;rea origen 4</label><select disabled="" id="qrFifoChainStep4SourceArea"><option value="">Sin &aacute;rea</option></select></div><div><label>&Aacute;rea destino 4</label><select disabled="" id="qrFifoChainStep4DestinationArea"><option value="">Sin &aacute;rea</option></select></div></div>
 <div class="row two-col"><div data-fifo-chain-source4="qr"><label>Celda origen 4 opcional</label><select disabled="" id="qrFifoChainStep4SourceCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="qrFifoChainStep4SourceCellSummary">No hay celda seleccionada.</div></div><div><label>Celda destino 4 opcional</label><select disabled="" id="qrFifoChainStep4DestinationCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="qrFifoChainStep4DestinationCellSummary">No hay celda seleccionada.</div></div></div>
+</div>
+<div class="qr-route-quad hidden" data-fifo-chain-step5="qr">
+<div class="qr-section-title">TRAMO 5</div>
+<div class="row two-col"><div><label>Origen tramo 5</label><select disabled="" id="qrFifoChainStep5SourceMode"><option value="configured_area">&Aacute;rea origen configurada</option><option value="any_area_by_material">Cualquier &aacute;rea por material</option></select></div><div><label>Material requerido tramo 5</label><select disabled="" id="qrFifoChainStep5Material"><option value="">Sin material</option></select></div></div>
+<div class="qr-fifo-chain-global-note hidden" data-fifo-chain-global-note="qr_step5">El paso 5 buscar&aacute; un rack disponible con este material en cualquier &aacute;rea operativa. El origen real se decidir&aacute; cuando finalice el paso 4.</div>
+<div class="row two-col"><div data-fifo-chain-source5="qr"><label>&Aacute;rea origen 5</label><select disabled="" id="qrFifoChainStep5SourceArea"><option value="">Sin &aacute;rea</option></select></div><div><label>&Aacute;rea destino 5</label><select disabled="" id="qrFifoChainStep5DestinationArea"><option value="">Sin &aacute;rea</option></select></div></div>
+<div class="row two-col"><div data-fifo-chain-source5="qr"><label>Celda origen 5 opcional</label><select disabled="" id="qrFifoChainStep5SourceCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="qrFifoChainStep5SourceCellSummary">No hay celda seleccionada.</div></div><div><label>Celda destino 5 opcional</label><select disabled="" id="qrFifoChainStep5DestinationCell"><option value="">Sin celda</option></select><div class="qr-cell-summary" id="qrFifoChainStep5DestinationCellSummary">No hay celda seleccionada.</div></div></div>
 </div>
 <div class="row two-col">
 <div><label>AGV code</label><input disabled="" id="qrAgvCode" type="text"/></div>
@@ -1374,6 +1388,6 @@ reqCode automático · reqTime automático · mapShortName configurable y habili
 </div>
 </div>
 </div>
-<script src="/static/app.js?v=admin-session-20260720"></script>
+<script src="/static/app.js?v=fifo-chain-origin-destination-ui-20260723"></script>
 </body>
 </html>

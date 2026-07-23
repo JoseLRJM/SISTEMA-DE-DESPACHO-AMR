@@ -853,11 +853,17 @@ class ScanPreviewOut(BaseModel):
     fifo_chain_step3_source: dict = {}
     fifo_chain_step3_destination: dict = {}
     fifo_chain_step4_source_mode: Optional[str] = None
+    fifo_chain_step5_source_mode: Optional[str] = None
     fifo_chain_step4_material_group_id: Optional[int] = None
+    fifo_chain_step5_material_group_id: Optional[int] = None
     fifo_chain_step4_material_group_name: Optional[str] = None
+    fifo_chain_step5_material_group_name: Optional[str] = None
     fifo_chain_step4_material: dict = {}
+    fifo_chain_step5_material: dict = {}
     fifo_chain_step4_source: dict = {}
+    fifo_chain_step5_source: dict = {}
     fifo_chain_step4_destination: dict = {}
+    fifo_chain_step5_destination: dict = {}
     fifo_chain_group_id: Optional[str] = None
     fifo_chain_step: Optional[int] = None
     fifo_chain_status: Optional[str] = None
@@ -903,11 +909,13 @@ VALID_QR_ACTION_TYPES = {"fifo_request", "store_rack", "request_empty", "return_
 VALID_SCAN_TERMINAL_MODES = {"preview", "execute"}
 VALID_ROUTE_MODES = {"simple_area", "double_area", "fifo_chain", "trmx_doble"}
 VALID_FIFO_MATERIAL_POLICIES = {"specific_material", "any_available_from_source"}
-VALID_FIFO_CHAIN_SOURCE_MODES = {"configured_area", "any_area_by_material"}
+VALID_FIFO_CHAIN_SOURCE_MODES = {"configured_area", "any_area_by_material", "selected_areas_by_material"}
+VALID_FIFO_CHAIN_DESTINATION_MODES = {"configured_area", "any_area_with_space", "selected_areas_with_space"}
 VALID_FIFO_CHAIN_STEP2_SOURCE_MODES = VALID_FIFO_CHAIN_SOURCE_MODES
-VALID_FIFO_CHAIN_TOTAL_STEPS = {2, 3, 4}
+VALID_FIFO_CHAIN_TOTAL_STEPS = {2, 3, 4, 5}
 VALID_FIFO_CHAIN_STEP3_SOURCE_MODES = VALID_FIFO_CHAIN_SOURCE_MODES
 VALID_FIFO_CHAIN_STEP4_SOURCE_MODES = VALID_FIFO_CHAIN_SOURCE_MODES
+VALID_FIFO_CHAIN_STEP5_SOURCE_MODES = VALID_FIFO_CHAIN_SOURCE_MODES
 
 
 def _normalize_route_mode(value: Optional[str]) -> str:
@@ -937,6 +945,11 @@ def _normalize_fifo_chain_step4_source_mode(value: Optional[str]) -> str:
     return mode
 
 
+def _normalize_fifo_chain_step5_source_mode(value: Optional[str]) -> str:
+    mode = (str(value or "configured_area").strip() or "configured_area")
+    return mode
+
+
 def _normalize_fifo_chain_total_steps(value) -> int:
     if value in (None, ""):
         return 2
@@ -945,6 +958,150 @@ def _normalize_fifo_chain_total_steps(value) -> int:
     except (TypeError, ValueError):
         return 2
     return total if total in VALID_FIFO_CHAIN_TOTAL_STEPS else 2
+
+
+def _normalize_area_ids_json(value) -> tuple[list[int], Optional[str]]:
+    if value in (None, "", []):
+        return [], None
+    raw = value
+    if isinstance(value, str):
+        try:
+            raw = json.loads(value)
+        except Exception:
+            raise HTTPException(status_code=400, detail="La lista de areas seleccionadas no es JSON valido")
+    if not isinstance(raw, list):
+        raise HTTPException(status_code=400, detail="La lista de areas seleccionadas debe ser una lista")
+    result = []
+    for item in raw:
+        try:
+            area_id = int(item)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="La lista de areas seleccionadas contiene un ID invalido")
+        if area_id <= 0 or area_id in result:
+            if area_id <= 0:
+                raise HTTPException(status_code=400, detail="La lista de areas seleccionadas contiene un ID invalido")
+            continue
+        result.append(area_id)
+    return result, json.dumps(result, ensure_ascii=False) if result else None
+
+
+def _validate_selected_area_ids(db, area_ids: list[int], label: str) -> None:
+    if not area_ids:
+        raise HTTPException(status_code=400, detail=f"{label}: no se configuraron areas validas para esta seleccion")
+    rows = db.execute(select(Area).where(Area.id.in_(area_ids))).scalars().all()
+    valid = {row.id for row in rows if int(row.is_active or 0) == 1}
+    missing = [area_id for area_id in area_ids if area_id not in valid]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"{label}: areas inexistentes o inactivas: {missing}")
+
+
+def _validate_fifo_chain_area_modes(db, body, route_mode: str) -> None:
+    total_steps = _validate_fifo_chain_total_steps_input(body.fifo_chain_total_steps)
+    for step in range(1, 6):
+        source_mode = str(getattr(body, f"fifo_chain_step{step}_source_mode", None) or "configured_area").strip()
+        destination_mode = str(getattr(body, f"fifo_chain_step{step}_destination_mode", None) or "configured_area").strip()
+        _validate_choice(source_mode, VALID_FIFO_CHAIN_SOURCE_MODES, f"fifo_chain_step{step}_source_mode")
+        _validate_choice(destination_mode, VALID_FIFO_CHAIN_DESTINATION_MODES, f"fifo_chain_step{step}_destination_mode")
+        source_ids, _ = _normalize_area_ids_json(getattr(body, f"fifo_chain_step{step}_source_area_ids_json", None))
+        destination_ids, _ = _normalize_area_ids_json(getattr(body, f"fifo_chain_step{step}_destination_area_ids_json", None))
+        if route_mode != "fifo_chain" or step > total_steps:
+            continue
+        material_id = getattr(body, f"fifo_chain_step{step}_material_group_id", None)
+        if step == 1:
+            source_area_id, source_cell_id = body.source_area_id, body.source_cell_id
+            destination_area_id, destination_cell_id = body.destination_area_id, body.destination_cell_id
+        elif step == 2:
+            source_area_id, source_cell_id = body.second_source_area_id, body.second_source_cell_id
+            destination_area_id, destination_cell_id = body.second_destination_area_id, body.second_destination_cell_id
+        else:
+            source_area_id = getattr(body, f"fifo_chain_step{step}_source_area_id", None)
+            source_cell_id = getattr(body, f"fifo_chain_step{step}_source_cell_id", None)
+            destination_area_id = getattr(body, f"fifo_chain_step{step}_destination_area_id", None)
+            destination_cell_id = getattr(body, f"fifo_chain_step{step}_destination_cell_id", None)
+        if source_mode == "configured_area":
+            if not source_area_id:
+                raise HTTPException(status_code=400, detail=f"Origen tramo {step}: requiere area configurada")
+            if source_cell_id:
+                cell = db.execute(select(Location).where(Location.id == source_cell_id)).scalar_one_or_none()
+                if not cell or cell.area_id != source_area_id:
+                    raise HTTPException(status_code=400, detail=f"Origen tramo {step}: la celda no pertenece al area")
+        if source_mode == "selected_areas_by_material":
+            if not material_id:
+                raise HTTPException(status_code=400, detail=f"El tramo {step} por areas seleccionadas requiere material")
+            _validate_selected_area_ids(db, source_ids, f"Origen tramo {step}")
+        if destination_mode == "configured_area":
+            if not destination_area_id:
+                raise HTTPException(status_code=400, detail=f"Destino tramo {step}: requiere area configurada")
+            if destination_cell_id:
+                cell = db.execute(select(Location).where(Location.id == destination_cell_id)).scalar_one_or_none()
+                if not cell or cell.area_id != destination_area_id:
+                    raise HTTPException(status_code=400, detail=f"Destino tramo {step}: la celda no pertenece al area")
+        if destination_mode == "selected_areas_with_space":
+            _validate_selected_area_ids(db, destination_ids, f"Destino tramo {step}")
+
+
+def _apply_fifo_chain_area_modes(row, body) -> None:
+    total_steps = _normalize_fifo_chain_total_steps(getattr(row, "fifo_chain_total_steps", None))
+    route_mode = _normalize_route_mode(getattr(row, "route_mode", None))
+    for step in range(1, 6):
+        applies = route_mode == "fifo_chain" and step <= total_steps
+        source_mode = str(getattr(body, f"fifo_chain_step{step}_source_mode", None) or "configured_area").strip()
+        destination_mode = str(getattr(body, f"fifo_chain_step{step}_destination_mode", None) or "configured_area").strip()
+        _, source_json = _normalize_area_ids_json(getattr(body, f"fifo_chain_step{step}_source_area_ids_json", None))
+        _, destination_json = _normalize_area_ids_json(getattr(body, f"fifo_chain_step{step}_destination_area_ids_json", None))
+        setattr(row, f"fifo_chain_step{step}_source_mode", source_mode if applies else "configured_area")
+        setattr(row, f"fifo_chain_step{step}_source_area_ids_json", source_json if applies and source_mode == "selected_areas_by_material" else None)
+        setattr(row, f"fifo_chain_step{step}_destination_mode", destination_mode if applies else "configured_area")
+        setattr(row, f"fifo_chain_step{step}_destination_area_ids_json", destination_json if applies and destination_mode == "selected_areas_with_space" else None)
+        if not applies:
+            continue
+        if step == 1:
+            source_area_field, source_cell_field = "source_area_id", "source_cell_id"
+            destination_area_field, destination_cell_field = "destination_area_id", "destination_cell_id"
+        elif step == 2:
+            source_area_field, source_cell_field = "second_source_area_id", "second_source_cell_id"
+            destination_area_field, destination_cell_field = "second_destination_area_id", "second_destination_cell_id"
+        else:
+            source_area_field = f"fifo_chain_step{step}_source_area_id"
+            source_cell_field = f"fifo_chain_step{step}_source_cell_id"
+            destination_area_field = f"fifo_chain_step{step}_destination_area_id"
+            destination_cell_field = f"fifo_chain_step{step}_destination_cell_id"
+        if source_mode != "configured_area":
+            setattr(row, source_area_field, None)
+            setattr(row, source_cell_field, None)
+        if destination_mode != "configured_area":
+            setattr(row, destination_area_field, None)
+            setattr(row, destination_cell_field, None)
+
+
+def _fifo_chain_area_modes_out(row) -> dict:
+    result = {}
+    for step in range(1, 6):
+        result[f"fifo_chain_step{step}_source_area_ids_json"] = getattr(row, f"fifo_chain_step{step}_source_area_ids_json", None)
+        result[f"fifo_chain_step{step}_destination_mode"] = getattr(row, f"fifo_chain_step{step}_destination_mode", None) or "configured_area"
+        result[f"fifo_chain_step{step}_destination_area_ids_json"] = getattr(row, f"fifo_chain_step{step}_destination_area_ids_json", None)
+    return result
+
+
+def _validate_fifo_chain_total_steps_input(value) -> int:
+    if value in (None, ""):
+        raise HTTPException(status_code=400, detail="fifo_chain_total_steps debe ser 2, 3, 4 o 5")
+    try:
+        total = int(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="fifo_chain_total_steps debe ser 2, 3, 4 o 5")
+    return _validate_choice(total, VALID_FIFO_CHAIN_TOTAL_STEPS, "fifo_chain_total_steps")
+
+
+def _clear_fifo_chain_step5_if_unused(row) -> None:
+    if _normalize_fifo_chain_total_steps(getattr(row, "fifo_chain_total_steps", None)) >= 5:
+        return
+    row.fifo_chain_step5_source_mode = "configured_area"
+    row.fifo_chain_step5_material_group_id = None
+    row.fifo_chain_step5_source_area_id = None
+    row.fifo_chain_step5_source_cell_id = None
+    row.fifo_chain_step5_destination_area_id = None
+    row.fifo_chain_step5_destination_cell_id = None
 
 
 class ScannerStationIn(BaseModel):
@@ -962,20 +1119,41 @@ class ScannerStationIn(BaseModel):
     fifo_chain_total_steps: Optional[Union[int, str]] = Field(default=2)
     fifo_chain_step1_source_mode: str = Field(default="configured_area", min_length=1, max_length=32)
     fifo_chain_step1_material_group_id: Optional[int] = None
+    fifo_chain_step1_source_area_ids_json: Optional[Union[str, list[int]]] = None
+    fifo_chain_step1_destination_mode: str = Field(default="configured_area", min_length=1, max_length=32)
+    fifo_chain_step1_destination_area_ids_json: Optional[Union[str, list[int]]] = None
     fifo_chain_step2_source_mode: str = Field(default="configured_area", min_length=1, max_length=32)
     fifo_chain_step2_material_group_id: Optional[int] = None
+    fifo_chain_step2_source_area_ids_json: Optional[Union[str, list[int]]] = None
+    fifo_chain_step2_destination_mode: str = Field(default="configured_area", min_length=1, max_length=32)
+    fifo_chain_step2_destination_area_ids_json: Optional[Union[str, list[int]]] = None
     fifo_chain_step3_source_mode: str = Field(default="configured_area", min_length=1, max_length=32)
     fifo_chain_step3_material_group_id: Optional[int] = None
     fifo_chain_step3_source_area_id: Optional[int] = None
     fifo_chain_step3_source_cell_id: Optional[int] = None
     fifo_chain_step3_destination_area_id: Optional[int] = None
     fifo_chain_step3_destination_cell_id: Optional[int] = None
+    fifo_chain_step3_source_area_ids_json: Optional[Union[str, list[int]]] = None
+    fifo_chain_step3_destination_mode: str = Field(default="configured_area", min_length=1, max_length=32)
+    fifo_chain_step3_destination_area_ids_json: Optional[Union[str, list[int]]] = None
     fifo_chain_step4_source_mode: str = Field(default="configured_area", min_length=1, max_length=32)
+    fifo_chain_step5_source_mode: str = Field(default="configured_area", min_length=1, max_length=32)
     fifo_chain_step4_material_group_id: Optional[int] = None
+    fifo_chain_step5_material_group_id: Optional[int] = None
     fifo_chain_step4_source_area_id: Optional[int] = None
+    fifo_chain_step5_source_area_id: Optional[int] = None
     fifo_chain_step4_source_cell_id: Optional[int] = None
+    fifo_chain_step5_source_cell_id: Optional[int] = None
     fifo_chain_step4_destination_area_id: Optional[int] = None
+    fifo_chain_step5_destination_area_id: Optional[int] = None
     fifo_chain_step4_destination_cell_id: Optional[int] = None
+    fifo_chain_step4_source_area_ids_json: Optional[Union[str, list[int]]] = None
+    fifo_chain_step4_destination_mode: str = Field(default="configured_area", min_length=1, max_length=32)
+    fifo_chain_step4_destination_area_ids_json: Optional[Union[str, list[int]]] = None
+    fifo_chain_step5_destination_cell_id: Optional[int] = None
+    fifo_chain_step5_source_area_ids_json: Optional[Union[str, list[int]]] = None
+    fifo_chain_step5_destination_mode: str = Field(default="configured_area", min_length=1, max_length=32)
+    fifo_chain_step5_destination_area_ids_json: Optional[Union[str, list[int]]] = None
     second_source_area_id: Optional[int] = None
     second_destination_area_id: Optional[int] = None
     second_source_cell_id: Optional[int] = None
@@ -1012,10 +1190,15 @@ class ScannerStationOut(ScannerStationIn):
     fifo_chain_step3_destination_area_name: Optional[str] = None
     fifo_chain_step3_destination_cell_code: Optional[str] = None
     fifo_chain_step4_material_group_name: Optional[str] = None
+    fifo_chain_step5_material_group_name: Optional[str] = None
     fifo_chain_step4_source_area_name: Optional[str] = None
+    fifo_chain_step5_source_area_name: Optional[str] = None
     fifo_chain_step4_source_cell_code: Optional[str] = None
+    fifo_chain_step5_source_cell_code: Optional[str] = None
     fifo_chain_step4_destination_area_name: Optional[str] = None
+    fifo_chain_step5_destination_area_name: Optional[str] = None
     fifo_chain_step4_destination_cell_code: Optional[str] = None
+    fifo_chain_step5_destination_cell_code: Optional[str] = None
     storage_area_name: Optional[str] = None
     empty_rack_area_name: Optional[str] = None
     cancel_return_area_code: Optional[str] = None
@@ -1045,20 +1228,41 @@ class QrActionRuleIn(BaseModel):
     fifo_chain_total_steps: Optional[Union[int, str]] = Field(default=2)
     fifo_chain_step1_source_mode: str = Field(default="configured_area", min_length=1, max_length=32)
     fifo_chain_step1_material_group_id: Optional[int] = None
+    fifo_chain_step1_source_area_ids_json: Optional[Union[str, list[int]]] = None
+    fifo_chain_step1_destination_mode: str = Field(default="configured_area", min_length=1, max_length=32)
+    fifo_chain_step1_destination_area_ids_json: Optional[Union[str, list[int]]] = None
     fifo_chain_step2_source_mode: str = Field(default="configured_area", min_length=1, max_length=32)
     fifo_chain_step2_material_group_id: Optional[int] = None
+    fifo_chain_step2_source_area_ids_json: Optional[Union[str, list[int]]] = None
+    fifo_chain_step2_destination_mode: str = Field(default="configured_area", min_length=1, max_length=32)
+    fifo_chain_step2_destination_area_ids_json: Optional[Union[str, list[int]]] = None
     fifo_chain_step3_source_mode: str = Field(default="configured_area", min_length=1, max_length=32)
     fifo_chain_step3_material_group_id: Optional[int] = None
     fifo_chain_step3_source_area_id: Optional[int] = None
     fifo_chain_step3_source_cell_id: Optional[int] = None
     fifo_chain_step3_destination_area_id: Optional[int] = None
     fifo_chain_step3_destination_cell_id: Optional[int] = None
+    fifo_chain_step3_source_area_ids_json: Optional[Union[str, list[int]]] = None
+    fifo_chain_step3_destination_mode: str = Field(default="configured_area", min_length=1, max_length=32)
+    fifo_chain_step3_destination_area_ids_json: Optional[Union[str, list[int]]] = None
     fifo_chain_step4_source_mode: str = Field(default="configured_area", min_length=1, max_length=32)
+    fifo_chain_step5_source_mode: str = Field(default="configured_area", min_length=1, max_length=32)
     fifo_chain_step4_material_group_id: Optional[int] = None
+    fifo_chain_step5_material_group_id: Optional[int] = None
     fifo_chain_step4_source_area_id: Optional[int] = None
+    fifo_chain_step5_source_area_id: Optional[int] = None
     fifo_chain_step4_source_cell_id: Optional[int] = None
+    fifo_chain_step5_source_cell_id: Optional[int] = None
     fifo_chain_step4_destination_area_id: Optional[int] = None
+    fifo_chain_step5_destination_area_id: Optional[int] = None
     fifo_chain_step4_destination_cell_id: Optional[int] = None
+    fifo_chain_step4_source_area_ids_json: Optional[Union[str, list[int]]] = None
+    fifo_chain_step4_destination_mode: str = Field(default="configured_area", min_length=1, max_length=32)
+    fifo_chain_step4_destination_area_ids_json: Optional[Union[str, list[int]]] = None
+    fifo_chain_step5_destination_cell_id: Optional[int] = None
+    fifo_chain_step5_source_area_ids_json: Optional[Union[str, list[int]]] = None
+    fifo_chain_step5_destination_mode: str = Field(default="configured_area", min_length=1, max_length=32)
+    fifo_chain_step5_destination_area_ids_json: Optional[Union[str, list[int]]] = None
     second_source_area_id: Optional[int] = None
     second_destination_area_id: Optional[int] = None
     second_source_cell_id: Optional[int] = None
@@ -1092,10 +1296,15 @@ class QrActionRuleOut(QrActionRuleIn):
     fifo_chain_step3_destination_area_name: Optional[str] = None
     fifo_chain_step3_destination_cell_code: Optional[str] = None
     fifo_chain_step4_material_group_name: Optional[str] = None
+    fifo_chain_step5_material_group_name: Optional[str] = None
     fifo_chain_step4_source_area_name: Optional[str] = None
+    fifo_chain_step5_source_area_name: Optional[str] = None
     fifo_chain_step4_source_cell_code: Optional[str] = None
+    fifo_chain_step5_source_cell_code: Optional[str] = None
     fifo_chain_step4_destination_area_name: Optional[str] = None
+    fifo_chain_step5_destination_area_name: Optional[str] = None
     fifo_chain_step4_destination_cell_code: Optional[str] = None
+    fifo_chain_step5_destination_cell_code: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -1534,16 +1743,28 @@ def cleanup_legacy_schema():
                     "fifo_chain_step3_destination_area_id": "ALTER TABLE scanner_stations ADD COLUMN fifo_chain_step3_destination_area_id INTEGER;",
                     "fifo_chain_step3_destination_cell_id": "ALTER TABLE scanner_stations ADD COLUMN fifo_chain_step3_destination_cell_id INTEGER;",
                     "fifo_chain_step4_source_mode": "ALTER TABLE scanner_stations ADD COLUMN fifo_chain_step4_source_mode VARCHAR(32) NOT NULL DEFAULT 'configured_area';",
+                    "fifo_chain_step5_source_mode": "ALTER TABLE scanner_stations ADD COLUMN fifo_chain_step5_source_mode VARCHAR(32) NOT NULL DEFAULT 'configured_area';",
                     "fifo_chain_step4_material_group_id": "ALTER TABLE scanner_stations ADD COLUMN fifo_chain_step4_material_group_id INTEGER;",
+                    "fifo_chain_step5_material_group_id": "ALTER TABLE scanner_stations ADD COLUMN fifo_chain_step5_material_group_id INTEGER;",
                     "fifo_chain_step4_source_area_id": "ALTER TABLE scanner_stations ADD COLUMN fifo_chain_step4_source_area_id INTEGER;",
+                    "fifo_chain_step5_source_area_id": "ALTER TABLE scanner_stations ADD COLUMN fifo_chain_step5_source_area_id INTEGER;",
                     "fifo_chain_step4_source_cell_id": "ALTER TABLE scanner_stations ADD COLUMN fifo_chain_step4_source_cell_id INTEGER;",
+                    "fifo_chain_step5_source_cell_id": "ALTER TABLE scanner_stations ADD COLUMN fifo_chain_step5_source_cell_id INTEGER;",
                     "fifo_chain_step4_destination_area_id": "ALTER TABLE scanner_stations ADD COLUMN fifo_chain_step4_destination_area_id INTEGER;",
+                    "fifo_chain_step5_destination_area_id": "ALTER TABLE scanner_stations ADD COLUMN fifo_chain_step5_destination_area_id INTEGER;",
                     "fifo_chain_step4_destination_cell_id": "ALTER TABLE scanner_stations ADD COLUMN fifo_chain_step4_destination_cell_id INTEGER;",
+                    "fifo_chain_step5_destination_cell_id": "ALTER TABLE scanner_stations ADD COLUMN fifo_chain_step5_destination_cell_id INTEGER;",
                     "second_source_area_id": "ALTER TABLE scanner_stations ADD COLUMN second_source_area_id INTEGER;",
                     "second_destination_area_id": "ALTER TABLE scanner_stations ADD COLUMN second_destination_area_id INTEGER;",
                     "second_source_cell_id": "ALTER TABLE scanner_stations ADD COLUMN second_source_cell_id INTEGER;",
                     "second_destination_cell_id": "ALTER TABLE scanner_stations ADD COLUMN second_destination_cell_id INTEGER;",
                 }
+                for step in range(1, 6):
+                    scanner_route_missing_sql.update({
+                        f"fifo_chain_step{step}_source_area_ids_json": f"ALTER TABLE scanner_stations ADD COLUMN fifo_chain_step{step}_source_area_ids_json TEXT;",
+                        f"fifo_chain_step{step}_destination_mode": f"ALTER TABLE scanner_stations ADD COLUMN fifo_chain_step{step}_destination_mode VARCHAR(32) NOT NULL DEFAULT 'configured_area';",
+                        f"fifo_chain_step{step}_destination_area_ids_json": f"ALTER TABLE scanner_stations ADD COLUMN fifo_chain_step{step}_destination_area_ids_json TEXT;",
+                    })
                 for name, stmt in scanner_route_missing_sql.items():
                     if name not in scanner_station_cols:
                         conn.exec_driver_sql(stmt)
@@ -1559,8 +1780,10 @@ def cleanup_legacy_schema():
                     conn.exec_driver_sql("UPDATE scanner_stations SET fifo_chain_step3_source_mode = 'configured_area' WHERE fifo_chain_step3_source_mode IS NULL OR trim(fifo_chain_step3_source_mode) = '';")
                 if "fifo_chain_step4_source_mode" in scanner_station_cols:
                     conn.exec_driver_sql("UPDATE scanner_stations SET fifo_chain_step4_source_mode = 'configured_area' WHERE fifo_chain_step4_source_mode IS NULL OR trim(fifo_chain_step4_source_mode) = '';")
+                if "fifo_chain_step5_source_mode" in scanner_station_cols:
+                    conn.exec_driver_sql("UPDATE scanner_stations SET fifo_chain_step5_source_mode = 'configured_area' WHERE fifo_chain_step5_source_mode IS NULL OR trim(fifo_chain_step5_source_mode) = '';")
                 if "fifo_chain_total_steps" in scanner_station_cols:
-                    conn.exec_driver_sql("UPDATE scanner_stations SET fifo_chain_total_steps = 2 WHERE fifo_chain_total_steps IS NULL OR fifo_chain_total_steps NOT IN (2, 3, 4);")
+                    conn.exec_driver_sql("UPDATE scanner_stations SET fifo_chain_total_steps = 2 WHERE fifo_chain_total_steps IS NULL OR fifo_chain_total_steps NOT IN (2, 3, 4, 5);")
             except Exception:
                 logger.exception("SQLite migration failed for scanner_stations route columns")
                 raise
@@ -1584,16 +1807,28 @@ def cleanup_legacy_schema():
                     "fifo_chain_step3_destination_area_id": "ALTER TABLE qr_action_rules ADD COLUMN fifo_chain_step3_destination_area_id INTEGER;",
                     "fifo_chain_step3_destination_cell_id": "ALTER TABLE qr_action_rules ADD COLUMN fifo_chain_step3_destination_cell_id INTEGER;",
                     "fifo_chain_step4_source_mode": "ALTER TABLE qr_action_rules ADD COLUMN fifo_chain_step4_source_mode VARCHAR(32) NOT NULL DEFAULT 'configured_area';",
+                    "fifo_chain_step5_source_mode": "ALTER TABLE qr_action_rules ADD COLUMN fifo_chain_step5_source_mode VARCHAR(32) NOT NULL DEFAULT 'configured_area';",
                     "fifo_chain_step4_material_group_id": "ALTER TABLE qr_action_rules ADD COLUMN fifo_chain_step4_material_group_id INTEGER;",
+                    "fifo_chain_step5_material_group_id": "ALTER TABLE qr_action_rules ADD COLUMN fifo_chain_step5_material_group_id INTEGER;",
                     "fifo_chain_step4_source_area_id": "ALTER TABLE qr_action_rules ADD COLUMN fifo_chain_step4_source_area_id INTEGER;",
+                    "fifo_chain_step5_source_area_id": "ALTER TABLE qr_action_rules ADD COLUMN fifo_chain_step5_source_area_id INTEGER;",
                     "fifo_chain_step4_source_cell_id": "ALTER TABLE qr_action_rules ADD COLUMN fifo_chain_step4_source_cell_id INTEGER;",
+                    "fifo_chain_step5_source_cell_id": "ALTER TABLE qr_action_rules ADD COLUMN fifo_chain_step5_source_cell_id INTEGER;",
                     "fifo_chain_step4_destination_area_id": "ALTER TABLE qr_action_rules ADD COLUMN fifo_chain_step4_destination_area_id INTEGER;",
+                    "fifo_chain_step5_destination_area_id": "ALTER TABLE qr_action_rules ADD COLUMN fifo_chain_step5_destination_area_id INTEGER;",
                     "fifo_chain_step4_destination_cell_id": "ALTER TABLE qr_action_rules ADD COLUMN fifo_chain_step4_destination_cell_id INTEGER;",
+                    "fifo_chain_step5_destination_cell_id": "ALTER TABLE qr_action_rules ADD COLUMN fifo_chain_step5_destination_cell_id INTEGER;",
                     "second_source_area_id": "ALTER TABLE qr_action_rules ADD COLUMN second_source_area_id INTEGER;",
                     "second_destination_area_id": "ALTER TABLE qr_action_rules ADD COLUMN second_destination_area_id INTEGER;",
                     "second_source_cell_id": "ALTER TABLE qr_action_rules ADD COLUMN second_source_cell_id INTEGER;",
                     "second_destination_cell_id": "ALTER TABLE qr_action_rules ADD COLUMN second_destination_cell_id INTEGER;",
                 }
+                for step in range(1, 6):
+                    qr_route_missing_sql.update({
+                        f"fifo_chain_step{step}_source_area_ids_json": f"ALTER TABLE qr_action_rules ADD COLUMN fifo_chain_step{step}_source_area_ids_json TEXT;",
+                        f"fifo_chain_step{step}_destination_mode": f"ALTER TABLE qr_action_rules ADD COLUMN fifo_chain_step{step}_destination_mode VARCHAR(32) NOT NULL DEFAULT 'configured_area';",
+                        f"fifo_chain_step{step}_destination_area_ids_json": f"ALTER TABLE qr_action_rules ADD COLUMN fifo_chain_step{step}_destination_area_ids_json TEXT;",
+                    })
                 for name, stmt in qr_route_missing_sql.items():
                     if name not in qr_action_rule_cols:
                         conn.exec_driver_sql(stmt)
@@ -1609,8 +1844,10 @@ def cleanup_legacy_schema():
                     conn.exec_driver_sql("UPDATE qr_action_rules SET fifo_chain_step3_source_mode = 'configured_area' WHERE fifo_chain_step3_source_mode IS NULL OR trim(fifo_chain_step3_source_mode) = '';")
                 if "fifo_chain_step4_source_mode" in qr_action_rule_cols:
                     conn.exec_driver_sql("UPDATE qr_action_rules SET fifo_chain_step4_source_mode = 'configured_area' WHERE fifo_chain_step4_source_mode IS NULL OR trim(fifo_chain_step4_source_mode) = '';")
+                if "fifo_chain_step5_source_mode" in qr_action_rule_cols:
+                    conn.exec_driver_sql("UPDATE qr_action_rules SET fifo_chain_step5_source_mode = 'configured_area' WHERE fifo_chain_step5_source_mode IS NULL OR trim(fifo_chain_step5_source_mode) = '';")
                 if "fifo_chain_total_steps" in qr_action_rule_cols:
-                    conn.exec_driver_sql("UPDATE qr_action_rules SET fifo_chain_total_steps = 2 WHERE fifo_chain_total_steps IS NULL OR fifo_chain_total_steps NOT IN (2, 3, 4);")
+                    conn.exec_driver_sql("UPDATE qr_action_rules SET fifo_chain_total_steps = 2 WHERE fifo_chain_total_steps IS NULL OR fifo_chain_total_steps NOT IN (2, 3, 4, 5);")
             except Exception:
                 logger.exception("SQLite migration failed for qr_action_rules route columns")
                 raise
@@ -2918,10 +3155,15 @@ def _scanner_station_out(db, row: ScannerStation, area_by_id: Optional[dict] = N
     step2_material = db.execute(select(MaterialGroup).where(MaterialGroup.id == row.fifo_chain_step2_material_group_id)).scalar_one_or_none() if getattr(row, "fifo_chain_step2_material_group_id", None) else None
     step3_material = db.execute(select(MaterialGroup).where(MaterialGroup.id == row.fifo_chain_step3_material_group_id)).scalar_one_or_none() if getattr(row, "fifo_chain_step3_material_group_id", None) else None
     step4_source_area = area_for(getattr(row, "fifo_chain_step4_source_area_id", None))
+    step5_source_area = area_for(getattr(row, "fifo_chain_step5_source_area_id", None))
     step4_destination_area = area_for(getattr(row, "fifo_chain_step4_destination_area_id", None))
+    step5_destination_area = area_for(getattr(row, "fifo_chain_step5_destination_area_id", None))
     step4_source_cell = db.execute(select(Location).where(Location.id == row.fifo_chain_step4_source_cell_id)).scalar_one_or_none() if getattr(row, "fifo_chain_step4_source_cell_id", None) else None
+    step5_source_cell = db.execute(select(Location).where(Location.id == row.fifo_chain_step5_source_cell_id)).scalar_one_or_none() if getattr(row, "fifo_chain_step5_source_cell_id", None) else None
     step4_destination_cell = db.execute(select(Location).where(Location.id == row.fifo_chain_step4_destination_cell_id)).scalar_one_or_none() if getattr(row, "fifo_chain_step4_destination_cell_id", None) else None
+    step5_destination_cell = db.execute(select(Location).where(Location.id == row.fifo_chain_step5_destination_cell_id)).scalar_one_or_none() if getattr(row, "fifo_chain_step5_destination_cell_id", None) else None
     step4_material = db.execute(select(MaterialGroup).where(MaterialGroup.id == row.fifo_chain_step4_material_group_id)).scalar_one_or_none() if getattr(row, "fifo_chain_step4_material_group_id", None) else None
+    step5_material = db.execute(select(MaterialGroup).where(MaterialGroup.id == row.fifo_chain_step5_material_group_id)).scalar_one_or_none() if getattr(row, "fifo_chain_step5_material_group_id", None) else None
     return ScannerStationOut(
         id=row.id,
         scanner_code=row.scanner_code,
@@ -2958,16 +3200,27 @@ def _scanner_station_out(db, row: ScannerStation, area_by_id: Optional[dict] = N
         fifo_chain_step3_destination_cell_id=getattr(row, "fifo_chain_step3_destination_cell_id", None),
         fifo_chain_step3_destination_cell_code=_cell_code(step3_destination_cell),
         fifo_chain_step4_source_mode=_normalize_fifo_chain_step4_source_mode(getattr(row, "fifo_chain_step4_source_mode", None)),
+        fifo_chain_step5_source_mode=_normalize_fifo_chain_step5_source_mode(getattr(row, "fifo_chain_step5_source_mode", None)),
         fifo_chain_step4_material_group_id=getattr(row, "fifo_chain_step4_material_group_id", None),
+        fifo_chain_step5_material_group_id=getattr(row, "fifo_chain_step5_material_group_id", None),
         fifo_chain_step4_material_group_name=step4_material.name if step4_material else None,
+        fifo_chain_step5_material_group_name=step5_material.name if step5_material else None,
         fifo_chain_step4_source_area_id=getattr(row, "fifo_chain_step4_source_area_id", None),
+        fifo_chain_step5_source_area_id=getattr(row, "fifo_chain_step5_source_area_id", None),
         fifo_chain_step4_source_area_name=step4_source_area.name if step4_source_area else None,
+        fifo_chain_step5_source_area_name=step5_source_area.name if step5_source_area else None,
         fifo_chain_step4_source_cell_id=getattr(row, "fifo_chain_step4_source_cell_id", None),
+        fifo_chain_step5_source_cell_id=getattr(row, "fifo_chain_step5_source_cell_id", None),
         fifo_chain_step4_source_cell_code=_cell_code(step4_source_cell),
+        fifo_chain_step5_source_cell_code=_cell_code(step5_source_cell),
         fifo_chain_step4_destination_area_id=getattr(row, "fifo_chain_step4_destination_area_id", None),
+        fifo_chain_step5_destination_area_id=getattr(row, "fifo_chain_step5_destination_area_id", None),
         fifo_chain_step4_destination_area_name=step4_destination_area.name if step4_destination_area else None,
+        fifo_chain_step5_destination_area_name=step5_destination_area.name if step5_destination_area else None,
         fifo_chain_step4_destination_cell_id=getattr(row, "fifo_chain_step4_destination_cell_id", None),
+        fifo_chain_step5_destination_cell_id=getattr(row, "fifo_chain_step5_destination_cell_id", None),
         fifo_chain_step4_destination_cell_code=_cell_code(step4_destination_cell),
+        fifo_chain_step5_destination_cell_code=_cell_code(step5_destination_cell),
         second_source_area_id=getattr(row, "second_source_area_id", None),
         second_source_area_code=second_source_area.code if second_source_area else None,
         second_source_area_name=second_source_area.name if second_source_area else None,
@@ -2995,6 +3248,7 @@ def _scanner_station_out(db, row: ScannerStation, area_by_id: Optional[dict] = N
         require_preview=int(row.require_preview or 0),
         allow_execute=int(row.allow_execute or 0),
         is_active=int(row.is_active or 0),
+        **_fifo_chain_area_modes_out(row),
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -3036,17 +3290,22 @@ def _qr_action_rule_out(db, row: QrActionRule) -> QrActionRuleOut:
     step3_source_area = db.execute(select(Area).where(Area.id == row.fifo_chain_step3_source_area_id)).scalar_one_or_none() if getattr(row, "fifo_chain_step3_source_area_id", None) else None
     step3_destination_area = db.execute(select(Area).where(Area.id == row.fifo_chain_step3_destination_area_id)).scalar_one_or_none() if getattr(row, "fifo_chain_step3_destination_area_id", None) else None
     step4_source_area = db.execute(select(Area).where(Area.id == row.fifo_chain_step4_source_area_id)).scalar_one_or_none() if getattr(row, "fifo_chain_step4_source_area_id", None) else None
+    step5_source_area = db.execute(select(Area).where(Area.id == row.fifo_chain_step5_source_area_id)).scalar_one_or_none() if getattr(row, "fifo_chain_step5_source_area_id", None) else None
     step4_destination_area = db.execute(select(Area).where(Area.id == row.fifo_chain_step4_destination_area_id)).scalar_one_or_none() if getattr(row, "fifo_chain_step4_destination_area_id", None) else None
+    step5_destination_area = db.execute(select(Area).where(Area.id == row.fifo_chain_step5_destination_area_id)).scalar_one_or_none() if getattr(row, "fifo_chain_step5_destination_area_id", None) else None
     second_source_cell = db.execute(select(Location).where(Location.id == row.second_source_cell_id)).scalar_one_or_none() if getattr(row, "second_source_cell_id", None) else None
     second_destination_cell = db.execute(select(Location).where(Location.id == row.second_destination_cell_id)).scalar_one_or_none() if getattr(row, "second_destination_cell_id", None) else None
     step3_source_cell = db.execute(select(Location).where(Location.id == row.fifo_chain_step3_source_cell_id)).scalar_one_or_none() if getattr(row, "fifo_chain_step3_source_cell_id", None) else None
     step3_destination_cell = db.execute(select(Location).where(Location.id == row.fifo_chain_step3_destination_cell_id)).scalar_one_or_none() if getattr(row, "fifo_chain_step3_destination_cell_id", None) else None
     step4_source_cell = db.execute(select(Location).where(Location.id == row.fifo_chain_step4_source_cell_id)).scalar_one_or_none() if getattr(row, "fifo_chain_step4_source_cell_id", None) else None
+    step5_source_cell = db.execute(select(Location).where(Location.id == row.fifo_chain_step5_source_cell_id)).scalar_one_or_none() if getattr(row, "fifo_chain_step5_source_cell_id", None) else None
     step4_destination_cell = db.execute(select(Location).where(Location.id == row.fifo_chain_step4_destination_cell_id)).scalar_one_or_none() if getattr(row, "fifo_chain_step4_destination_cell_id", None) else None
+    step5_destination_cell = db.execute(select(Location).where(Location.id == row.fifo_chain_step5_destination_cell_id)).scalar_one_or_none() if getattr(row, "fifo_chain_step5_destination_cell_id", None) else None
     step1_material = db.execute(select(MaterialGroup).where(MaterialGroup.id == row.fifo_chain_step1_material_group_id)).scalar_one_or_none() if getattr(row, "fifo_chain_step1_material_group_id", None) else None
     step2_material = db.execute(select(MaterialGroup).where(MaterialGroup.id == row.fifo_chain_step2_material_group_id)).scalar_one_or_none() if getattr(row, "fifo_chain_step2_material_group_id", None) else None
     step3_material = db.execute(select(MaterialGroup).where(MaterialGroup.id == row.fifo_chain_step3_material_group_id)).scalar_one_or_none() if getattr(row, "fifo_chain_step3_material_group_id", None) else None
     step4_material = db.execute(select(MaterialGroup).where(MaterialGroup.id == row.fifo_chain_step4_material_group_id)).scalar_one_or_none() if getattr(row, "fifo_chain_step4_material_group_id", None) else None
+    step5_material = db.execute(select(MaterialGroup).where(MaterialGroup.id == row.fifo_chain_step5_material_group_id)).scalar_one_or_none() if getattr(row, "fifo_chain_step5_material_group_id", None) else None
     return QrActionRuleOut(
         id=row.id,
         qr_value=row.qr_value,
@@ -3088,16 +3347,27 @@ def _qr_action_rule_out(db, row: QrActionRule) -> QrActionRuleOut:
         fifo_chain_step3_destination_cell_id=getattr(row, "fifo_chain_step3_destination_cell_id", None),
         fifo_chain_step3_destination_cell_code=_cell_code(step3_destination_cell),
         fifo_chain_step4_source_mode=_normalize_fifo_chain_step4_source_mode(getattr(row, "fifo_chain_step4_source_mode", None)),
+        fifo_chain_step5_source_mode=_normalize_fifo_chain_step5_source_mode(getattr(row, "fifo_chain_step5_source_mode", None)),
         fifo_chain_step4_material_group_id=getattr(row, "fifo_chain_step4_material_group_id", None),
+        fifo_chain_step5_material_group_id=getattr(row, "fifo_chain_step5_material_group_id", None),
         fifo_chain_step4_material_group_name=step4_material.name if step4_material else None,
+        fifo_chain_step5_material_group_name=step5_material.name if step5_material else None,
         fifo_chain_step4_source_area_id=getattr(row, "fifo_chain_step4_source_area_id", None),
+        fifo_chain_step5_source_area_id=getattr(row, "fifo_chain_step5_source_area_id", None),
         fifo_chain_step4_source_area_name=step4_source_area.name if step4_source_area else None,
+        fifo_chain_step5_source_area_name=step5_source_area.name if step5_source_area else None,
         fifo_chain_step4_source_cell_id=getattr(row, "fifo_chain_step4_source_cell_id", None),
+        fifo_chain_step5_source_cell_id=getattr(row, "fifo_chain_step5_source_cell_id", None),
         fifo_chain_step4_source_cell_code=_cell_code(step4_source_cell),
+        fifo_chain_step5_source_cell_code=_cell_code(step5_source_cell),
         fifo_chain_step4_destination_area_id=getattr(row, "fifo_chain_step4_destination_area_id", None),
+        fifo_chain_step5_destination_area_id=getattr(row, "fifo_chain_step5_destination_area_id", None),
         fifo_chain_step4_destination_area_name=step4_destination_area.name if step4_destination_area else None,
+        fifo_chain_step5_destination_area_name=step5_destination_area.name if step5_destination_area else None,
         fifo_chain_step4_destination_cell_id=getattr(row, "fifo_chain_step4_destination_cell_id", None),
+        fifo_chain_step5_destination_cell_id=getattr(row, "fifo_chain_step5_destination_cell_id", None),
         fifo_chain_step4_destination_cell_code=_cell_code(step4_destination_cell),
+        fifo_chain_step5_destination_cell_code=_cell_code(step5_destination_cell),
         second_source_area_id=getattr(row, "second_source_area_id", None),
         second_source_area_code=second_source_area.code if second_source_area else None,
         second_source_area_name=second_source_area.name if second_source_area else None,
@@ -3113,6 +3383,7 @@ def _qr_action_rule_out(db, row: QrActionRule) -> QrActionRuleOut:
         agv_code=row.agv_code,
         requires_scanner_station=int(row.requires_scanner_station or 0),
         is_active=int(row.is_active or 0),
+        **_fifo_chain_area_modes_out(row),
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -3283,12 +3554,14 @@ def _validate_scanner_station_body(db, body: ScannerStationIn) -> tuple[str, str
     station_type = _validate_choice(body.station_type, VALID_SCANNER_STATION_TYPES, "station_type")
     default_action = _validate_choice(body.default_action, VALID_SCANNER_ACTIONS, "default_action")
     route_mode = _validate_choice(_normalize_route_mode(body.route_mode), VALID_ROUTE_MODES, "route_mode")
+    _validate_fifo_chain_area_modes(db, body, route_mode)
     _validate_choice(body.fifo_material_policy or "specific_material", VALID_FIFO_MATERIAL_POLICIES, "fifo_material_policy")
-    _validate_choice(_normalize_fifo_chain_total_steps(body.fifo_chain_total_steps), VALID_FIFO_CHAIN_TOTAL_STEPS, "fifo_chain_total_steps")
+    _validate_fifo_chain_total_steps_input(body.fifo_chain_total_steps)
     step1_source_mode = _validate_choice(_normalize_fifo_chain_step1_source_mode(body.fifo_chain_step1_source_mode), VALID_FIFO_CHAIN_SOURCE_MODES, "fifo_chain_step1_source_mode")
     step2_source_mode = _validate_choice(_normalize_fifo_chain_step2_source_mode(body.fifo_chain_step2_source_mode), VALID_FIFO_CHAIN_STEP2_SOURCE_MODES, "fifo_chain_step2_source_mode")
     step3_source_mode = _validate_choice(_normalize_fifo_chain_step3_source_mode(body.fifo_chain_step3_source_mode), VALID_FIFO_CHAIN_STEP3_SOURCE_MODES, "fifo_chain_step3_source_mode")
     step4_source_mode = _validate_choice(_normalize_fifo_chain_step4_source_mode(body.fifo_chain_step4_source_mode), VALID_FIFO_CHAIN_STEP4_SOURCE_MODES, "fifo_chain_step4_source_mode")
+    step5_source_mode = _validate_choice(_normalize_fifo_chain_step5_source_mode(body.fifo_chain_step5_source_mode), VALID_FIFO_CHAIN_STEP5_SOURCE_MODES, "fifo_chain_step5_source_mode")
     _require_area(db, body.source_area_id, "Area origen")
     _require_area(db, body.destination_area_id, "Area destino")
     _require_area(db, body.second_source_area_id, "Area origen secundaria")
@@ -3305,24 +3578,31 @@ def _validate_scanner_station_body(db, body: ScannerStationIn) -> tuple[str, str
     _require_location(db, body.fifo_chain_step3_source_cell_id, "Celda origen tramo 3")
     _require_location(db, body.fifo_chain_step3_destination_cell_id, "Celda destino tramo 3")
     _require_area(db, body.fifo_chain_step4_source_area_id, "Area origen tramo 4")
+    _require_area(db, body.fifo_chain_step5_source_area_id, "Area origen tramo 5")
     _require_area(db, body.fifo_chain_step4_destination_area_id, "Area destino tramo 4")
+    _require_area(db, body.fifo_chain_step5_destination_area_id, "Area destino tramo 5")
     _require_location(db, body.fifo_chain_step4_source_cell_id, "Celda origen tramo 4")
+    _require_location(db, body.fifo_chain_step5_source_cell_id, "Celda origen tramo 5")
     _require_location(db, body.fifo_chain_step4_destination_cell_id, "Celda destino tramo 4")
+    _require_location(db, body.fifo_chain_step5_destination_cell_id, "Celda destino tramo 5")
     if route_mode != "fifo_chain":
         _require_material_group(db, body.default_material_group_id)
     _require_material_group(db, body.fifo_chain_step1_material_group_id)
     _require_material_group(db, body.fifo_chain_step2_material_group_id)
     _require_material_group(db, body.fifo_chain_step3_material_group_id)
     _require_material_group(db, body.fifo_chain_step4_material_group_id)
+    _require_material_group(db, body.fifo_chain_step5_material_group_id)
     total_steps = _normalize_fifo_chain_total_steps(body.fifo_chain_total_steps)
     if route_mode == "fifo_chain" and not body.fifo_chain_step1_material_group_id:
         raise HTTPException(status_code=400, detail="El tramo 1 requiere Material requerido tramo 1.")
-    if route_mode == "fifo_chain" and step2_source_mode == "any_area_by_material" and not body.fifo_chain_step2_material_group_id:
+    if route_mode == "fifo_chain" and step2_source_mode != "configured_area" and not body.fifo_chain_step2_material_group_id:
         raise HTTPException(status_code=400, detail="El tramo 2 por material requiere Material requerido tramo 2.")
-    if route_mode == "fifo_chain" and total_steps >= 3 and step3_source_mode == "any_area_by_material" and not body.fifo_chain_step3_material_group_id:
+    if route_mode == "fifo_chain" and total_steps >= 3 and step3_source_mode != "configured_area" and not body.fifo_chain_step3_material_group_id:
         raise HTTPException(status_code=400, detail="El tramo 3 por material requiere Material requerido tramo 3.")
-    if route_mode == "fifo_chain" and total_steps == 4 and step4_source_mode == "any_area_by_material" and not body.fifo_chain_step4_material_group_id:
+    if route_mode == "fifo_chain" and total_steps >= 4 and step4_source_mode != "configured_area" and not body.fifo_chain_step4_material_group_id:
         raise HTTPException(status_code=400, detail="El tramo 4 por material requiere Material requerido tramo 4.")
+    if route_mode == "fifo_chain" and total_steps == 5 and step5_source_mode != "configured_area" and not body.fifo_chain_step5_material_group_id:
+        raise HTTPException(status_code=400, detail="El tramo 5 por material requiere Material requerido tramo 5.")
     return station_type, default_action
 
 
@@ -3331,12 +3611,14 @@ def _validate_qr_action_rule_body(db, body: QrActionRuleIn) -> tuple[str, str, s
     match_type = _validate_choice(body.match_type, VALID_QR_MATCH_TYPES, "match_type")
     action_type = _validate_choice(body.action_type, VALID_QR_ACTION_TYPES, "action_type")
     route_mode = _validate_choice(_normalize_route_mode(body.route_mode), VALID_ROUTE_MODES, "route_mode")
+    _validate_fifo_chain_area_modes(db, body, route_mode)
     fifo_material_policy = _validate_choice(body.fifo_material_policy or "specific_material", VALID_FIFO_MATERIAL_POLICIES, "fifo_material_policy")
-    _validate_choice(_normalize_fifo_chain_total_steps(body.fifo_chain_total_steps), VALID_FIFO_CHAIN_TOTAL_STEPS, "fifo_chain_total_steps")
+    _validate_fifo_chain_total_steps_input(body.fifo_chain_total_steps)
     step1_source_mode = _validate_choice(_normalize_fifo_chain_step1_source_mode(body.fifo_chain_step1_source_mode), VALID_FIFO_CHAIN_SOURCE_MODES, "fifo_chain_step1_source_mode")
     step2_source_mode = _validate_choice(_normalize_fifo_chain_step2_source_mode(body.fifo_chain_step2_source_mode), VALID_FIFO_CHAIN_STEP2_SOURCE_MODES, "fifo_chain_step2_source_mode")
     step3_source_mode = _validate_choice(_normalize_fifo_chain_step3_source_mode(body.fifo_chain_step3_source_mode), VALID_FIFO_CHAIN_STEP3_SOURCE_MODES, "fifo_chain_step3_source_mode")
     step4_source_mode = _validate_choice(_normalize_fifo_chain_step4_source_mode(body.fifo_chain_step4_source_mode), VALID_FIFO_CHAIN_STEP4_SOURCE_MODES, "fifo_chain_step4_source_mode")
+    step5_source_mode = _validate_choice(_normalize_fifo_chain_step5_source_mode(body.fifo_chain_step5_source_mode), VALID_FIFO_CHAIN_STEP5_SOURCE_MODES, "fifo_chain_step5_source_mode")
     if match_type == "regex":
         try:
             re.compile(body.qr_value)
@@ -3362,10 +3644,15 @@ def _validate_qr_action_rule_body(db, body: QrActionRuleIn) -> tuple[str, str, s
     _require_location(db, body.fifo_chain_step3_destination_cell_id, "Celda destino tramo 3")
     _require_material_group(db, body.fifo_chain_step3_material_group_id)
     _require_area(db, body.fifo_chain_step4_source_area_id, "Area origen tramo 4")
+    _require_area(db, body.fifo_chain_step5_source_area_id, "Area origen tramo 5")
     _require_area(db, body.fifo_chain_step4_destination_area_id, "Area destino tramo 4")
+    _require_area(db, body.fifo_chain_step5_destination_area_id, "Area destino tramo 5")
     _require_location(db, body.fifo_chain_step4_source_cell_id, "Celda origen tramo 4")
+    _require_location(db, body.fifo_chain_step5_source_cell_id, "Celda origen tramo 5")
     _require_location(db, body.fifo_chain_step4_destination_cell_id, "Celda destino tramo 4")
+    _require_location(db, body.fifo_chain_step5_destination_cell_id, "Celda destino tramo 5")
     _require_material_group(db, body.fifo_chain_step4_material_group_id)
+    _require_material_group(db, body.fifo_chain_step5_material_group_id)
     total_steps = _normalize_fifo_chain_total_steps(body.fifo_chain_total_steps)
     if route_mode == "fifo_chain" and not body.fifo_chain_step1_material_group_id:
         raise HTTPException(status_code=400, detail="El tramo 1 requiere Material requerido tramo 1.")
@@ -3373,12 +3660,14 @@ def _validate_qr_action_rule_body(db, body: QrActionRuleIn) -> tuple[str, str, s
         raise HTTPException(status_code=400, detail="fifo_request requiere material_group_id o un qr_value con prefijo MAT:")
     if action_type == "fifo_request" and fifo_material_policy == "any_available_from_source" and not (body.source_area_id or body.source_cell_id) and route_mode != "fifo_chain":
         raise HTTPException(status_code=400, detail="any_available_from_source requiere area origen o celda origen")
-    if route_mode == "fifo_chain" and step2_source_mode == "any_area_by_material" and not body.fifo_chain_step2_material_group_id:
+    if route_mode == "fifo_chain" and step2_source_mode != "configured_area" and not body.fifo_chain_step2_material_group_id:
         raise HTTPException(status_code=400, detail="El tramo 2 por material requiere Material requerido tramo 2.")
-    if route_mode == "fifo_chain" and total_steps >= 3 and step3_source_mode == "any_area_by_material" and not body.fifo_chain_step3_material_group_id:
+    if route_mode == "fifo_chain" and total_steps >= 3 and step3_source_mode != "configured_area" and not body.fifo_chain_step3_material_group_id:
         raise HTTPException(status_code=400, detail="El tramo 3 por material requiere Material requerido tramo 3.")
-    if route_mode == "fifo_chain" and total_steps == 4 and step4_source_mode == "any_area_by_material" and not body.fifo_chain_step4_material_group_id:
+    if route_mode == "fifo_chain" and total_steps >= 4 and step4_source_mode != "configured_area" and not body.fifo_chain_step4_material_group_id:
         raise HTTPException(status_code=400, detail="El tramo 4 por material requiere Material requerido tramo 4.")
+    if route_mode == "fifo_chain" and total_steps == 5 and step5_source_mode != "configured_area" and not body.fifo_chain_step5_material_group_id:
+        raise HTTPException(status_code=400, detail="El tramo 5 por material requiere Material requerido tramo 5.")
     return qr_type, match_type, action_type
 
 
@@ -6924,7 +7213,7 @@ async def _runtime_broadcast_loop():
 
 
 @app.get("/api/runtime-snapshot", response_model=RuntimeSnapshotOut)
-def get_runtime_snapshot(debug_limit: int = 200, include_robot_monitor: int = 1):
+def get_runtime_snapshot(debug_limit: int = 200, include_robot_monitor: int = 0):
     with SessionLocal() as db:
         return _build_runtime_snapshot_out(db, debug_limit=debug_limit, include_robot_monitor=include_robot_monitor)
 
@@ -8014,6 +8303,7 @@ def admin_create_scanner_station(body: ScannerStationIn, x_admin_token: Optional
         station_type, default_action = _validate_scanner_station_body(db, body)
         step3_source_mode = _normalize_fifo_chain_step3_source_mode(body.fifo_chain_step3_source_mode)
         step4_source_mode = _normalize_fifo_chain_step4_source_mode(body.fifo_chain_step4_source_mode)
+        step5_source_mode = _normalize_fifo_chain_step5_source_mode(body.fifo_chain_step5_source_mode)
         route_mode = _normalize_route_mode(body.route_mode)
         now = datetime.utcnow()
         row = ScannerStation(
@@ -8040,11 +8330,17 @@ def admin_create_scanner_station(body: ScannerStationIn, x_admin_token: Optional
             fifo_chain_step3_destination_area_id=body.fifo_chain_step3_destination_area_id,
             fifo_chain_step3_destination_cell_id=body.fifo_chain_step3_destination_cell_id,
             fifo_chain_step4_source_mode=step4_source_mode,
+            fifo_chain_step5_source_mode=step5_source_mode,
             fifo_chain_step4_material_group_id=body.fifo_chain_step4_material_group_id,
+            fifo_chain_step5_material_group_id=body.fifo_chain_step5_material_group_id,
             fifo_chain_step4_source_area_id=None if step4_source_mode == "any_area_by_material" else body.fifo_chain_step4_source_area_id,
+            fifo_chain_step5_source_area_id=None if step5_source_mode == "any_area_by_material" else body.fifo_chain_step5_source_area_id,
             fifo_chain_step4_source_cell_id=None if step4_source_mode == "any_area_by_material" else body.fifo_chain_step4_source_cell_id,
+            fifo_chain_step5_source_cell_id=None if step5_source_mode == "any_area_by_material" else body.fifo_chain_step5_source_cell_id,
             fifo_chain_step4_destination_area_id=body.fifo_chain_step4_destination_area_id,
+            fifo_chain_step5_destination_area_id=body.fifo_chain_step5_destination_area_id,
             fifo_chain_step4_destination_cell_id=body.fifo_chain_step4_destination_cell_id,
+            fifo_chain_step5_destination_cell_id=body.fifo_chain_step5_destination_cell_id,
             second_source_area_id=body.second_source_area_id,
             second_destination_area_id=body.second_destination_area_id,
             second_source_cell_id=body.second_source_cell_id,
@@ -8062,6 +8358,8 @@ def admin_create_scanner_station(body: ScannerStationIn, x_admin_token: Optional
             created_at=now,
             updated_at=now,
         )
+        _apply_fifo_chain_area_modes(row, body)
+        _clear_fifo_chain_step5_if_unused(row)
         db.add(row)
         db.commit()
         db.refresh(row)
@@ -8083,6 +8381,7 @@ def admin_update_scanner_station(scanner_station_id: int, body: ScannerStationIn
         station_type, default_action = _validate_scanner_station_body(db, body)
         step3_source_mode = _normalize_fifo_chain_step3_source_mode(body.fifo_chain_step3_source_mode)
         step4_source_mode = _normalize_fifo_chain_step4_source_mode(body.fifo_chain_step4_source_mode)
+        step5_source_mode = _normalize_fifo_chain_step5_source_mode(body.fifo_chain_step5_source_mode)
         route_mode = _normalize_route_mode(body.route_mode)
         row.scanner_code = scanner_code
         row.name = body.name.strip()
@@ -8107,11 +8406,17 @@ def admin_update_scanner_station(scanner_station_id: int, body: ScannerStationIn
         row.fifo_chain_step3_destination_area_id = body.fifo_chain_step3_destination_area_id
         row.fifo_chain_step3_destination_cell_id = body.fifo_chain_step3_destination_cell_id
         row.fifo_chain_step4_source_mode = step4_source_mode
+        row.fifo_chain_step5_source_mode = step5_source_mode
         row.fifo_chain_step4_material_group_id = body.fifo_chain_step4_material_group_id
+        row.fifo_chain_step5_material_group_id = body.fifo_chain_step5_material_group_id
         row.fifo_chain_step4_source_area_id = None if step4_source_mode == "any_area_by_material" else body.fifo_chain_step4_source_area_id
+        row.fifo_chain_step5_source_area_id = None if step5_source_mode == "any_area_by_material" else body.fifo_chain_step5_source_area_id
         row.fifo_chain_step4_source_cell_id = None if step4_source_mode == "any_area_by_material" else body.fifo_chain_step4_source_cell_id
+        row.fifo_chain_step5_source_cell_id = None if step5_source_mode == "any_area_by_material" else body.fifo_chain_step5_source_cell_id
         row.fifo_chain_step4_destination_area_id = body.fifo_chain_step4_destination_area_id
+        row.fifo_chain_step5_destination_area_id = body.fifo_chain_step5_destination_area_id
         row.fifo_chain_step4_destination_cell_id = body.fifo_chain_step4_destination_cell_id
+        row.fifo_chain_step5_destination_cell_id = body.fifo_chain_step5_destination_cell_id
         row.second_source_area_id = body.second_source_area_id
         row.second_destination_area_id = body.second_destination_area_id
         row.second_source_cell_id = body.second_source_cell_id
@@ -8127,6 +8432,8 @@ def admin_update_scanner_station(scanner_station_id: int, body: ScannerStationIn
         row.allow_execute = int(body.allow_execute or 0)
         row.is_active = int(body.is_active or 0)
         row.updated_at = datetime.utcnow()
+        _apply_fifo_chain_area_modes(row, body)
+        _clear_fifo_chain_step5_if_unused(row)
         db.add(row)
         db.commit()
         db.refresh(row)
@@ -8185,6 +8492,7 @@ def admin_create_qr_action_rule(body: QrActionRuleIn, x_admin_token: Optional[st
         qr_type, match_type, action_type = _validate_qr_action_rule_body(db, body)
         step3_source_mode = _normalize_fifo_chain_step3_source_mode(body.fifo_chain_step3_source_mode)
         step4_source_mode = _normalize_fifo_chain_step4_source_mode(body.fifo_chain_step4_source_mode)
+        step5_source_mode = _normalize_fifo_chain_step5_source_mode(body.fifo_chain_step5_source_mode)
         route_mode = _normalize_route_mode(body.route_mode)
         now = datetime.utcnow()
         row = QrActionRule(
@@ -8214,11 +8522,17 @@ def admin_create_qr_action_rule(body: QrActionRuleIn, x_admin_token: Optional[st
             fifo_chain_step3_destination_area_id=body.fifo_chain_step3_destination_area_id,
             fifo_chain_step3_destination_cell_id=body.fifo_chain_step3_destination_cell_id,
             fifo_chain_step4_source_mode=step4_source_mode,
+            fifo_chain_step5_source_mode=step5_source_mode,
             fifo_chain_step4_material_group_id=body.fifo_chain_step4_material_group_id,
+            fifo_chain_step5_material_group_id=body.fifo_chain_step5_material_group_id,
             fifo_chain_step4_source_area_id=None if step4_source_mode == "any_area_by_material" else body.fifo_chain_step4_source_area_id,
+            fifo_chain_step5_source_area_id=None if step5_source_mode == "any_area_by_material" else body.fifo_chain_step5_source_area_id,
             fifo_chain_step4_source_cell_id=None if step4_source_mode == "any_area_by_material" else body.fifo_chain_step4_source_cell_id,
+            fifo_chain_step5_source_cell_id=None if step5_source_mode == "any_area_by_material" else body.fifo_chain_step5_source_cell_id,
             fifo_chain_step4_destination_area_id=body.fifo_chain_step4_destination_area_id,
+            fifo_chain_step5_destination_area_id=body.fifo_chain_step5_destination_area_id,
             fifo_chain_step4_destination_cell_id=body.fifo_chain_step4_destination_cell_id,
+            fifo_chain_step5_destination_cell_id=body.fifo_chain_step5_destination_cell_id,
             second_source_area_id=body.second_source_area_id,
             second_destination_area_id=body.second_destination_area_id,
             second_source_cell_id=body.second_source_cell_id,
@@ -8231,6 +8545,8 @@ def admin_create_qr_action_rule(body: QrActionRuleIn, x_admin_token: Optional[st
             created_at=now,
             updated_at=now,
         )
+        _apply_fifo_chain_area_modes(row, body)
+        _clear_fifo_chain_step5_if_unused(row)
         db.add(row)
         db.commit()
         db.refresh(row)
@@ -8248,6 +8564,7 @@ def admin_update_qr_action_rule(qr_action_rule_id: int, body: QrActionRuleIn, x_
         qr_type, match_type, action_type = _validate_qr_action_rule_body(db, body)
         step3_source_mode = _normalize_fifo_chain_step3_source_mode(body.fifo_chain_step3_source_mode)
         step4_source_mode = _normalize_fifo_chain_step4_source_mode(body.fifo_chain_step4_source_mode)
+        step5_source_mode = _normalize_fifo_chain_step5_source_mode(body.fifo_chain_step5_source_mode)
         route_mode = _normalize_route_mode(body.route_mode)
         row.qr_value = body.qr_value.strip()
         row.qr_alias = (body.qr_alias or "").strip() or None
@@ -8275,11 +8592,17 @@ def admin_update_qr_action_rule(qr_action_rule_id: int, body: QrActionRuleIn, x_
         row.fifo_chain_step3_destination_area_id = body.fifo_chain_step3_destination_area_id
         row.fifo_chain_step3_destination_cell_id = body.fifo_chain_step3_destination_cell_id
         row.fifo_chain_step4_source_mode = step4_source_mode
+        row.fifo_chain_step5_source_mode = step5_source_mode
         row.fifo_chain_step4_material_group_id = body.fifo_chain_step4_material_group_id
+        row.fifo_chain_step5_material_group_id = body.fifo_chain_step5_material_group_id
         row.fifo_chain_step4_source_area_id = None if step4_source_mode == "any_area_by_material" else body.fifo_chain_step4_source_area_id
+        row.fifo_chain_step5_source_area_id = None if step5_source_mode == "any_area_by_material" else body.fifo_chain_step5_source_area_id
         row.fifo_chain_step4_source_cell_id = None if step4_source_mode == "any_area_by_material" else body.fifo_chain_step4_source_cell_id
+        row.fifo_chain_step5_source_cell_id = None if step5_source_mode == "any_area_by_material" else body.fifo_chain_step5_source_cell_id
         row.fifo_chain_step4_destination_area_id = body.fifo_chain_step4_destination_area_id
+        row.fifo_chain_step5_destination_area_id = body.fifo_chain_step5_destination_area_id
         row.fifo_chain_step4_destination_cell_id = body.fifo_chain_step4_destination_cell_id
+        row.fifo_chain_step5_destination_cell_id = body.fifo_chain_step5_destination_cell_id
         row.second_source_area_id = body.second_source_area_id
         row.second_destination_area_id = body.second_destination_area_id
         row.second_source_cell_id = body.second_source_cell_id
@@ -8290,6 +8613,8 @@ def admin_update_qr_action_rule(qr_action_rule_id: int, body: QrActionRuleIn, x_
         row.requires_scanner_station = int(body.requires_scanner_station or 0)
         row.is_active = int(body.is_active or 0)
         row.updated_at = datetime.utcnow()
+        _apply_fifo_chain_area_modes(row, body)
+        _clear_fifo_chain_step5_if_unused(row)
         db.add(row)
         db.commit()
         db.refresh(row)

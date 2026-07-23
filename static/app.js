@@ -531,6 +531,14 @@ const scannerFifoChainStep4SourceCell = $("scannerFifoChainStep4SourceCell");
 const scannerFifoChainStep4DestinationCell = $("scannerFifoChainStep4DestinationCell");
 const scannerFifoChainStep4SourceCellSummary = $("scannerFifoChainStep4SourceCellSummary");
 const scannerFifoChainStep4DestinationCellSummary = $("scannerFifoChainStep4DestinationCellSummary");
+const scannerFifoChainStep5SourceMode = $("scannerFifoChainStep5SourceMode");
+const scannerFifoChainStep5Material = $("scannerFifoChainStep5Material");
+const scannerFifoChainStep5SourceArea = $("scannerFifoChainStep5SourceArea");
+const scannerFifoChainStep5DestinationArea = $("scannerFifoChainStep5DestinationArea");
+const scannerFifoChainStep5SourceCell = $("scannerFifoChainStep5SourceCell");
+const scannerFifoChainStep5DestinationCell = $("scannerFifoChainStep5DestinationCell");
+const scannerFifoChainStep5SourceCellSummary = $("scannerFifoChainStep5SourceCellSummary");
+const scannerFifoChainStep5DestinationCellSummary = $("scannerFifoChainStep5DestinationCellSummary");
 const scannerAgvCode = $("scannerAgvCode");
 const scannerTaskTyp = $("scannerTaskTyp");
 const scannerPriority = $("scannerPriority");
@@ -572,6 +580,14 @@ const qrFifoChainStep4SourceCell = $("qrFifoChainStep4SourceCell");
 const qrFifoChainStep4DestinationCell = $("qrFifoChainStep4DestinationCell");
 const qrFifoChainStep4SourceCellSummary = $("qrFifoChainStep4SourceCellSummary");
 const qrFifoChainStep4DestinationCellSummary = $("qrFifoChainStep4DestinationCellSummary");
+const qrFifoChainStep5SourceMode = $("qrFifoChainStep5SourceMode");
+const qrFifoChainStep5Material = $("qrFifoChainStep5Material");
+const qrFifoChainStep5SourceArea = $("qrFifoChainStep5SourceArea");
+const qrFifoChainStep5DestinationArea = $("qrFifoChainStep5DestinationArea");
+const qrFifoChainStep5SourceCell = $("qrFifoChainStep5SourceCell");
+const qrFifoChainStep5DestinationCell = $("qrFifoChainStep5DestinationCell");
+const qrFifoChainStep5SourceCellSummary = $("qrFifoChainStep5SourceCellSummary");
+const qrFifoChainStep5DestinationCellSummary = $("qrFifoChainStep5DestinationCellSummary");
 const qrRack = $("qrRack");
 const qrRouteMode = $("qrRouteMode");
 const qrSourceArea = $("qrSourceArea");
@@ -603,6 +619,29 @@ const qrRuleModalImage = $("qrRuleModalImage");
 const qrRuleModalImageError = $("qrRuleModalImageError");
 const qrRuleModalMeta = $("qrRuleModalMeta");
 const qrRulePrintLabel = $("qrRulePrintLabel");
+const FIFO_CHAIN_STEP_FIELDS = {
+  1: { sourceArea: "source_area_id", sourceCell: "source_cell_id", destinationArea: "destination_area_id", destinationCell: "destination_cell_id" },
+  2: { sourceArea: "second_source_area_id", sourceCell: "second_source_cell_id", destinationArea: "second_destination_area_id", destinationCell: "second_destination_cell_id" },
+  3: { sourceArea: "fifo_chain_step3_source_area_id", sourceCell: "fifo_chain_step3_source_cell_id", destinationArea: "fifo_chain_step3_destination_area_id", destinationCell: "fifo_chain_step3_destination_cell_id" },
+  4: { sourceArea: "fifo_chain_step4_source_area_id", sourceCell: "fifo_chain_step4_source_cell_id", destinationArea: "fifo_chain_step4_destination_area_id", destinationCell: "fifo_chain_step4_destination_cell_id" },
+  5: { sourceArea: "fifo_chain_step5_source_area_id", sourceCell: "fifo_chain_step5_source_cell_id", destinationArea: "fifo_chain_step5_destination_area_id", destinationCell: "fifo_chain_step5_destination_cell_id" },
+};
+const FIFO_CHAIN_DOM_IDS = {
+  scanner: {
+    1: { sourceMode: "scannerFifoChainStep1SourceMode", material: "scannerFifoChainStep1Material", sourceArea: "scannerSourceArea", sourceCell: "scannerSourceCell", destinationArea: "scannerDestinationArea", destinationCell: "scannerDestinationCell" },
+    2: { sourceMode: "scannerFifoChainStep2SourceMode", material: "scannerFifoChainStep2Material", sourceArea: "scannerSecondSourceArea", sourceCell: "scannerSecondSourceCell", destinationArea: "scannerSecondDestinationArea", destinationCell: "scannerSecondDestinationCell" },
+    3: { sourceMode: "scannerFifoChainStep3SourceMode", material: "scannerFifoChainStep3Material", sourceArea: "scannerFifoChainStep3SourceArea", sourceCell: "scannerFifoChainStep3SourceCell", destinationArea: "scannerFifoChainStep3DestinationArea", destinationCell: "scannerFifoChainStep3DestinationCell" },
+    4: { sourceMode: "scannerFifoChainStep4SourceMode", material: "scannerFifoChainStep4Material", sourceArea: "scannerFifoChainStep4SourceArea", sourceCell: "scannerFifoChainStep4SourceCell", destinationArea: "scannerFifoChainStep4DestinationArea", destinationCell: "scannerFifoChainStep4DestinationCell" },
+    5: { sourceMode: "scannerFifoChainStep5SourceMode", material: "scannerFifoChainStep5Material", sourceArea: "scannerFifoChainStep5SourceArea", sourceCell: "scannerFifoChainStep5SourceCell", destinationArea: "scannerFifoChainStep5DestinationArea", destinationCell: "scannerFifoChainStep5DestinationCell" },
+  },
+  qr: {
+    1: { sourceMode: "qrFifoChainStep1SourceMode", material: "qrFifoChainStep1Material", sourceArea: "qrSourceArea", sourceCell: "qrSourceCell", destinationArea: "qrDestinationArea", destinationCell: "qrDestinationCell" },
+    2: { sourceMode: "qrFifoChainStep2SourceMode", material: "qrFifoChainStep2Material", sourceArea: "qrSecondSourceArea", sourceCell: "qrSecondSourceCell", destinationArea: "qrSecondDestinationArea", destinationCell: "qrSecondDestinationCell" },
+    3: { sourceMode: "qrFifoChainStep3SourceMode", material: "qrFifoChainStep3Material", sourceArea: "qrFifoChainStep3SourceArea", sourceCell: "qrFifoChainStep3SourceCell", destinationArea: "qrFifoChainStep3DestinationArea", destinationCell: "qrFifoChainStep3DestinationCell" },
+    4: { sourceMode: "qrFifoChainStep4SourceMode", material: "qrFifoChainStep4Material", sourceArea: "qrFifoChainStep4SourceArea", sourceCell: "qrFifoChainStep4SourceCell", destinationArea: "qrFifoChainStep4DestinationArea", destinationCell: "qrFifoChainStep4DestinationCell" },
+    5: { sourceMode: "qrFifoChainStep5SourceMode", material: "qrFifoChainStep5Material", sourceArea: "qrFifoChainStep5SourceArea", sourceCell: "qrFifoChainStep5SourceCell", destinationArea: "qrFifoChainStep5DestinationArea", destinationCell: "qrFifoChainStep5DestinationCell" },
+  },
+};
 const btnCloseQrRuleModal = $("btnCloseQrRuleModal");
 const btnCloseQrRuleModalX = $("btnCloseQrRuleModalX");
 const btnPrintQrRuleLabel = $("btnPrintQrRuleLabel");
@@ -3724,6 +3763,218 @@ function renderRackList() {
 function buildAreaOptions(selectedValue = "") {
   return `<option value="">Sin area</option>` + (catalog.areas || []).map(a => `<option value="${a.id}" ${String(selectedValue) === String(a.id) ? "selected" : ""}>${escapeHtml(a.code || "")} - ${escapeHtml(a.name || "")}</option>`).join("");
 }
+function buildOperationalAreaCheckboxes(owner, step, kind, selectedIds = []) {
+  const selected = new Set((selectedIds || []).map(id => String(id)));
+  return (catalog.areas || [])
+    .filter(a => Number(a.is_active ?? 1) === 1)
+    .map(a => {
+      const inputId = `${owner}FifoChainStep${step}${kind === "source" ? "Source" : "Destination"}Area_${a.id}`;
+      const checked = selected.has(String(a.id));
+      return `
+        <label class="qr-area-check-row ${checked ? "checked" : ""}" for="${inputId}">
+          <input type="checkbox" id="${inputId}" value="${a.id}" ${checked ? "checked" : ""}>
+          <span>${escapeHtml(a.code || "")} - ${escapeHtml(a.name || "")}</span>
+        </label>`;
+    })
+    .join("");
+}
+function parseFifoChainAreaIds(value) {
+  const raw = Array.isArray(value) ? value : (() => {
+    if (value == null || value === "") return [];
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_) {
+      return [];
+    }
+  })();
+  const seen = new Set();
+  const ids = [];
+  raw.forEach((id) => {
+    const num = Number(id);
+    if (!Number.isFinite(num) || num <= 0 || seen.has(num)) return;
+    seen.add(num);
+    ids.push(num);
+  });
+  return ids;
+}
+function fifoChainAreaSelectId(owner, step, kind) {
+  return `${owner}FifoChainStep${step}${kind === "source" ? "Source" : "Destination"}AreaIds`;
+}
+function fifoChainDestinationModeId(owner, step) {
+  return `${owner}FifoChainStep${step}DestinationMode`;
+}
+function selectedFifoChainAreaIds(owner, step, kind) {
+  const el = $(fifoChainAreaSelectId(owner, step, kind));
+  if (!el) return [];
+  const ids = Array.from(el.querySelectorAll('input[type="checkbox"]:checked'))
+    .map(input => Number(input.value))
+    .filter(id => Number.isFinite(id) && id > 0);
+  el.dataset.selectionOrder = JSON.stringify(ids);
+  renderFifoChainAreaCounter(owner, step, kind);
+  return ids;
+}
+function setFifoChainAreaSelection(owner, step, kind, ids = []) {
+  const el = $(fifoChainAreaSelectId(owner, step, kind));
+  if (!el) return;
+  const normalized = parseFifoChainAreaIds(ids);
+  const selected = new Set(normalized.map(id => String(id)));
+  Array.from(el.querySelectorAll('input[type="checkbox"]')).forEach((input) => {
+    input.checked = selected.has(String(input.value));
+    input.closest(".qr-area-check-row")?.classList.toggle("checked", input.checked);
+  });
+  el.dataset.selectionOrder = JSON.stringify(normalized);
+  renderFifoChainAreaCounter(owner, step, kind);
+}
+function clearFifoChainAreaSelection(owner, step, kind) {
+  setFifoChainAreaSelection(owner, step, kind, []);
+}
+function areaIdsShortLabel(ids) {
+  const names = parseFifoChainAreaIds(ids).map(id => {
+    const area = (catalog.areas || []).find(a => Number(a.id) === Number(id));
+    return area ? (area.code || area.name || `Area ID ${id}`) : `Area ID ${id}`;
+  });
+  return names.length ? names.join(", ") : "-";
+}
+function renderFifoChainAreaCounter(owner, step, kind) {
+  const counter = document.querySelector(`[data-fifo-chain-area-counter="${owner}_step${step}_${kind}"]`);
+  if (!counter) return;
+  const count = selectedFifoChainAreaIdsNoRender(owner, step, kind).length;
+  counter.textContent = `${count} ${count === 1 ? "area seleccionada" : "areas seleccionadas"}`;
+}
+function selectedFifoChainAreaIdsNoRender(owner, step, kind) {
+  const el = $(fifoChainAreaSelectId(owner, step, kind));
+  if (!el) return [];
+  return Array.from(el.querySelectorAll('input[type="checkbox"]:checked'))
+    .map(input => Number(input.value))
+    .filter(id => Number.isFinite(id) && id > 0);
+}
+function renderFifoChainAreaCheckboxGroup(owner, step, kind) {
+  const el = $(fifoChainAreaSelectId(owner, step, kind));
+  if (!el) return;
+  const cur = parseFifoChainAreaIds(el.dataset.selectionOrder || "[]");
+  el.innerHTML = buildOperationalAreaCheckboxes(owner, step, kind, cur);
+  setFifoChainAreaSelection(owner, step, kind, cur);
+}
+function updateFifoChainAreaCheckboxRow(input) {
+  input?.closest(".qr-area-check-row")?.classList.toggle("checked", !!input?.checked);
+}
+function setAllVisibleFifoChainAreas(owner, step, kind, checked) {
+  const el = $(fifoChainAreaSelectId(owner, step, kind));
+  if (!el) return;
+  el.querySelectorAll('input[type="checkbox"]:not(:disabled)').forEach((input) => {
+    input.checked = !!checked;
+    updateFifoChainAreaCheckboxRow(input);
+  });
+  selectedFifoChainAreaIds(owner, step, kind);
+}
+function fifoChainStepTitleElement(owner, step) {
+  const ids = FIFO_CHAIN_DOM_IDS[owner]?.[step] || {};
+  const modeEl = $(ids.sourceMode);
+  let node = modeEl?.parentElement;
+  while (node && !node.previousElementSibling?.classList?.contains("qr-section-title")) {
+    node = node.parentElement;
+  }
+  return node?.previousElementSibling || null;
+}
+function moveFifoChainNode(target, node) {
+  if (!target || !node || target.contains(node)) return;
+  target.appendChild(node);
+}
+function removeEmptyFifoChainRows(scope) {
+  if (!scope) return;
+  scope.querySelectorAll(".row").forEach((row) => {
+    if (row.children.length === 0 || !String(row.textContent || "").trim()) row.remove();
+  });
+  scope.querySelectorAll(".qr-fifo-chain-flex-step").forEach((row) => {
+    if (row.children.length === 0 || !String(row.textContent || "").trim()) row.remove();
+  });
+}
+function organizeFifoChainStepUi(owner, step) {
+  const ids = FIFO_CHAIN_DOM_IDS[owner]?.[step] || {};
+  const title = fifoChainStepTitleElement(owner, step);
+  if (!title || title.nextElementSibling?.dataset?.fifoChainLayout === `${owner}_step${step}`) return;
+  const layout = document.createElement("div");
+  layout.className = "qr-fifo-chain-step-layout";
+  layout.dataset.fifoChainLayout = `${owner}_step${step}`;
+  layout.innerHTML = `
+    <div class="qr-fifo-chain-panel" data-fifo-chain-origin-panel="${owner}_step${step}">
+      <div class="qr-fifo-chain-panel-title">ORIGEN</div>
+    </div>
+    <div class="qr-fifo-chain-panel" data-fifo-chain-destination-panel="${owner}_step${step}">
+      <div class="qr-fifo-chain-panel-title">DESTINO</div>
+    </div>
+  `;
+  title.insertAdjacentElement("afterend", layout);
+  const originPanel = layout.querySelector(`[data-fifo-chain-origin-panel="${owner}_step${step}"]`);
+  const destinationPanel = layout.querySelector(`[data-fifo-chain-destination-panel="${owner}_step${step}"]`);
+  moveFifoChainNode(originPanel, $(ids.sourceMode)?.parentElement);
+  moveFifoChainNode(originPanel, $(ids.material)?.parentElement);
+  moveFifoChainNode(originPanel, document.querySelector(`[data-fifo-chain-source${step}="${owner}"]`));
+  moveFifoChainNode(originPanel, $(ids.sourceCell)?.parentElement);
+  moveFifoChainNode(originPanel, document.querySelector(`[data-fifo-chain-global-note="${owner}_step${step}"]`));
+  moveFifoChainNode(originPanel, document.querySelector(`[data-fifo-chain-source-selected="${owner}_step${step}"]`));
+  moveFifoChainNode(destinationPanel, document.querySelector(`[data-fifo-chain-destination-mode="${owner}_step${step}"]`));
+  moveFifoChainNode(destinationPanel, $(ids.destinationArea)?.parentElement);
+  moveFifoChainNode(destinationPanel, $(ids.destinationCell)?.parentElement);
+  moveFifoChainNode(destinationPanel, document.querySelector(`[data-fifo-chain-destination-selected="${owner}_step${step}"]`));
+  const scope = layout.parentElement;
+  removeEmptyFifoChainRows(scope);
+}
+function organizeFifoChainUi() {
+  ["scanner", "qr"].forEach((owner) => {
+    for (let step = 1; step <= 5; step += 1) organizeFifoChainStepUi(owner, step);
+  });
+}
+function ensureFifoChainFlexibleUi() {
+  ["scanner", "qr"].forEach((owner) => {
+    for (let step = 1; step <= 5; step += 1) {
+      const ids = FIFO_CHAIN_DOM_IDS[owner]?.[step];
+      const sourceMode = $(ids?.sourceMode);
+      if (sourceMode && !sourceMode.querySelector('option[value="selected_areas_by_material"]')) {
+        sourceMode.insertAdjacentHTML("beforeend", `<option value="selected_areas_by_material">&Aacute;reas seleccionadas por material</option>`);
+      }
+      const note = document.querySelector(`[data-fifo-chain-global-note="${owner}_step${step}"]`);
+      if (note && !$(fifoChainAreaSelectId(owner, step, "source"))) {
+        note.insertAdjacentHTML("afterend", `
+          <div class="qr-fifo-chain-flex-step hidden" data-fifo-chain-flex-step="${owner}_step${step}">
+            <div class="qr-fifo-chain-subpanel hidden" data-fifo-chain-source-selected="${owner}_step${step}">
+              <label>&Aacute;reas origen permitidas ${step}</label>
+              <div class="qr-area-check-list" id="${fifoChainAreaSelectId(owner, step, "source")}" data-selection-order="[]"></div>
+              <div class="qr-area-check-actions">
+                <button class="btn ghost small-btn" type="button" data-fifo-chain-area-action="all" data-owner="${owner}" data-step="${step}" data-kind="source">Seleccionar todas</button>
+                <button class="btn ghost small-btn" type="button" data-fifo-chain-area-action="clear" data-owner="${owner}" data-step="${step}" data-kind="source">Limpiar</button>
+                <span class="small" data-fifo-chain-area-counter="${owner}_step${step}_source">0 areas seleccionadas</span>
+              </div>
+              <div class="small">Solo se buscar&aacute;n racks dentro de las &aacute;reas marcadas.</div>
+            </div>
+            <div class="qr-fifo-chain-subpanel" data-fifo-chain-destination-mode="${owner}_step${step}">
+              <label>Destino tramo ${step}</label>
+              <select disabled id="${fifoChainDestinationModeId(owner, step)}">
+                <option value="configured_area">&Aacute;rea destino configurada</option>
+                <option value="any_area_with_space">Cualquier &aacute;rea con espacio</option>
+                <option value="selected_areas_with_space">&Aacute;reas seleccionadas con espacio</option>
+              </select>
+              <div class="small" data-fifo-chain-destination-note="${owner}_step${step}"></div>
+            </div>
+            <div class="qr-fifo-chain-subpanel hidden" data-fifo-chain-destination-selected="${owner}_step${step}">
+              <label>&Aacute;reas destino permitidas ${step}</label>
+              <div class="qr-area-check-list" id="${fifoChainAreaSelectId(owner, step, "destination")}" data-selection-order="[]"></div>
+              <div class="qr-area-check-actions">
+                <button class="btn ghost small-btn" type="button" data-fifo-chain-area-action="all" data-owner="${owner}" data-step="${step}" data-kind="destination">Seleccionar todas</button>
+                <button class="btn ghost small-btn" type="button" data-fifo-chain-area-action="clear" data-owner="${owner}" data-step="${step}" data-kind="destination">Limpiar</button>
+                <span class="small" data-fifo-chain-area-counter="${owner}_step${step}_destination">0 areas seleccionadas</span>
+              </div>
+              <div class="small">Solo se buscar&aacute; espacio libre dentro de las &aacute;reas marcadas.</div>
+            </div>
+          </div>
+        `);
+      }
+    }
+  });
+}
+ensureFifoChainFlexibleUi();
+organizeFifoChainUi();
 function scannerCancelReturnAreaLabel(area) {
   if (!area) return "";
   const parts = [
@@ -3874,6 +4125,8 @@ function renderQrCellSummaries() {
   renderQrCellSummary(scannerFifoChainStep3DestinationCell, scannerFifoChainStep3DestinationCellSummary);
   renderQrCellSummary(scannerFifoChainStep4SourceCell, scannerFifoChainStep4SourceCellSummary);
   renderQrCellSummary(scannerFifoChainStep4DestinationCell, scannerFifoChainStep4DestinationCellSummary);
+  renderQrCellSummary(scannerFifoChainStep5SourceCell, scannerFifoChainStep5SourceCellSummary);
+  renderQrCellSummary(scannerFifoChainStep5DestinationCell, scannerFifoChainStep5DestinationCellSummary);
   renderQrCellSummary(qrSourceCell, qrSourceCellSummary);
   renderQrCellSummary(qrDestinationCell, qrDestinationCellSummary);
   renderQrCellSummary(qrSecondSourceCell, qrSecondSourceCellSummary);
@@ -3882,6 +4135,8 @@ function renderQrCellSummaries() {
   renderQrCellSummary(qrFifoChainStep3DestinationCell, qrFifoChainStep3DestinationCellSummary);
   renderQrCellSummary(qrFifoChainStep4SourceCell, qrFifoChainStep4SourceCellSummary);
   renderQrCellSummary(qrFifoChainStep4DestinationCell, qrFifoChainStep4DestinationCellSummary);
+  renderQrCellSummary(qrFifoChainStep5SourceCell, qrFifoChainStep5SourceCellSummary);
+  renderQrCellSummary(qrFifoChainStep5DestinationCell, qrFifoChainStep5DestinationCellSummary);
 }
 function normalizeRouteMode(value) {
   if (value === "fifo_chain" || value === "trmx_doble") return "fifo_chain";
@@ -3895,7 +4150,7 @@ function routeModeLabel(value) {
 function fifoChainFlowLabel(item) {
   if (normalizeRouteMode(item?.route_mode) !== "fifo_chain") return routeModeLabel(item?.route_mode);
   const total = normalizeFifoChainTotalSteps(item?.fifo_chain_total_steps);
-  return total === 4 ? "Flujo FIFO de 4 tramos" : (total === 3 ? "Flujo triple FIFO" : "Flujo doble FIFO");
+  return total >= 4 ? `Flujo FIFO de ${total} tramos` : (total === 3 ? "Flujo triple FIFO" : "Flujo doble FIFO");
 }
 function normalizeFifoMaterialPolicy(value) {
   return value === "any_available_from_source" ? "any_available_from_source" : "specific_material";
@@ -3904,17 +4159,29 @@ function fifoMaterialPolicyLabel(value) {
   return normalizeFifoMaterialPolicy(value) === "any_available_from_source" ? "Cualquier rack disponible" : "Material especifico";
 }
 function normalizeFifoChainSourceMode(value) {
-  return value === "any_area_by_material" ? "any_area_by_material" : "configured_area";
+  return value === "any_area_by_material" || value === "selected_areas_by_material" ? value : "configured_area";
+}
+function normalizeFifoChainDestinationMode(value) {
+  return value === "any_area_with_space" || value === "selected_areas_with_space" ? value : "configured_area";
 }
 function normalizeFifoChainStep2SourceMode(value) {
   return normalizeFifoChainSourceMode(value);
 }
 function normalizeFifoChainTotalSteps(value) {
   const total = Number(value || 2);
-  return [2, 3, 4].includes(total) ? total : 2;
+  return [2, 3, 4, 5].includes(total) ? total : 2;
 }
 function fifoChainSourceModeLabel(value) {
-  return normalizeFifoChainSourceMode(value) === "any_area_by_material" ? "Cualquier area por material" : "Area origen configurada";
+  const mode = normalizeFifoChainSourceMode(value);
+  if (mode === "any_area_by_material") return "Cualquier area por material";
+  if (mode === "selected_areas_by_material") return "Areas seleccionadas por material";
+  return "Area origen configurada";
+}
+function fifoChainDestinationModeLabel(value) {
+  const mode = normalizeFifoChainDestinationMode(value);
+  if (mode === "any_area_with_space") return "Cualquier area con espacio";
+  if (mode === "selected_areas_with_space") return "Areas seleccionadas con espacio";
+  return "Area destino configurada";
 }
 function fifoChainStep2SourceModeLabel(value) {
   return fifoChainSourceModeLabel(value);
@@ -3942,6 +4209,11 @@ function fifoChainStep4MaterialDisplay(item) {
   if (item?.fifo_chain_step4_material_group_id) return `Material ID ${item.fifo_chain_step4_material_group_id}`;
   return "-";
 }
+function fifoChainStep5MaterialDisplay(item) {
+  if (item?.fifo_chain_step5_material_group_name) return item.fifo_chain_step5_material_group_name;
+  if (item?.fifo_chain_step5_material_group_id) return `Material ID ${item.fifo_chain_step5_material_group_id}`;
+  return "-";
+}
 function syncFifoMaterialPolicyHelp() {
   const anyQr = normalizeFifoMaterialPolicy(qrFifoMaterialPolicy?.value) === "any_available_from_source" && (qrActionType?.value || "") === "fifo_request";
   if (qrFifoMaterialPolicyHelp) qrFifoMaterialPolicyHelp.classList.toggle("hidden", !anyQr);
@@ -3952,40 +4224,89 @@ function setFifoChainEndpointDisabled(ids, disabled) {
     if (el) el.disabled = !!disabled || !adminToken;
   });
 }
-function syncFifoChainUi(owner, routeMode, totalSteps, step1SourceMode, step2SourceMode, step3SourceMode, step4SourceMode) {
+function setFifoChainAreaGroupDisabled(owner, step, kind, disabled) {
+  const container = $(fifoChainAreaSelectId(owner, step, kind));
+  if (!container) return;
+  container.classList.toggle("disabled", !!disabled || !adminToken);
+  container.querySelectorAll('input[type="checkbox"]').forEach(input => { input.disabled = !!disabled || !adminToken; });
+  document.querySelectorAll(`[data-fifo-chain-area-action][data-owner="${owner}"][data-step="${step}"][data-kind="${kind}"]`).forEach(btn => {
+    btn.disabled = !!disabled || !adminToken;
+  });
+}
+function syncFifoChainUi(owner, routeMode, totalSteps, step1SourceMode, step2SourceMode, step3SourceMode, step4SourceMode, step5SourceMode) {
   const isFifoChain = normalizeRouteMode(routeMode) === "fifo_chain";
   const normalizedTotal = normalizeFifoChainTotalSteps(totalSteps);
   const hasStep3 = isFifoChain && normalizedTotal >= 3;
   const hasStep4 = isFifoChain && normalizedTotal >= 4;
-  const isGlobalStep1 = isFifoChain && normalizeFifoChainSourceMode(step1SourceMode) === "any_area_by_material";
-  const isGlobalStep2 = isFifoChain && normalizeFifoChainSourceMode(step2SourceMode) === "any_area_by_material";
-  const isGlobalStep3 = hasStep3 && normalizeFifoChainSourceMode(step3SourceMode) === "any_area_by_material";
-  const isGlobalStep4 = hasStep4 && normalizeFifoChainSourceMode(step4SourceMode) === "any_area_by_material";
-  document.querySelectorAll(`[data-fifo-chain-source1="${owner}"]`).forEach(el => el.classList.toggle("hidden", isGlobalStep1));
-  document.querySelectorAll(`[data-fifo-chain-source2="${owner}"]`).forEach(el => el.classList.toggle("hidden", isGlobalStep2));
-  document.querySelectorAll(`[data-fifo-chain-source3="${owner}"]`).forEach(el => el.classList.toggle("hidden", isGlobalStep3));
-  document.querySelectorAll(`[data-fifo-chain-source4="${owner}"]`).forEach(el => el.classList.toggle("hidden", isGlobalStep4));
+  const hasStep5 = isFifoChain && normalizedTotal >= 5;
+  const sourceModes = { 1: step1SourceMode, 2: step2SourceMode, 3: step3SourceMode, 4: step4SourceMode, 5: step5SourceMode };
   document.querySelectorAll(`[data-fifo-chain-step3="${owner}"]`).forEach(el => el.classList.toggle("hidden", !hasStep3));
   document.querySelectorAll(`[data-fifo-chain-step4="${owner}"]`).forEach(el => el.classList.toggle("hidden", !hasStep4));
-  document.querySelectorAll(`[data-fifo-chain-global-note="${owner}_step1"]`).forEach(el => el.classList.toggle("hidden", !isGlobalStep1));
-  document.querySelectorAll(`[data-fifo-chain-global-note="${owner}_step2"]`).forEach(el => el.classList.toggle("hidden", !isGlobalStep2));
-  document.querySelectorAll(`[data-fifo-chain-global-note="${owner}_step3"]`).forEach(el => el.classList.toggle("hidden", !isGlobalStep3));
-  document.querySelectorAll(`[data-fifo-chain-global-note="${owner}_step4"]`).forEach(el => el.classList.toggle("hidden", !isGlobalStep4));
-  if (owner === "scanner") {
-    setFifoChainEndpointDisabled(["scannerSourceArea", "scannerSourceCell"], isGlobalStep1);
-    setFifoChainEndpointDisabled(["scannerSecondSourceArea", "scannerSecondSourceCell"], isGlobalStep2);
-    setFifoChainEndpointDisabled(["scannerFifoChainStep3SourceArea", "scannerFifoChainStep3SourceCell"], isGlobalStep3 || !hasStep3);
-    setFifoChainEndpointDisabled(["scannerFifoChainStep3DestinationArea", "scannerFifoChainStep3DestinationCell"], !hasStep3);
-    setFifoChainEndpointDisabled(["scannerFifoChainStep4SourceArea", "scannerFifoChainStep4SourceCell"], isGlobalStep4 || !hasStep4);
-    setFifoChainEndpointDisabled(["scannerFifoChainStep4DestinationArea", "scannerFifoChainStep4DestinationCell"], !hasStep4);
-  } else if (owner === "qr") {
-    setFifoChainEndpointDisabled(["qrSourceArea", "qrSourceCell"], isGlobalStep1);
-    setFifoChainEndpointDisabled(["qrSecondSourceArea", "qrSecondSourceCell"], isGlobalStep2);
-    setFifoChainEndpointDisabled(["qrFifoChainStep3SourceArea", "qrFifoChainStep3SourceCell"], isGlobalStep3 || !hasStep3);
-    setFifoChainEndpointDisabled(["qrFifoChainStep3DestinationArea", "qrFifoChainStep3DestinationCell"], !hasStep3);
-    setFifoChainEndpointDisabled(["qrFifoChainStep4SourceArea", "qrFifoChainStep4SourceCell"], isGlobalStep4 || !hasStep4);
-    setFifoChainEndpointDisabled(["qrFifoChainStep4DestinationArea", "qrFifoChainStep4DestinationCell"], !hasStep4);
+  document.querySelectorAll(`[data-fifo-chain-step5="${owner}"]`).forEach(el => el.classList.toggle("hidden", !hasStep5));
+  for (let step = 1; step <= 5; step += 1) {
+    const hasStep = isFifoChain && (step <= 2 || step <= normalizedTotal);
+    const ids = FIFO_CHAIN_DOM_IDS[owner]?.[step] || {};
+    if (!isFifoChain) {
+      document.querySelectorAll(`[data-fifo-chain-flex-step="${owner}_step${step}"]`).forEach(el => el.classList.add("hidden"));
+      document.querySelectorAll(`[data-fifo-chain-source-selected="${owner}_step${step}"]`).forEach(el => el.classList.add("hidden"));
+      document.querySelectorAll(`[data-fifo-chain-destination-selected="${owner}_step${step}"]`).forEach(el => el.classList.add("hidden"));
+      document.querySelectorAll(`[data-fifo-chain-global-note="${owner}_step${step}"]`).forEach(el => el.classList.add("hidden"));
+      continue;
+    }
+    const sourceMode = normalizeFifoChainSourceMode(sourceModes[step]);
+    const destinationModeEl = $(fifoChainDestinationModeId(owner, step));
+    const destinationMode = normalizeFifoChainDestinationMode(destinationModeEl?.value);
+    const usesAnySource = hasStep && sourceMode === "any_area_by_material";
+    const usesSelectedSource = hasStep && sourceMode === "selected_areas_by_material";
+    const usesFlexibleSource = usesAnySource || usesSelectedSource;
+    const usesConfiguredDestination = hasStep && destinationMode === "configured_area";
+    const usesSelectedDestination = hasStep && destinationMode === "selected_areas_with_space";
+    document.querySelectorAll(`[data-fifo-chain-flex-step="${owner}_step${step}"]`).forEach(el => el.classList.toggle("hidden", !hasStep));
+    document.querySelectorAll(`[data-fifo-chain-source${step}="${owner}"]`).forEach(el => el.classList.toggle("hidden", usesFlexibleSource));
+    document.querySelectorAll(`[data-fifo-chain-global-note="${owner}_step${step}"]`).forEach(el => {
+      el.classList.toggle("hidden", !usesAnySource);
+      if (usesAnySource) el.innerHTML = step === 1
+        ? "El tramo 1 buscar&aacute; un rack disponible con este material en cualquier &aacute;rea operativa. Configura el destino; el origen real se decidir&aacute; al escanear."
+        : `El paso ${step} buscar&aacute; un rack disponible con este material en cualquier &aacute;rea operativa. El origen real se decidir&aacute; al finalizar el paso ${step - 1}.`;
+    });
+    document.querySelectorAll(`[data-fifo-chain-source-selected="${owner}_step${step}"]`).forEach(el => el.classList.toggle("hidden", !usesSelectedSource));
+    document.querySelectorAll(`[data-fifo-chain-destination-selected="${owner}_step${step}"]`).forEach(el => el.classList.toggle("hidden", !usesSelectedDestination));
+    const fixedDestinationNodes = [$(ids.destinationArea)?.parentElement, $(ids.destinationCell)?.parentElement].filter(Boolean);
+    fixedDestinationNodes.forEach(el => el.classList.toggle("hidden", hasStep && !usesConfiguredDestination));
+    setFifoChainEndpointDisabled([ids.sourceArea, ids.sourceCell].filter(Boolean), usesFlexibleSource || !hasStep);
+    setFifoChainEndpointDisabled([ids.destinationArea, ids.destinationCell].filter(Boolean), !usesConfiguredDestination);
+    [fifoChainDestinationModeId(owner, step)].forEach(id => {
+      const el = $(id);
+      if (el) el.disabled = !hasStep || !adminToken;
+    });
+    setFifoChainAreaGroupDisabled(owner, step, "source", !usesSelectedSource);
+    setFifoChainAreaGroupDisabled(owner, step, "destination", !usesSelectedDestination);
+    const destinationNote = document.querySelector(`[data-fifo-chain-destination-note="${owner}_step${step}"]`);
+    if (destinationNote) {
+      destinationNote.textContent = destinationMode === "any_area_with_space"
+        ? "El sistema seleccionara una celda libre en cualquier area operativa."
+        : destinationMode === "selected_areas_with_space"
+          ? "El sistema seleccionara una celda libre dentro de las areas seleccionadas."
+          : "Usa el area destino y la celda destino opcional configuradas.";
+    }
+    if (usesFlexibleSource) {
+      const area = $(ids.sourceArea);
+      const cell = $(ids.sourceCell);
+      if (area) area.value = "";
+      if (cell) cell.value = "";
+    } else if (sourceMode === "configured_area") {
+      clearFifoChainAreaSelection(owner, step, "source");
+    }
+    if (!usesConfiguredDestination) {
+      const area = $(ids.destinationArea);
+      const cell = $(ids.destinationCell);
+      if (area) area.value = "";
+      if (cell) cell.value = "";
+    } else {
+      clearFifoChainAreaSelection(owner, step, "destination");
+    }
   }
+  renderQrCellSummaries();
 }
 function syncRouteModeSections() {
   const scannerMode = normalizeRouteMode(scannerRouteMode?.value);
@@ -4001,12 +4322,106 @@ function syncRouteModeSections() {
   if (qrMaterial) qrMaterial.disabled = qrMode === "fifo_chain" || !adminToken;
   if (qrRack) qrRack.disabled = qrMode === "fifo_chain" || !adminToken;
   if (qrFifoMaterialPolicy) qrFifoMaterialPolicy.disabled = qrMode === "fifo_chain" || !adminToken;
-  syncFifoChainUi("scanner", scannerMode, scannerFifoChainTotalSteps?.value, scannerFifoChainStep1SourceMode?.value, scannerFifoChainStep2SourceMode?.value, scannerFifoChainStep3SourceMode?.value, scannerFifoChainStep4SourceMode?.value);
-  syncFifoChainUi("qr", qrMode, qrFifoChainTotalSteps?.value, qrFifoChainStep1SourceMode?.value, qrFifoChainStep2SourceMode?.value, qrFifoChainStep3SourceMode?.value, qrFifoChainStep4SourceMode?.value);
+  syncFifoChainUi("scanner", scannerMode, scannerFifoChainTotalSteps?.value, scannerFifoChainStep1SourceMode?.value, scannerFifoChainStep2SourceMode?.value, scannerFifoChainStep3SourceMode?.value, scannerFifoChainStep4SourceMode?.value, scannerFifoChainStep5SourceMode?.value);
+  syncFifoChainUi("qr", qrMode, qrFifoChainTotalSteps?.value, qrFifoChainStep1SourceMode?.value, qrFifoChainStep2SourceMode?.value, qrFifoChainStep3SourceMode?.value, qrFifoChainStep4SourceMode?.value, qrFifoChainStep5SourceMode?.value);
+}
+function addFifoChainFlexiblePayload(owner, payload) {
+  for (let step = 1; step <= 5; step += 1) {
+    const fields = FIFO_CHAIN_STEP_FIELDS[step];
+    const ids = FIFO_CHAIN_DOM_IDS[owner]?.[step] || {};
+    const sourceMode = normalizeFifoChainSourceMode($(ids.sourceMode)?.value);
+    const destinationMode = normalizeFifoChainDestinationMode($(fifoChainDestinationModeId(owner, step))?.value);
+    payload[`fifo_chain_step${step}_source_mode`] = sourceMode;
+    payload[`fifo_chain_step${step}_source_area_ids_json`] = sourceMode === "selected_areas_by_material" ? selectedFifoChainAreaIds(owner, step, "source") : null;
+    payload[`fifo_chain_step${step}_destination_mode`] = destinationMode;
+    payload[`fifo_chain_step${step}_destination_area_ids_json`] = destinationMode === "selected_areas_with_space" ? selectedFifoChainAreaIds(owner, step, "destination") : null;
+    if (sourceMode !== "configured_area") {
+      payload[fields.sourceArea] = null;
+      payload[fields.sourceCell] = null;
+    }
+    if (destinationMode !== "configured_area") {
+      payload[fields.destinationArea] = null;
+      payload[fields.destinationCell] = null;
+    }
+  }
+}
+function resetFifoChainFlexibleControls(owner) {
+  for (let step = 1; step <= 5; step += 1) {
+    const destinationMode = $(fifoChainDestinationModeId(owner, step));
+    if (destinationMode) destinationMode.value = "configured_area";
+    clearFifoChainAreaSelection(owner, step, "source");
+    clearFifoChainAreaSelection(owner, step, "destination");
+  }
+}
+function loadFifoChainFlexibleControls(owner, item = {}) {
+  for (let step = 1; step <= 5; step += 1) {
+    const destinationMode = $(fifoChainDestinationModeId(owner, step));
+    if (destinationMode) destinationMode.value = normalizeFifoChainDestinationMode(item[`fifo_chain_step${step}_destination_mode`]);
+    setFifoChainAreaSelection(owner, step, "source", parseFifoChainAreaIds(item[`fifo_chain_step${step}_source_area_ids_json`]));
+    setFifoChainAreaSelection(owner, step, "destination", parseFifoChainAreaIds(item[`fifo_chain_step${step}_destination_area_ids_json`]));
+  }
+}
+function clearInactiveFifoChainStep(payload, step) {
+  const fields = FIFO_CHAIN_STEP_FIELDS[step];
+  payload[`fifo_chain_step${step}_source_mode`] = "configured_area";
+  payload[`fifo_chain_step${step}_material_group_id`] = null;
+  payload[`fifo_chain_step${step}_source_area_ids_json`] = null;
+  payload[`fifo_chain_step${step}_destination_mode`] = "configured_area";
+  payload[`fifo_chain_step${step}_destination_area_ids_json`] = null;
+  payload[fields.sourceArea] = null;
+  payload[fields.sourceCell] = null;
+  payload[fields.destinationArea] = null;
+  payload[fields.destinationCell] = null;
+}
+function validateFifoChainStep(prefix, payload, step, required) {
+  const fields = FIFO_CHAIN_STEP_FIELDS[step];
+  const sourceMode = normalizeFifoChainSourceMode(payload[`fifo_chain_step${step}_source_mode`]);
+  const destinationMode = normalizeFifoChainDestinationMode(payload[`fifo_chain_step${step}_destination_mode`]);
+  payload[`fifo_chain_step${step}_source_mode`] = sourceMode;
+  payload[`fifo_chain_step${step}_destination_mode`] = destinationMode;
+  if (!required) {
+    clearInactiveFifoChainStep(payload, step);
+    return;
+  }
+  const materialField = `fifo_chain_step${step}_material_group_id`;
+  const sourceListField = `fifo_chain_step${step}_source_area_ids_json`;
+  const destinationListField = `fifo_chain_step${step}_destination_area_ids_json`;
+  if (step === 1 && !payload[materialField]) throw new Error(`El tramo ${step} requiere Material requerido tramo ${step}.`);
+  if (sourceMode === "configured_area") {
+    payload[sourceListField] = null;
+    if (!payload[fields.sourceArea] && !payload[fields.sourceCell]) throw new Error(`${prefix}: Flujo FIFO requiere origen para tramo ${step}.`);
+  } else {
+    if (!payload[materialField]) throw new Error(sourceMode === "selected_areas_by_material" ? "Seleccione material para buscar por areas seleccionadas." : `El tramo ${step} por material requiere Material requerido tramo ${step}.`);
+    payload[fields.sourceArea] = null;
+    payload[fields.sourceCell] = null;
+    if (sourceMode === "selected_areas_by_material" && !parseFifoChainAreaIds(payload[sourceListField]).length) {
+      throw new Error("Seleccione al menos un area origen.");
+    }
+    if (sourceMode === "any_area_by_material") payload[sourceListField] = null;
+  }
+  if (destinationMode === "configured_area") {
+    payload[destinationListField] = null;
+    if (!payload[fields.destinationArea] && !payload[fields.destinationCell]) throw new Error(`${prefix}: Flujo FIFO requiere destino para tramo ${step}.`);
+  } else {
+    payload[fields.destinationArea] = null;
+    payload[fields.destinationCell] = null;
+    if (destinationMode === "selected_areas_with_space" && !parseFifoChainAreaIds(payload[destinationListField]).length) {
+      throw new Error("Seleccione al menos un area destino.");
+    }
+    if (destinationMode === "any_area_with_space") payload[destinationListField] = null;
+  }
 }
 function validateRouteConfig(prefix, payload) {
   const mode = normalizeRouteMode(payload.route_mode);
   payload.route_mode = mode;
+  if (mode !== "fifo_chain") {
+    payload.fifo_chain_step5_source_mode = "configured_area";
+    payload.fifo_chain_step5_material_group_id = null;
+    payload.fifo_chain_step5_source_area_id = null;
+    payload.fifo_chain_step5_source_cell_id = null;
+    payload.fifo_chain_step5_destination_area_id = null;
+    payload.fifo_chain_step5_destination_cell_id = null;
+  }
   if (!["double_area", "fifo_chain"].includes(mode)) return;
   const hasSource1 = !!payload.source_area_id || !!payload.source_cell_id;
   const hasDestination1 = !!payload.destination_area_id || !!payload.destination_cell_id;
@@ -4014,103 +4429,13 @@ function validateRouteConfig(prefix, payload) {
   const hasDestination2 = !!payload.second_destination_area_id || !!payload.second_destination_cell_id;
   if (mode === "fifo_chain") {
     const totalSteps = normalizeFifoChainTotalSteps(payload.fifo_chain_total_steps);
-    const step1SourceMode = normalizeFifoChainSourceMode(payload.fifo_chain_step1_source_mode);
-    const step2SourceMode = normalizeFifoChainSourceMode(payload.fifo_chain_step2_source_mode);
-    const step3SourceMode = normalizeFifoChainSourceMode(payload.fifo_chain_step3_source_mode);
-    const step4SourceMode = normalizeFifoChainSourceMode(payload.fifo_chain_step4_source_mode);
-    const hasSource3 = !!payload.fifo_chain_step3_source_area_id || !!payload.fifo_chain_step3_source_cell_id;
-    const hasDestination3 = !!payload.fifo_chain_step3_destination_area_id || !!payload.fifo_chain_step3_destination_cell_id;
-    const hasSource4 = !!payload.fifo_chain_step4_source_area_id || !!payload.fifo_chain_step4_source_cell_id;
-    const hasDestination4 = !!payload.fifo_chain_step4_destination_area_id || !!payload.fifo_chain_step4_destination_cell_id;
     payload.fifo_chain_total_steps = totalSteps;
-    payload.fifo_chain_step1_source_mode = step1SourceMode;
-    payload.fifo_chain_step2_source_mode = step2SourceMode;
-    payload.fifo_chain_step3_source_mode = step3SourceMode;
-    payload.fifo_chain_step4_source_mode = step4SourceMode;
     payload.material_group_id = null;
     payload.rack_id = null;
     payload.default_material_group_id = null;
     payload.fifo_material_policy = "specific_material";
-    if (!payload.fifo_chain_step1_material_group_id) {
-      throw new Error("El tramo 1 requiere Material requerido tramo 1.");
-    }
-    if (!hasDestination1) {
-      throw new Error(step1SourceMode === "any_area_by_material" ? "El tramo 1 por material requiere destino 1." : `${prefix}: Flujo doble FIFO requiere destino para tramo 1.`);
-    }
-    if (step1SourceMode === "any_area_by_material") {
-      if (!payload.fifo_chain_step1_material_group_id) {
-        throw new Error("El tramo 1 por material requiere Material requerido tramo 1.");
-      }
-      payload.source_area_id = null;
-      payload.source_cell_id = null;
-    } else if (!hasSource1) {
-      throw new Error(`${prefix}: Flujo doble FIFO requiere origen para tramo 1.`);
-    }
-    if (!hasDestination2) {
-      throw new Error(step2SourceMode === "any_area_by_material" ? "El tramo 2 por material requiere destino 2." : `${prefix}: Flujo doble FIFO requiere destino para tramo 2.`);
-    }
-    if (step2SourceMode === "any_area_by_material") {
-      if (!payload.fifo_chain_step2_material_group_id) {
-        throw new Error("El tramo 2 por material requiere Material requerido tramo 2.");
-      }
-      payload.second_source_area_id = null;
-      payload.second_source_cell_id = null;
-    } else {
-      if (!hasSource2) {
-        throw new Error(`${prefix}: Flujo doble FIFO requiere origen para tramo 2.`);
-      }
-    }
-    if (totalSteps === 2) {
-      payload.fifo_chain_step3_source_mode = "configured_area";
-      payload.fifo_chain_step3_material_group_id = null;
-      payload.fifo_chain_step3_source_area_id = null;
-      payload.fifo_chain_step3_source_cell_id = null;
-      payload.fifo_chain_step3_destination_area_id = null;
-      payload.fifo_chain_step3_destination_cell_id = null;
-      payload.fifo_chain_step4_source_mode = "configured_area";
-      payload.fifo_chain_step4_material_group_id = null;
-      payload.fifo_chain_step4_source_area_id = null;
-      payload.fifo_chain_step4_source_cell_id = null;
-      payload.fifo_chain_step4_destination_area_id = null;
-      payload.fifo_chain_step4_destination_cell_id = null;
-      return;
-    }
-    if (step3SourceMode === "any_area_by_material") {
-      if (!payload.fifo_chain_step3_material_group_id) {
-        throw new Error("El tramo 3 por material requiere Material requerido tramo 3.");
-      }
-      if (!hasDestination3) {
-        throw new Error("El tramo 3 por material requiere destino 3.");
-      }
-      payload.fifo_chain_step3_source_area_id = null;
-      payload.fifo_chain_step3_source_cell_id = null;
-    } else {
-      if (!hasSource3 || !hasDestination3) {
-        throw new Error("El tramo 3 requiere origen y destino.");
-      }
-    }
-    if (totalSteps < 4) {
-      payload.fifo_chain_step4_source_mode = "configured_area";
-      payload.fifo_chain_step4_material_group_id = null;
-      payload.fifo_chain_step4_source_area_id = null;
-      payload.fifo_chain_step4_source_cell_id = null;
-      payload.fifo_chain_step4_destination_area_id = null;
-      payload.fifo_chain_step4_destination_cell_id = null;
-      return;
-    }
-    if (step4SourceMode === "any_area_by_material") {
-      if (!payload.fifo_chain_step4_material_group_id) {
-        throw new Error("El tramo 4 por material requiere Material requerido tramo 4.");
-      }
-      if (!hasDestination4) {
-        throw new Error("El tramo 4 por material requiere destino 4.");
-      }
-      payload.fifo_chain_step4_source_area_id = null;
-      payload.fifo_chain_step4_source_cell_id = null;
-      return;
-    }
-    if (!hasSource4 || !hasDestination4) {
-      throw new Error("Tramo 4 requiere origen y destino.");
+    for (let step = 1; step <= 5; step += 1) {
+      validateFifoChainStep(prefix, payload, step, step <= totalSteps);
     }
     return;
   }
@@ -4122,17 +4447,26 @@ function validateRouteConfig(prefix, payload) {
   }
 }
 function renderQrCatalogOptions() {
-  [scannerSourceArea, scannerDestinationArea, scannerSecondSourceArea, scannerSecondDestinationArea, scannerFifoChainStep3SourceArea, scannerFifoChainStep3DestinationArea, scannerFifoChainStep4SourceArea, scannerFifoChainStep4DestinationArea, scannerStorageArea, scannerEmptyRackArea, qrSourceArea, qrDestinationArea, qrSecondSourceArea, qrSecondDestinationArea, qrFifoChainStep3SourceArea, qrFifoChainStep3DestinationArea, qrFifoChainStep4SourceArea, qrFifoChainStep4DestinationArea, qrTransitionSourceArea, qrTransitionDestinationArea].forEach((el) => {
+  [scannerSourceArea, scannerDestinationArea, scannerSecondSourceArea, scannerSecondDestinationArea, scannerFifoChainStep3SourceArea, scannerFifoChainStep3DestinationArea, scannerFifoChainStep4SourceArea, scannerFifoChainStep4DestinationArea, scannerFifoChainStep5SourceArea, scannerFifoChainStep5DestinationArea, scannerStorageArea, scannerEmptyRackArea, qrSourceArea, qrDestinationArea, qrSecondSourceArea, qrSecondDestinationArea, qrFifoChainStep3SourceArea, qrFifoChainStep3DestinationArea, qrFifoChainStep4SourceArea, qrFifoChainStep4DestinationArea, qrFifoChainStep5SourceArea, qrFifoChainStep5DestinationArea, qrTransitionSourceArea, qrTransitionDestinationArea].forEach((el) => {
     if (!el) return;
     const cur = el.value;
     el.innerHTML = buildAreaOptions(cur);
+  });
+  document.querySelectorAll("[id$='AreaIds']").forEach((el) => {
+    if (!el || !/^((scanner)|(qr))FifoChainStep[1-5](Source|Destination)AreaIds$/.test(el.id)) return;
+    const owner = el.id.startsWith("scanner") ? "scanner" : "qr";
+    const step = Number((el.id.match(/Step([1-5])/) || [])[1] || 0);
+    const kind = el.id.includes("Source") ? "source" : "destination";
+    const cur = selectedFifoChainAreaIdsNoRender(owner, step, kind);
+    el.dataset.selectionOrder = JSON.stringify(cur);
+    renderFifoChainAreaCheckboxGroup(owner, step, kind);
   });
   if (scannerCancelReturnArea) {
     const cur = scannerCancelReturnArea.value;
     scannerCancelReturnArea.innerHTML = buildScannerCancelReturnAreaOptions(cur);
     renderScannerCancelReturnAreaWarning();
   }
-  [scannerDefaultMaterial, scannerFifoChainStep1Material, scannerFifoChainStep2Material, scannerFifoChainStep3Material, scannerFifoChainStep4Material, qrMaterial, qrFifoChainStep1Material, qrFifoChainStep2Material, qrFifoChainStep3Material, qrFifoChainStep4Material, qrTransitionCurrentMaterial, qrTransitionNextMaterial].forEach((el) => {
+  [scannerDefaultMaterial, scannerFifoChainStep1Material, scannerFifoChainStep2Material, scannerFifoChainStep3Material, scannerFifoChainStep4Material, scannerFifoChainStep5Material, qrMaterial, qrFifoChainStep1Material, qrFifoChainStep2Material, qrFifoChainStep3Material, qrFifoChainStep4Material, qrFifoChainStep5Material, qrTransitionCurrentMaterial, qrTransitionNextMaterial].forEach((el) => {
     if (!el) return;
     const cur = el.value;
     el.innerHTML = buildMaterialOptions(cur);
@@ -4141,7 +4475,7 @@ function renderQrCatalogOptions() {
     const cur = qrRack.value;
     qrRack.innerHTML = buildRackSelectOptions(cur);
   }
-  [scannerSourceCell, scannerDestinationCell, scannerSecondSourceCell, scannerSecondDestinationCell, scannerFifoChainStep3SourceCell, scannerFifoChainStep3DestinationCell, scannerFifoChainStep4SourceCell, scannerFifoChainStep4DestinationCell, qrSourceCell, qrDestinationCell, qrSecondSourceCell, qrSecondDestinationCell, qrFifoChainStep3SourceCell, qrFifoChainStep3DestinationCell, qrFifoChainStep4SourceCell, qrFifoChainStep4DestinationCell, qrTransitionSourceCell, qrTransitionDestinationCell].forEach((el) => {
+  [scannerSourceCell, scannerDestinationCell, scannerSecondSourceCell, scannerSecondDestinationCell, scannerFifoChainStep3SourceCell, scannerFifoChainStep3DestinationCell, scannerFifoChainStep4SourceCell, scannerFifoChainStep4DestinationCell, scannerFifoChainStep5SourceCell, scannerFifoChainStep5DestinationCell, qrSourceCell, qrDestinationCell, qrSecondSourceCell, qrSecondDestinationCell, qrFifoChainStep3SourceCell, qrFifoChainStep3DestinationCell, qrFifoChainStep4SourceCell, qrFifoChainStep4DestinationCell, qrFifoChainStep5SourceCell, qrFifoChainStep5DestinationCell, qrTransitionSourceCell, qrTransitionDestinationCell].forEach((el) => {
     if (!el) return;
     const cur = el.value;
     el.innerHTML = buildCellOptions(cur);
@@ -4192,6 +4526,13 @@ function clearScannerStationForm() {
   if (scannerFifoChainStep4DestinationArea) scannerFifoChainStep4DestinationArea.value = "";
   if (scannerFifoChainStep4SourceCell) scannerFifoChainStep4SourceCell.value = "";
   if (scannerFifoChainStep4DestinationCell) scannerFifoChainStep4DestinationCell.value = "";
+  if (scannerFifoChainStep5SourceMode) scannerFifoChainStep5SourceMode.value = "configured_area";
+  if (scannerFifoChainStep5Material) scannerFifoChainStep5Material.value = "";
+  if (scannerFifoChainStep5SourceArea) scannerFifoChainStep5SourceArea.value = "";
+  if (scannerFifoChainStep5DestinationArea) scannerFifoChainStep5DestinationArea.value = "";
+  if (scannerFifoChainStep5SourceCell) scannerFifoChainStep5SourceCell.value = "";
+  if (scannerFifoChainStep5DestinationCell) scannerFifoChainStep5DestinationCell.value = "";
+  resetFifoChainFlexibleControls("scanner");
   scannerAgvCode.value = "";
   scannerTaskTyp.value = "";
   scannerPriority.value = 0;
@@ -4267,6 +4608,19 @@ function loadScannerStationForm(id) {
     scannerFifoChainStep4DestinationCell.innerHTML = buildCellOptions(item.fifo_chain_step4_destination_cell_id || "");
     scannerFifoChainStep4DestinationCell.value = item.fifo_chain_step4_destination_cell_id || "";
   }
+  if (scannerFifoChainStep5SourceMode) scannerFifoChainStep5SourceMode.value = normalizeFifoChainSourceMode(item.fifo_chain_step5_source_mode);
+  if (scannerFifoChainStep5Material) scannerFifoChainStep5Material.value = item.fifo_chain_step5_material_group_id || "";
+  if (scannerFifoChainStep5SourceArea) scannerFifoChainStep5SourceArea.value = item.fifo_chain_step5_source_area_id || "";
+  if (scannerFifoChainStep5DestinationArea) scannerFifoChainStep5DestinationArea.value = item.fifo_chain_step5_destination_area_id || "";
+  if (scannerFifoChainStep5SourceCell) {
+    scannerFifoChainStep5SourceCell.innerHTML = buildCellOptions(item.fifo_chain_step5_source_cell_id || "");
+    scannerFifoChainStep5SourceCell.value = item.fifo_chain_step5_source_cell_id || "";
+  }
+  if (scannerFifoChainStep5DestinationCell) {
+    scannerFifoChainStep5DestinationCell.innerHTML = buildCellOptions(item.fifo_chain_step5_destination_cell_id || "");
+    scannerFifoChainStep5DestinationCell.value = item.fifo_chain_step5_destination_cell_id || "";
+  }
+  loadFifoChainFlexibleControls("scanner", item);
   syncRouteModeSections();
   scannerAgvCode.value = item.agv_code || "";
   scannerTaskTyp.value = item.task_typ || "";
@@ -4304,6 +4658,12 @@ function scannerStationPayload() {
     fifo_chain_step4_source_cell_id: scannerFifoChainStep4SourceCell?.value ? Number(scannerFifoChainStep4SourceCell.value) : null,
     fifo_chain_step4_destination_area_id: scannerFifoChainStep4DestinationArea?.value ? Number(scannerFifoChainStep4DestinationArea.value) : null,
     fifo_chain_step4_destination_cell_id: scannerFifoChainStep4DestinationCell?.value ? Number(scannerFifoChainStep4DestinationCell.value) : null,
+    fifo_chain_step5_source_mode: normalizeFifoChainSourceMode(scannerFifoChainStep5SourceMode?.value),
+    fifo_chain_step5_material_group_id: scannerFifoChainStep5Material?.value ? Number(scannerFifoChainStep5Material.value) : null,
+    fifo_chain_step5_source_area_id: scannerFifoChainStep5SourceArea?.value ? Number(scannerFifoChainStep5SourceArea.value) : null,
+    fifo_chain_step5_source_cell_id: scannerFifoChainStep5SourceCell?.value ? Number(scannerFifoChainStep5SourceCell.value) : null,
+    fifo_chain_step5_destination_area_id: scannerFifoChainStep5DestinationArea?.value ? Number(scannerFifoChainStep5DestinationArea.value) : null,
+    fifo_chain_step5_destination_cell_id: scannerFifoChainStep5DestinationCell?.value ? Number(scannerFifoChainStep5DestinationCell.value) : null,
     second_source_area_id: scannerSecondSourceArea?.value ? Number(scannerSecondSourceArea.value) : null,
     second_destination_area_id: scannerSecondDestinationArea?.value ? Number(scannerSecondDestinationArea.value) : null,
     second_source_cell_id: scannerSecondSourceCell?.value ? Number(scannerSecondSourceCell.value) : null,
@@ -4320,6 +4680,7 @@ function scannerStationPayload() {
     allow_execute: Number(scannerAllowExecute.value || 0),
     is_active: Number(scannerActive.value || 0),
   };
+  addFifoChainFlexiblePayload("scanner", payload);
   validateRouteConfig("Scanner", payload);
   return payload;
 }
@@ -4345,11 +4706,14 @@ function renderScannerStationsList() {
       <td>${escapeHtml(fifoChainStep4EndpointLabel(s, "source"))}</td>
       <td>${escapeHtml(fifoChainStep4EndpointLabel(s, "destination"))}</td>
       <td>${escapeHtml(fifoChainStep4MaterialDisplayForList(s))}</td>
+      <td>${escapeHtml(fifoChainStep5EndpointLabel(s, "source"))}</td>
+      <td>${escapeHtml(fifoChainStep5EndpointLabel(s, "destination"))}</td>
+      <td>${escapeHtml(fifoChainStep5MaterialDisplayForList(s))}</td>
       <td>${escapeHtml(s.default_action || "-")}</td>
       <td>${escapeHtml(fifoMaterialPolicyLabel(s.fifo_material_policy))}</td>
       <td>${Number(s.is_active ?? 0) ? "Activo" : "Inactivo"}</td>
     </tr>`).join("");
-  scannerStationsList.innerHTML = `<table class="diagnosis-table qr-route-table"><thead><tr><th>C&oacute;digo scanner</th><th>Modo de ruta</th><th>Origen 1</th><th>Destino 1</th><th>Material tramo 1</th><th>Origen 2</th><th>Destino 2</th><th>Material tramo 2</th><th>Origen 3</th><th>Destino 3</th><th>Material tramo 3</th><th>Origen 4</th><th>Destino 4</th><th>Material tramo 4</th><th>Default action</th><th>Modo selecci&oacute;n</th><th>Activo</th></tr></thead><tbody>${rows}</tbody></table>`;
+  scannerStationsList.innerHTML = `<table class="diagnosis-table qr-route-table"><thead><tr><th>C&oacute;digo scanner</th><th>Modo de ruta</th><th>Origen 1</th><th>Destino 1</th><th>Material tramo 1</th><th>Origen 2</th><th>Destino 2</th><th>Material tramo 2</th><th>Origen 3</th><th>Destino 3</th><th>Material tramo 3</th><th>Origen 4</th><th>Destino 4</th><th>Material tramo 4</th><th>Origen 5</th><th>Destino 5</th><th>Material tramo 5</th><th>Default action</th><th>Modo selecci&oacute;n</th><th>Activo</th></tr></thead><tbody>${rows}</tbody></table>`;
   scannerStationsList.querySelectorAll("[data-scanner-id]").forEach(btn => btn.addEventListener("click", () => loadScannerStationForm(Number(btn.dataset.scannerId))));
 }
 function buildScannerStationOptions(selectedValue = "") {
@@ -4433,6 +4797,13 @@ function clearQrRuleForm() {
   if (qrFifoChainStep4DestinationArea) qrFifoChainStep4DestinationArea.value = "";
   if (qrFifoChainStep4SourceCell) qrFifoChainStep4SourceCell.value = "";
   if (qrFifoChainStep4DestinationCell) qrFifoChainStep4DestinationCell.value = "";
+  if (qrFifoChainStep5SourceMode) qrFifoChainStep5SourceMode.value = "configured_area";
+  if (qrFifoChainStep5Material) qrFifoChainStep5Material.value = "";
+  if (qrFifoChainStep5SourceArea) qrFifoChainStep5SourceArea.value = "";
+  if (qrFifoChainStep5DestinationArea) qrFifoChainStep5DestinationArea.value = "";
+  if (qrFifoChainStep5SourceCell) qrFifoChainStep5SourceCell.value = "";
+  if (qrFifoChainStep5DestinationCell) qrFifoChainStep5DestinationCell.value = "";
+  resetFifoChainFlexibleControls("qr");
   qrRack.value = "";
   if (qrRouteMode) qrRouteMode.value = "simple_area";
   qrSourceArea.value = "";
@@ -4511,6 +4882,19 @@ function loadQrRuleForm(id) {
     qrFifoChainStep4DestinationCell.innerHTML = buildCellOptions(item.fifo_chain_step4_destination_cell_id || "");
     qrFifoChainStep4DestinationCell.value = item.fifo_chain_step4_destination_cell_id || "";
   }
+  if (qrFifoChainStep5SourceMode) qrFifoChainStep5SourceMode.value = normalizeFifoChainSourceMode(item.fifo_chain_step5_source_mode);
+  if (qrFifoChainStep5Material) qrFifoChainStep5Material.value = item.fifo_chain_step5_material_group_id || "";
+  if (qrFifoChainStep5SourceArea) qrFifoChainStep5SourceArea.value = item.fifo_chain_step5_source_area_id || "";
+  if (qrFifoChainStep5DestinationArea) qrFifoChainStep5DestinationArea.value = item.fifo_chain_step5_destination_area_id || "";
+  if (qrFifoChainStep5SourceCell) {
+    qrFifoChainStep5SourceCell.innerHTML = buildCellOptions(item.fifo_chain_step5_source_cell_id || "");
+    qrFifoChainStep5SourceCell.value = item.fifo_chain_step5_source_cell_id || "";
+  }
+  if (qrFifoChainStep5DestinationCell) {
+    qrFifoChainStep5DestinationCell.innerHTML = buildCellOptions(item.fifo_chain_step5_destination_cell_id || "");
+    qrFifoChainStep5DestinationCell.value = item.fifo_chain_step5_destination_cell_id || "";
+  }
+  loadFifoChainFlexibleControls("qr", item);
   renderQrCellSummaries();
   syncRouteModeSections();
   qrPriority.value = item.priority ?? "";
@@ -4547,6 +4931,12 @@ function qrRulePayload() {
     fifo_chain_step4_source_cell_id: qrFifoChainStep4SourceCell?.value ? Number(qrFifoChainStep4SourceCell.value) : null,
     fifo_chain_step4_destination_area_id: qrFifoChainStep4DestinationArea?.value ? Number(qrFifoChainStep4DestinationArea.value) : null,
     fifo_chain_step4_destination_cell_id: qrFifoChainStep4DestinationCell?.value ? Number(qrFifoChainStep4DestinationCell.value) : null,
+    fifo_chain_step5_source_mode: normalizeFifoChainSourceMode(qrFifoChainStep5SourceMode?.value),
+    fifo_chain_step5_material_group_id: qrFifoChainStep5Material?.value ? Number(qrFifoChainStep5Material.value) : null,
+    fifo_chain_step5_source_area_id: qrFifoChainStep5SourceArea?.value ? Number(qrFifoChainStep5SourceArea.value) : null,
+    fifo_chain_step5_source_cell_id: qrFifoChainStep5SourceCell?.value ? Number(qrFifoChainStep5SourceCell.value) : null,
+    fifo_chain_step5_destination_area_id: qrFifoChainStep5DestinationArea?.value ? Number(qrFifoChainStep5DestinationArea.value) : null,
+    fifo_chain_step5_destination_cell_id: qrFifoChainStep5DestinationCell?.value ? Number(qrFifoChainStep5DestinationCell.value) : null,
     rack_id: qrRack.value ? Number(qrRack.value) : null,
     route_mode: normalizeRouteMode(qrRouteMode?.value),
     source_area_id: qrSourceArea.value ? Number(qrSourceArea.value) : null,
@@ -4563,6 +4953,7 @@ function qrRulePayload() {
     requires_scanner_station: Number(qrRequiresScanner.value || 0),
     is_active: Number(qrActive.value || 0),
   };
+  addFifoChainFlexiblePayload("qr", payload);
   validateRouteConfig("QR", payload);
   return payload;
 }
@@ -4608,7 +4999,33 @@ function qrRuleAreaLabel(q, kind) {
   const id = q?.[`${kind}_area_id`];
   return name || (id ? `Área ID ${id}` : "-");
 }
+function fifoChainEndpointLabel(item, step, kind) {
+  if (normalizeRouteMode(item?.route_mode) !== "fifo_chain") return null;
+  if (step > normalizeFifoChainTotalSteps(item?.fifo_chain_total_steps)) return "-";
+  const fields = FIFO_CHAIN_STEP_FIELDS[step];
+  if (kind === "source") {
+    const mode = normalizeFifoChainSourceMode(item?.[`fifo_chain_step${step}_source_mode`]);
+    if (mode === "any_area_by_material") return "Origen: cualquier area por material";
+    if (mode === "selected_areas_by_material") return `Origen: areas seleccionadas (${areaIdsShortLabel(item?.[`fifo_chain_step${step}_source_area_ids_json`])})`;
+  } else {
+    const mode = normalizeFifoChainDestinationMode(item?.[`fifo_chain_step${step}_destination_mode`]);
+    if (mode === "any_area_with_space") return "Destino: cualquier area con espacio";
+    if (mode === "selected_areas_with_space") return `Destino: areas seleccionadas (${areaIdsShortLabel(item?.[`fifo_chain_step${step}_destination_area_ids_json`])})`;
+  }
+  const fieldPrefix = kind === "source" ? fields.sourceArea.replace(/_area_id$/, "") : fields.destinationArea.replace(/_area_id$/, "");
+  const areaName = item?.[`${fieldPrefix}_area_name`];
+  const areaCode = item?.[`${fieldPrefix}_area_code`];
+  const areaId = item?.[fields[kind === "source" ? "sourceArea" : "destinationArea"]];
+  const cellCode = item?.[`${fieldPrefix}_cell_code`];
+  const cellId = item?.[fields[kind === "source" ? "sourceCell" : "destinationCell"]];
+  const area = areaCode && areaName ? `${areaCode} - ${areaName}` : (areaName || areaCode || (areaId ? `Area ID ${areaId}` : ""));
+  const cell = cellCode || (cellId ? `Celda ID ${cellId}` : "");
+  if (area && cell) return `${area} / ${cell}`;
+  return area || cell || "-";
+}
 function routeEndpointLabel(item, kind) {
+  const fifoLabel = kind === "source" ? fifoChainEndpointLabel(item, 1, "source") : fifoChainEndpointLabel(item, 1, "destination");
+  if (fifoLabel != null) return fifoLabel;
   if (
     kind === "source"
     && normalizeRouteMode(item?.route_mode) === "fifo_chain"
@@ -4629,6 +5046,7 @@ function routeEndpointLabel(item, kind) {
 function secondaryRouteEndpointLabel(item, kind) {
   const mode = normalizeRouteMode(item?.route_mode);
   if (!["double_area", "fifo_chain"].includes(mode)) return "-";
+  if (mode === "fifo_chain") return fifoChainEndpointLabel(item, 2, kind === "second_source" ? "source" : "destination");
   if (mode === "fifo_chain" && kind === "second_source" && normalizeFifoChainSourceMode(item?.fifo_chain_step2_source_mode) === "any_area_by_material") {
     return "Cualquier area por material";
   }
@@ -4636,6 +5054,7 @@ function secondaryRouteEndpointLabel(item, kind) {
 }
 function fifoChainStep3EndpointLabel(item, kind) {
   if (normalizeRouteMode(item?.route_mode) !== "fifo_chain" || normalizeFifoChainTotalSteps(item?.fifo_chain_total_steps) < 3) return "-";
+  return fifoChainEndpointLabel(item, 3, kind);
   if (kind === "source" && normalizeFifoChainSourceMode(item?.fifo_chain_step3_source_mode) === "any_area_by_material") {
     return "Cualquier area por material";
   }
@@ -4655,6 +5074,7 @@ function fifoChainStep3MaterialDisplayForList(item) {
 }
 function fifoChainStep4EndpointLabel(item, kind) {
   if (normalizeRouteMode(item?.route_mode) !== "fifo_chain" || normalizeFifoChainTotalSteps(item?.fifo_chain_total_steps) < 4) return "-";
+  return fifoChainEndpointLabel(item, 4, kind);
   if (kind === "source" && normalizeFifoChainSourceMode(item?.fifo_chain_step4_source_mode) === "any_area_by_material") {
     return `Cualquier area por material ${fifoChainStep4MaterialDisplay(item)}`;
   }
@@ -4671,6 +5091,14 @@ function fifoChainStep4EndpointLabel(item, kind) {
 function fifoChainStep4MaterialDisplayForList(item) {
   if (normalizeRouteMode(item?.route_mode) !== "fifo_chain" || normalizeFifoChainTotalSteps(item?.fifo_chain_total_steps) < 4) return "-";
   return fifoChainStep4MaterialDisplay(item);
+}
+function fifoChainStep5EndpointLabel(item, kind) {
+  if (normalizeRouteMode(item?.route_mode) !== "fifo_chain" || normalizeFifoChainTotalSteps(item?.fifo_chain_total_steps) < 5) return "-";
+  return fifoChainEndpointLabel(item, 5, kind);
+}
+function fifoChainStep5MaterialDisplayForList(item) {
+  if (normalizeRouteMode(item?.route_mode) !== "fifo_chain" || normalizeFifoChainTotalSteps(item?.fifo_chain_total_steps) < 5) return "-";
+  return fifoChainStep5MaterialDisplay(item);
 }
 function renderQrRuleMetaHtml(q) {
   const rows = [
@@ -4694,6 +5122,9 @@ function renderQrRuleMetaHtml(q) {
     ["Origen tramo 4", fifoChainStep4EndpointLabel(q, "source")],
     ["Material tramo 4", fifoChainStep4MaterialDisplayForList(q)],
     ["Destino tramo 4", fifoChainStep4EndpointLabel(q, "destination")],
+    ["Origen tramo 5", fifoChainStep5EndpointLabel(q, "source")],
+    ["Material tramo 5", fifoChainStep5MaterialDisplayForList(q)],
+    ["Destino tramo 5", fifoChainStep5EndpointLabel(q, "destination")],
     ["Scanner requerido", Number(q?.requires_scanner_station ?? 0) ? "Sí" : "No"],
     ["Estado", Number(q?.is_active ?? 0) ? "Activo" : "Inactivo"],
   ];
@@ -4824,11 +5255,14 @@ function renderQrRulesList() {
       <td>${escapeHtml(fifoChainStep4EndpointLabel(q, "source"))}</td>
       <td>${escapeHtml(fifoChainStep4EndpointLabel(q, "destination"))}</td>
       <td>${escapeHtml(fifoChainStep4MaterialDisplayForList(q))}</td>
+      <td>${escapeHtml(fifoChainStep5EndpointLabel(q, "source"))}</td>
+      <td>${escapeHtml(fifoChainStep5EndpointLabel(q, "destination"))}</td>
+      <td>${escapeHtml(fifoChainStep5MaterialDisplayForList(q))}</td>
       <td>${escapeHtml(q.agv_code || "-")}</td>
       <td>${escapeHtml(q.task_typ || "-")}</td>
       <td>${Number(q.is_active ?? 0) ? "Activo" : "Inactivo"}</td>
     </tr>`).join("");
-  qrRulesList.innerHTML = `<table class="diagnosis-table qr-route-table"><thead><tr><th>QR le&iacute;do</th><th>Valor</th><th>Acci&oacute;n</th><th>Material</th><th>Modo selecci&oacute;n</th><th>Modo de ruta</th><th>Origen tramo 1</th><th>Destino 1</th><th>Material tramo 1</th><th>Origen 2</th><th>Destino 2</th><th>Material tramo 2</th><th>Origen 3</th><th>Destino 3</th><th>Material tramo 3</th><th>Origen 4</th><th>Destino 4</th><th>Material tramo 4</th><th>AGV</th><th>Task type</th><th>Activo</th></tr></thead><tbody>${rows}</tbody></table>`;
+  qrRulesList.innerHTML = `<table class="diagnosis-table qr-route-table"><thead><tr><th>QR le&iacute;do</th><th>Valor</th><th>Acci&oacute;n</th><th>Material</th><th>Modo selecci&oacute;n</th><th>Modo de ruta</th><th>Origen tramo 1</th><th>Destino 1</th><th>Material tramo 1</th><th>Origen 2</th><th>Destino 2</th><th>Material tramo 2</th><th>Origen 3</th><th>Destino 3</th><th>Material tramo 3</th><th>Origen 4</th><th>Destino 4</th><th>Material tramo 4</th><th>Origen 5</th><th>Destino 5</th><th>Material tramo 5</th><th>AGV</th><th>Task type</th><th>Activo</th></tr></thead><tbody>${rows}</tbody></table>`;
   qrRulesList.querySelectorAll("[data-qr-rule-id]").forEach(row => {
     row.addEventListener("click", (ev) => {
       if (ev.target.closest("[data-qr-preview-id]")) return;
@@ -5332,6 +5766,31 @@ function previewRoutePointsRows(result) {
     return previewDetailRow(label, `${area || "-"} / ${cell}`);
   }).join("");
 }
+function previewFifoChainAreaIdsLabel(ids) {
+  return areaIdsShortLabel(ids);
+}
+function previewFifoChainSourceLabel(step, materialLabel) {
+  const sourceMode = normalizeFifoChainSourceMode(step?.source_mode || step?.source?.mode);
+  if (sourceMode === "any_area_by_material") return `Cualquier area por material ${materialLabel || "-"}`;
+  if (sourceMode === "selected_areas_by_material") return `Areas seleccionadas por material (${previewFifoChainAreaIdsLabel(step?.source_area_ids || step?.source?.area_ids)})`;
+  return `${entityLabel(step?.source?.area, "") || "-"} / ${cellPayloadLabel(step?.source?.cell)}`;
+}
+function previewFifoChainDestinationLabel(step) {
+  const destinationMode = normalizeFifoChainDestinationMode(step?.destination_mode || step?.destination?.mode);
+  if (destinationMode === "any_area_with_space") return "Cualquier area con espacio";
+  if (destinationMode === "selected_areas_with_space") return `Areas seleccionadas con espacio (${previewFifoChainAreaIdsLabel(step?.destination_area_ids || step?.destination?.area_ids)})`;
+  return `${entityLabel(step?.destination?.area, "") || "-"} / ${cellPayloadLabel(step?.destination?.cell)}`;
+}
+function operatorDiagnosisMessage(diagnosis) {
+  const reason = String(diagnosis?.reason || diagnosis?.code || "").trim();
+  const map = {
+    source_material_not_available_in_selected_areas: "No hay rack disponible con el material requerido dentro de las areas origen seleccionadas.",
+    destination_space_not_available_in_selected_areas: "No hay celda libre en las areas destino seleccionadas.",
+    destination_space_not_available_any_area: "No hay celda libre en ninguna area operativa.",
+    invalid_selected_area_list: "La lista de areas seleccionadas esta vacia o contiene areas no disponibles.",
+  };
+  return map[reason] || diagnosis?.message || "";
+}
 function previewFifoChainStepsRows(result) {
   const steps = Array.isArray(result?.fifo_chain_steps) ? result.fifo_chain_steps.slice() : (Array.isArray(result?.trmx_steps) ? result.trmx_steps.slice() : []);
   const totalSteps = normalizeFifoChainTotalSteps(result?.fifo_chain_total_steps ?? result?.trmx_total_steps);
@@ -5353,18 +5812,26 @@ function previewFifoChainStepsRows(result) {
       destination: result?.fifo_chain_step4_destination,
     });
   }
+  if (totalSteps >= 5 && !steps.some(step => Number(step?.step || 0) === 5)) {
+    steps.push({
+      step: 5,
+      source_mode: result?.fifo_chain_step5_source_mode,
+      step5_material: result?.fifo_chain_step5_material,
+      source: result?.fifo_chain_step5_source,
+      destination: result?.fifo_chain_step5_destination,
+    });
+  }
   if (!steps.length) return "";
   return steps.map((step) => {
-    const sourceMode = normalizeFifoChainStep2SourceMode(step?.source_mode || step?.source?.source_mode);
+    const sourceMode = normalizeFifoChainStep2SourceMode(step?.source_mode || step?.source?.mode || step?.source?.source_mode);
     const isGlobalStep1 = Number(step?.step || 0) === 1 && sourceMode === "any_area_by_material";
     const isGlobalStep2 = Number(step?.step || 0) === 2 && sourceMode === "any_area_by_material";
     const isGlobalStep3 = Number(step?.step || 0) === 3 && sourceMode === "any_area_by_material";
     const isGlobalStep4 = Number(step?.step || 0) === 4 && sourceMode === "any_area_by_material";
-    const materialLabel = entityLabel(step?.step1_material || step?.step2_material || step?.step3_material || step?.step4_material || result?.fifo_chain_step1_material || result?.fifo_chain_step2_material || result?.fifo_chain_step3_material || result?.fifo_chain_step4_material, "");
-    const source = isGlobalStep1 || isGlobalStep2 || isGlobalStep3 || isGlobalStep4
-      ? `Cualquier area con material ${materialLabel || "-"}`
-      : `${entityLabel(step?.source?.area, "") || "-"} / ${cellPayloadLabel(step?.source?.cell)}`;
-    const destination = `${entityLabel(step?.destination?.area, "") || "-"} / ${cellPayloadLabel(step?.destination?.cell)}`;
+    const isGlobalStep5 = Number(step?.step || 0) === 5 && sourceMode === "any_area_by_material";
+    const materialLabel = entityLabel(step?.step1_material || step?.step2_material || step?.step3_material || step?.step4_material || step?.step5_material || result?.fifo_chain_step1_material || result?.fifo_chain_step2_material || result?.fifo_chain_step3_material || result?.fifo_chain_step4_material || result?.fifo_chain_step5_material, "");
+    const source = previewFifoChainSourceLabel(step, materialLabel);
+    const destination = previewFifoChainDestinationLabel(step);
     const stepNumber = Number(step?.step || 0);
     const rowLabel = `Tramo ${stepNumber || "-"}`;
     const row = previewDetailRow(rowLabel, `${source} -> ${destination}`);
@@ -5377,6 +5844,7 @@ function previewFifoChainStepsRows(result) {
     if (isGlobalStep2) return row + previewDetailRow("Nota tramo 2", "El rack del tramo 2 se revalidara al finalizar el tramo 1.");
     if (isGlobalStep3) return row + previewDetailRow("Nota tramo 3", "El rack del tramo 3 se revalidara al finalizar el tramo 2.");
     if (isGlobalStep4) return row + previewDetailRow("Nota tramo 4", "El rack se revalidara al finalizar el tramo anterior.");
+    if (isGlobalStep5) return row + previewDetailRow("Nota tramo 5", "El rack se revalidara al finalizar el tramo anterior.");
     return row;
   }).join("");
 }
@@ -5394,6 +5862,7 @@ function renderScanQrPreviewResult(result) {
     <div class="scan-preview-grid">
       ${previewDetailRow("Status", ok ? "preview_ok" : "error")}
       ${previewDetailRow("Mensaje", result?.message || "-")}
+      ${previewDetailRow("Diagnostico", operatorDiagnosisMessage(result?.operator_diagnosis || result?.diagnosis))}
       ${previewDetailRow("Accion", result?.action || "-")}
       ${previewDetailRow("Scanner", entityLabel(scanner))}
       ${previewDetailRow("QR leido", qr.qr_value || "-")}
@@ -8143,6 +8612,7 @@ scannerFifoChainStep1SourceMode?.addEventListener("change", syncRouteModeSection
 scannerFifoChainStep2SourceMode?.addEventListener("change", syncRouteModeSections);
 scannerFifoChainStep3SourceMode?.addEventListener("change", syncRouteModeSections);
 scannerFifoChainStep4SourceMode?.addEventListener("change", syncRouteModeSections);
+scannerFifoChainStep5SourceMode?.addEventListener("change", syncRouteModeSections);
 btnNewQrRule?.addEventListener("click", () => { clearQrRuleForm(); if (qrAdminMsg) qrAdminMsg.textContent = ""; });
 btnSaveQrRule?.addEventListener("click", () => saveQrRule().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
 btnDisableQrRule?.addEventListener("click", () => disableQrRule().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
@@ -8152,6 +8622,30 @@ qrFifoChainStep1SourceMode?.addEventListener("change", syncRouteModeSections);
 qrFifoChainStep2SourceMode?.addEventListener("change", syncRouteModeSections);
 qrFifoChainStep3SourceMode?.addEventListener("change", syncRouteModeSections);
 qrFifoChainStep4SourceMode?.addEventListener("change", syncRouteModeSections);
+qrFifoChainStep5SourceMode?.addEventListener("change", syncRouteModeSections);
+document.querySelectorAll("[id$='DestinationMode']").forEach((el) => {
+  if (/^((scanner)|(qr))FifoChainStep[1-5]DestinationMode$/.test(el.id)) el.addEventListener("change", syncRouteModeSections);
+});
+document.querySelectorAll("[id$='AreaIds']").forEach((el) => {
+  if (/^((scanner)|(qr))FifoChainStep[1-5](Source|Destination)AreaIds$/.test(el.id)) {
+    el.addEventListener("change", () => {
+      const owner = el.id.startsWith("scanner") ? "scanner" : "qr";
+      const step = Number((el.id.match(/Step([1-5])/) || [])[1] || 0);
+      const kind = el.id.includes("Source") ? "source" : "destination";
+      el.querySelectorAll('input[type="checkbox"]').forEach(updateFifoChainAreaCheckboxRow);
+      selectedFifoChainAreaIds(owner, step, kind);
+    });
+  }
+});
+document.querySelectorAll("[data-fifo-chain-area-action]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const owner = btn.dataset.owner || "";
+    const step = Number(btn.dataset.step || 0);
+    const kind = btn.dataset.kind || "";
+    if (!owner || !step || !kind) return;
+    setAllVisibleFifoChainAreas(owner, step, kind, btn.dataset.fifoChainAreaAction === "all");
+  });
+});
 qrActionType?.addEventListener("change", syncFifoMaterialPolicyHelp);
 qrFifoMaterialPolicy?.addEventListener("change", syncFifoMaterialPolicyHelp);
 btnNewQrTransitionRule?.addEventListener("click", () => { clearQrTransitionRuleForm(); renderQrTransitionQrOptions(); renderQrTransitionScannerOptions(); renderQrCatalogOptions(); if (qrAdminMsg) qrAdminMsg.textContent = ""; });
@@ -8168,7 +8662,7 @@ btnSaveScanTerminal?.addEventListener("click", () => saveScanTerminal().catch(er
 btnRefreshScanTerminals?.addEventListener("click", () => loadScanTerminals().then(() => { if (qrAdminMsg) qrAdminMsg.textContent = "Terminales PDA actualizados."; }).catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
 btnDisableScanTerminal?.addEventListener("click", () => disableScanTerminal().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
 btnRefreshScanEvents?.addEventListener("click", () => loadScanEvents().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
-[scannerSourceCell, scannerDestinationCell, scannerSecondSourceCell, scannerSecondDestinationCell, scannerFifoChainStep3SourceCell, scannerFifoChainStep3DestinationCell, scannerFifoChainStep4SourceCell, scannerFifoChainStep4DestinationCell, qrSourceCell, qrDestinationCell, qrSecondSourceCell, qrSecondDestinationCell, qrFifoChainStep3SourceCell, qrFifoChainStep3DestinationCell, qrFifoChainStep4SourceCell, qrFifoChainStep4DestinationCell].forEach(el => el?.addEventListener("change", renderQrCellSummaries));
+[scannerSourceCell, scannerDestinationCell, scannerSecondSourceCell, scannerSecondDestinationCell, scannerFifoChainStep3SourceCell, scannerFifoChainStep3DestinationCell, scannerFifoChainStep4SourceCell, scannerFifoChainStep4DestinationCell, scannerFifoChainStep5SourceCell, scannerFifoChainStep5DestinationCell, qrSourceCell, qrDestinationCell, qrSecondSourceCell, qrSecondDestinationCell, qrFifoChainStep3SourceCell, qrFifoChainStep3DestinationCell, qrFifoChainStep4SourceCell, qrFifoChainStep4DestinationCell, qrFifoChainStep5SourceCell, qrFifoChainStep5DestinationCell].forEach(el => el?.addEventListener("change", renderQrCellSummaries));
 btnScanQrPreview?.addEventListener("click", () => runScanQrPreview());
 btnScanQrExecute?.addEventListener("click", () => runScanQrPreview("execute"));
 scanQrValue?.addEventListener("keydown", (ev) => {
