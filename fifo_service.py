@@ -76,6 +76,7 @@ def _resolve_material_group_for_fifo(db, material_group_id: Optional[int]) -> Ma
 
 
 def _validate_request(db, source_area_id: int, destination_area_id: int, material_group_id: Optional[int]):
+    return _validate_request_allow_same_area(db, source_area_id, destination_area_id, material_group_id)
     if source_area_id == destination_area_id:
         raise HTTPException(status_code=400, detail="El área origen y destino no pueden ser iguales")
 
@@ -89,6 +90,19 @@ def _validate_request(db, source_area_id: int, destination_area_id: int, materia
 
     material_group = _resolve_material_group_for_fifo(db, material_group_id)
 
+    return source_area, destination_area, material_group
+
+
+def _validate_request_allow_same_area(db, source_area_id: int, destination_area_id: int, material_group_id: Optional[int]):
+    source_area = db.execute(select(Area).where(Area.id == source_area_id)).scalar_one_or_none()
+    if not source_area or int(source_area.is_active or 0) != 1:
+        raise HTTPException(status_code=400, detail="Area origen no encontrada o inactiva")
+
+    destination_area = db.execute(select(Area).where(Area.id == destination_area_id)).scalar_one_or_none()
+    if not destination_area or int(destination_area.is_active or 0) != 1:
+        raise HTTPException(status_code=400, detail="Area destino no encontrada o inactiva")
+
+    material_group = _resolve_material_group_for_fifo(db, material_group_id)
     return source_area, destination_area, material_group
 
 
@@ -253,31 +267,58 @@ def _destination_area_full_detail(db, destination_area: Area, reserved_cell_ids:
     }
 
 
-def _find_destination_cell(db, destination_area: Area) -> Location:
+def _find_destination_cell(
+    db,
+    destination_area: Area,
+    excluded_source_cell_id: Optional[int] = None,
+    allow_same_cell_move: bool = False,
+    same_cell_fallback: Optional[Location] = None,
+) -> Location:
     reserved_cell_ids = _reserved_destination_cell_ids(db)
     rows = (
         db.execute(
             select(Location)
             .where(Location.area_id == destination_area.id)
             .where(Location.enabled == 1)
+            .where(Location.is_visible == 1)
             .where(Location.rack_id.is_(None))
+            .where(Location.code.is_not(None))
             .order_by(Location.y.asc(), Location.x.asc())
         )
         .scalars()
         .all()
     )
     for cell in rows:
+        if excluded_source_cell_id is not None and cell.id == int(excluded_source_cell_id):
+            continue
         if cell.id in reserved_cell_ids:
             continue
         return cell
-    raise HTTPException(status_code=400, detail=_destination_area_full_detail(db, destination_area, reserved_cell_ids))
+    if allow_same_cell_move and same_cell_fallback is not None:
+        if same_cell_fallback.id not in reserved_cell_ids and str(getattr(same_cell_fallback, "code", "") or "").strip():
+            return same_cell_fallback
+    detail = _destination_area_full_detail(db, destination_area, reserved_cell_ids)
+    if excluded_source_cell_id is not None:
+        detail.update({
+            "error_code": "same_area_no_free_destination_cell",
+            "operator_message": "El area origen y destino son iguales, pero no hay una celda destino libre diferente.",
+            "suggested_action": "Libera otra celda dentro del area o cambia el destino configurado.",
+        })
+    raise HTTPException(status_code=400, detail=detail)
 
 
-def resolve_fifo_request(db, source_area_id: int, destination_area_id: int, material_group_id: Optional[int], priority: Optional[str] = None) -> FifoSelection:
+def resolve_fifo_request(db, source_area_id: int, destination_area_id: int, material_group_id: Optional[int], priority: Optional[str] = None, allow_same_cell_move: bool = False) -> FifoSelection:
     _normalize_priority(priority)
-    source_area, destination_area, material_group = _validate_request(db, source_area_id, destination_area_id, material_group_id)
+    source_area, destination_area, material_group = _validate_request_allow_same_area(db, source_area_id, destination_area_id, material_group_id)
     rack, source_cell = _find_fifo_candidate(db, source_area, material_group)
-    destination_cell = _find_destination_cell(db, destination_area)
+    excluded_source_cell_id = source_cell.id if source_area.id == destination_area.id else None
+    destination_cell = _find_destination_cell(
+        db,
+        destination_area,
+        excluded_source_cell_id=excluded_source_cell_id,
+        allow_same_cell_move=allow_same_cell_move,
+        same_cell_fallback=source_cell if source_area.id == destination_area.id else None,
+    )
     return FifoSelection(
         rack=rack,
         source_cell=source_cell,
@@ -288,7 +329,7 @@ def resolve_fifo_request(db, source_area_id: int, destination_area_id: int, mate
     )
 
 
-def resolve_fifo_request_any_available(db, source_area_id: int, destination_area_id: int, priority: Optional[str] = None, source_cell_id: Optional[int] = None) -> FifoSelection:
+def resolve_fifo_request_any_available(db, source_area_id: int, destination_area_id: int, priority: Optional[str] = None, source_cell_id: Optional[int] = None, allow_same_cell_move: bool = False) -> FifoSelection:
     _normalize_priority(priority)
     source_area = db.execute(select(Area).where(Area.id == source_area_id)).scalar_one_or_none()
     if not source_area or int(source_area.is_active or 0) != 1:
@@ -296,10 +337,15 @@ def resolve_fifo_request_any_available(db, source_area_id: int, destination_area
     destination_area = db.execute(select(Area).where(Area.id == destination_area_id)).scalar_one_or_none()
     if not destination_area or int(destination_area.is_active or 0) != 1:
         raise HTTPException(status_code=400, detail="Area destino no encontrada o inactiva")
-    if source_area.id == destination_area.id:
-        raise HTTPException(status_code=400, detail="El area origen y destino no pueden ser iguales")
     rack, source_cell = _find_any_available_fifo_candidate(db, source_area, source_cell_id=source_cell_id)
-    destination_cell = _find_destination_cell(db, destination_area)
+    excluded_source_cell_id = source_cell.id if source_area.id == destination_area.id else None
+    destination_cell = _find_destination_cell(
+        db,
+        destination_area,
+        excluded_source_cell_id=excluded_source_cell_id,
+        allow_same_cell_move=allow_same_cell_move,
+        same_cell_fallback=source_cell if source_area.id == destination_area.id else None,
+    )
     material_group = db.execute(select(MaterialGroup).where(MaterialGroup.id == rack.material_group_id)).scalar_one_or_none() if rack.material_group_id else None
     material_group = material_group or _ensure_default_material_group(db)
     return FifoSelection(
@@ -481,9 +527,10 @@ def execute_fifo_request(
     agv_code: Optional[str] = None,
     task_typ: Optional[str] = None,
     created_window_id: Optional[int] = None,
+    allow_same_cell_move: bool = False,
 ) -> tuple[MovementOrder, FifoSelection]:
     normalized_priority = _normalize_priority(priority)
-    selection = resolve_fifo_request(db, source_area_id, destination_area_id, material_group_id, normalized_priority)
+    selection = resolve_fifo_request(db, source_area_id, destination_area_id, material_group_id, normalized_priority, allow_same_cell_move=allow_same_cell_move)
 
     # Revalidar estados justo antes de reservar.
     rack = db.execute(select(Rack).where(Rack.id == selection.rack.id)).scalar_one()
@@ -494,7 +541,10 @@ def execute_fifo_request(
         raise HTTPException(status_code=409, detail="El rack FIFO seleccionado ya no está disponible")
     if source_cell.rack_id != rack.id or int(source_cell.enabled or 0) != 1:
         raise HTTPException(status_code=409, detail="La celda origen ya no es válida")
-    if destination_cell.rack_id is not None or int(destination_cell.enabled or 0) != 1:
+    same_cell_move = source_cell.id == destination_cell.id
+    if same_cell_move and not allow_same_cell_move:
+        raise HTTPException(status_code=400, detail={"error_code": "same_source_destination_cell", "operator_message": "La celda origen y destino no pueden ser la misma, salvo que se habilite Permitir movimiento en la misma celda."})
+    if (destination_cell.rack_id is not None and not (same_cell_move and destination_cell.rack_id == rack.id)) or int(destination_cell.enabled or 0) != 1:
         raise HTTPException(status_code=409, detail="La celda destino ya no está disponible")
 
     now = datetime.utcnow()
@@ -529,6 +579,11 @@ def execute_fifo_request(
     db.commit()
     db.refresh(order)
     logger.info("FIFO order created order_id=%s order_code=%s rack_id=%s source_cell_id=%s destination_cell_id=%s", order.id, order.order_code, rack.id, source_cell.id, destination_cell.id)
+    if same_cell_move:
+        logger.info(
+            "SAME_CELL_MOVE_ALLOWED movement_order_id=%s order_code=%s route_mode=%s source_cell_code=%s destination_cell_code=%s allow_same_cell_move=%s",
+            order.id, order.order_code, "simple_area", source_cell.code, destination_cell.code, True,
+        )
 
     selection.rack = rack
     selection.source_cell = source_cell
@@ -546,9 +601,10 @@ def execute_fifo_request_any_available(
     agv_code: Optional[str] = None,
     task_typ: Optional[str] = None,
     source_cell_id: Optional[int] = None,
+    allow_same_cell_move: bool = False,
 ) -> tuple[MovementOrder, FifoSelection]:
     normalized_priority = _normalize_priority(priority)
-    selection = resolve_fifo_request_any_available(db, source_area_id, destination_area_id, normalized_priority, source_cell_id=source_cell_id)
+    selection = resolve_fifo_request_any_available(db, source_area_id, destination_area_id, normalized_priority, source_cell_id=source_cell_id, allow_same_cell_move=allow_same_cell_move)
 
     rack = db.execute(select(Rack).where(Rack.id == selection.rack.id)).scalar_one()
     source_cell = db.execute(select(Location).where(Location.id == selection.source_cell.id)).scalar_one()
@@ -558,7 +614,10 @@ def execute_fifo_request_any_available(
         raise HTTPException(status_code=409, detail="El rack FIFO seleccionado ya no esta disponible")
     if source_cell.rack_id != rack.id or int(source_cell.enabled or 0) != 1:
         raise HTTPException(status_code=409, detail="La celda origen ya no es valida")
-    if destination_cell.rack_id is not None or int(destination_cell.enabled or 0) != 1:
+    same_cell_move = source_cell.id == destination_cell.id
+    if same_cell_move and not allow_same_cell_move:
+        raise HTTPException(status_code=400, detail={"error_code": "same_source_destination_cell", "operator_message": "La celda origen y destino no pueden ser la misma, salvo que se habilite Permitir movimiento en la misma celda."})
+    if (destination_cell.rack_id is not None and not (same_cell_move and destination_cell.rack_id == rack.id)) or int(destination_cell.enabled or 0) != 1:
         raise HTTPException(status_code=409, detail="La celda destino ya no esta disponible")
 
     now = datetime.utcnow()
@@ -591,6 +650,11 @@ def execute_fifo_request_any_available(
     db.commit()
     db.refresh(order)
     logger.info("FIFO any-available order created order_id=%s order_code=%s rack_id=%s source_cell_id=%s destination_cell_id=%s", order.id, order.order_code, rack.id, source_cell.id, destination_cell.id)
+    if same_cell_move:
+        logger.info(
+            "SAME_CELL_MOVE_ALLOWED movement_order_id=%s order_code=%s route_mode=%s source_cell_code=%s destination_cell_code=%s allow_same_cell_move=%s",
+            order.id, order.order_code, "simple_area", source_cell.code, destination_cell.code, True,
+        )
 
     selection.rack = rack
     selection.source_cell = source_cell

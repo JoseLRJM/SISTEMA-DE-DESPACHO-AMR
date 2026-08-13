@@ -4,8 +4,7 @@ __pycache__/
 *.py[cod]
 logs/
 *.log
-backups/
-updates/
+deployment_packages/
 agv.db
 *.db
 *.sqlite

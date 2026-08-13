@@ -34,8 +34,12 @@ const API = {
   adminShowConfiguredRange: "/api/admin/show-configured-range",
   adminAreas: "/api/admin/areas",
   adminArea: (id) => `/api/admin/areas/${id}`,
+  adminAreaDependencies: (id) => `/api/admin/areas/${id}/dependencies`,
+  adminAreaRestore: (id) => `/api/admin/areas/${id}/restore`,
   adminMaterials: "/api/admin/materials",
   adminMaterial: (id) => `/api/admin/materials/${id}`,
+  adminMaterialDependencies: (id) => `/api/admin/material-groups/${id}/dependencies`,
+  adminMaterialRestore: (id) => `/api/admin/material-groups/${id}/restore`,
   adminRacks: "/api/admin/racks",
   adminRack: (id) => `/api/admin/racks/${id}`,
   adminRackReservation: (id) => `/api/admin/racks/${id}/reservation`,
@@ -44,6 +48,7 @@ const API = {
   adminCleanupCloseInconsistentOrders: "/api/admin/cleanup-close-inconsistent-orders",
   adminCleanupResolveInconsistentRacks: "/api/admin/cleanup-resolve-inconsistent-racks",
   adminForceReleaseOldActiveRacks: "/api/admin/force-release-old-active-racks",
+  adminRepairInconsistentLocations: "/api/admin/repair-inconsistent-locations",
   adminCreateOldActiveOrderTest: "/api/admin/test/create-old-active-order",
   adminSoftwareUpdateValidate: "/api/admin/software-update/validate",
   adminSoftwareUpdateApply: "/api/admin/software-update/apply",
@@ -90,16 +95,25 @@ const API = {
   adminDeleteMovementOrder: (id) => `/api/admin/movement-orders/${id}`,
   adminScannerStations: "/api/admin/scanner-stations",
   adminScannerStation: (id) => `/api/admin/scanner-stations/${id}`,
+  adminScannerStationDependencies: (id) => `/api/admin/scanner-stations/${id}/dependencies`,
+  adminScannerStationRestore: (id) => `/api/admin/scanner-stations/${id}/restore`,
   adminQrActionRules: "/api/admin/qr-action-rules",
   adminQrActionRule: (id) => `/api/admin/qr-action-rules/${id}`,
+  adminQrActionRuleDependencies: (id) => `/api/admin/qr-action-rules/${id}/dependencies`,
+  adminQrActionRuleRestore: (id) => `/api/admin/qr-action-rules/${id}/restore`,
   adminQrActionRuleImage: (id, size = 240) => `/api/admin/qr-action-rules/${id}/qr-image?size=${encodeURIComponent(size)}`,
   adminQrTransitionRules: "/api/admin/qr-transition-rules",
+  adminQrTransitionRuleValidate: "/api/admin/qr-transition-rules/validate",
   adminQrTransitionRule: (id) => `/api/admin/qr-transition-rules/${id}`,
+  adminQrTransitionRuleDependencies: (id) => `/api/admin/qr-transition-rules/${id}/dependencies`,
+  adminQrTransitionRuleRestore: (id) => `/api/admin/qr-transition-rules/${id}/restore`,
   adminQrTransitionPreview: (id) => `/api/admin/qr-transition-rules/preview/${encodeURIComponent(id)}`,
   adminQrTransitionApply: (id) => `/api/admin/qr-transition-rules/apply/${encodeURIComponent(id)}`,
   adminQrTransitionLogs: "/api/admin/qr-transition-logs",
   adminScanTerminals: "/api/admin/scan-terminals",
   adminScanTerminal: (id) => `/api/admin/scan-terminals/${id}`,
+  adminScanTerminalDependencies: (id) => `/api/admin/scan-terminals/${id}/dependencies`,
+  adminScanTerminalRestore: (id) => `/api/admin/scan-terminals/${id}/restore`,
   scanPreview: "/api/scan/preview",
   scanExecute: "/api/scan/execute",
   scanEvents: "/api/scan/events",
@@ -193,8 +207,15 @@ const diagnosisInconsistentRacks = $("diagnosisInconsistentRacks");
 const diagnosisOldActiveRacks = $("diagnosisOldActiveRacks");
 const diagnosisStuckCancelRecoverable = $("diagnosisStuckCancelRecoverable");
 const diagnosisInconsistentLocations = $("diagnosisInconsistentLocations");
+const btnRepairInconsistentLocations = $("btnRepairInconsistentLocations");
 const diagnosisIntegrityCheck = $("diagnosisIntegrityCheck");
 const btnForceReleaseOldActiveRacks = $("btnForceReleaseOldActiveRacks");
+const forceReleaseConfirmModal = $("forceReleaseConfirmModal");
+const forceReleasePhysicalConfirm = $("forceReleasePhysicalConfirm");
+const forceReleaseReason = $("forceReleaseReason");
+const forceReleaseConfirmMsg = $("forceReleaseConfirmMsg");
+const btnCancelForceRelease = $("btnCancelForceRelease");
+const btnConfirmForceRelease = $("btnConfirmForceRelease");
 const createOldActiveOrderTestBtn = $("createOldActiveOrderTestBtn");
 const softwareUpdateZip = $("softwareUpdateZip");
 const btnValidateSoftwareUpdate = $("btnValidateSoftwareUpdate");
@@ -273,6 +294,7 @@ const btnResetBgTransform = $("btnResetBgTransform");
 const bgStateLbl = $("bgStateLbl");
 const clientIp = $("clientIp");
 const btnSaveClientIp = $("btnSaveClientIp");
+const rcsSimulatorEnabled = $("rcsSimulatorEnabled");
 const rcsBaseUrl = $("rcsBaseUrl");
 const rcsEndpoint = $("rcsEndpoint");
 const rcsQueryEndpoint = $("rcsQueryEndpoint");
@@ -349,6 +371,9 @@ const areaDescription = $("areaDescription");
 const btnSaveArea = $("btnSaveArea");
 const btnNewArea = $("btnNewArea");
 const btnDeleteArea = $("btnDeleteArea");
+const btnRestoreArea = $("btnRestoreArea");
+const showDeletedAreas = $("showDeletedAreas");
+const areaRecordState = $("areaRecordState");
 const areasList = $("areasList");
 const areaMsg = $("areaMsg");
 const areaEditRefreshNotice = $("areaEditRefreshNotice");
@@ -462,6 +487,9 @@ const materialDescription = $("materialDescription");
 const btnSaveMaterial = $("btnSaveMaterial");
 const btnNewMaterial = $("btnNewMaterial");
 const btnDeleteMaterial = $("btnDeleteMaterial");
+const btnRestoreMaterial = $("btnRestoreMaterial");
+const showDeletedMaterials = $("showDeletedMaterials");
+const materialRecordState = $("materialRecordState");
 const materialsList = $("materialsList");
 const materialMsg = $("materialMsg");
 
@@ -469,6 +497,8 @@ const rackId = $("rackId");
 const rackCode = $("rackCode");
 const rackName = $("rackName");
 const rackStatus = $("rackStatus");
+const rackActiveOrderWarning = $("rackActiveOrderWarning");
+const btnRackOpenCleanup = $("btnRackOpenCleanup");
 const rackMaterial = $("rackMaterial");
 const rackReservationState = $("rackReservationState");
 const rackReservationTask = $("rackReservationTask");
@@ -507,6 +537,7 @@ const scannerSecondDestinationCellSummary = $("scannerSecondDestinationCellSumma
 const scannerStorageArea = $("scannerStorageArea");
 const scannerEmptyRackArea = $("scannerEmptyRackArea");
 const scannerCancelReturnArea = $("scannerCancelReturnArea");
+const scannerCancelReturnMode = $("scannerCancelReturnMode");
 const scannerCancelReturnAreaWarning = $("scannerCancelReturnAreaWarning");
 const scannerDefaultMaterial = $("scannerDefaultMaterial");
 const scannerFifoMaterialPolicy = $("scannerFifoMaterialPolicy");
@@ -544,10 +575,14 @@ const scannerTaskTyp = $("scannerTaskTyp");
 const scannerPriority = $("scannerPriority");
 const scannerRequirePreview = $("scannerRequirePreview");
 const scannerAllowExecute = $("scannerAllowExecute");
+const scannerAllowSameCellMove = $("scannerAllowSameCellMove");
 const scannerActive = $("scannerActive");
 const btnSaveScannerStation = $("btnSaveScannerStation");
 const btnNewScannerStation = $("btnNewScannerStation");
 const btnDisableScannerStation = $("btnDisableScannerStation");
+const btnRestoreScannerStation = $("btnRestoreScannerStation");
+const showDeletedScannerStations = $("showDeletedScannerStations");
+const scannerRecordState = $("scannerRecordState");
 const scannerStationsList = $("scannerStationsList");
 const qrRuleId = $("qrRuleId");
 const qrValue = $("qrValue");
@@ -606,10 +641,14 @@ const qrPriority = $("qrPriority");
 const qrAgvCode = $("qrAgvCode");
 const qrTaskTyp = $("qrTaskTyp");
 const qrRequiresScanner = $("qrRequiresScanner");
+const qrAllowSameCellMove = $("qrAllowSameCellMove");
 const qrActive = $("qrActive");
 const btnSaveQrRule = $("btnSaveQrRule");
 const btnNewQrRule = $("btnNewQrRule");
 const btnDisableQrRule = $("btnDisableQrRule");
+const btnRestoreQrRule = $("btnRestoreQrRule");
+const showDeletedQrRules = $("showDeletedQrRules");
+const qrRuleRecordState = $("qrRuleRecordState");
 const qrRulesList = $("qrRulesList");
 const qrRulePreviewModal = $("qrRulePreviewModal");
 const qrRuleModalTitle = $("qrRuleModalTitle");
@@ -628,18 +667,18 @@ const FIFO_CHAIN_STEP_FIELDS = {
 };
 const FIFO_CHAIN_DOM_IDS = {
   scanner: {
-    1: { sourceMode: "scannerFifoChainStep1SourceMode", material: "scannerFifoChainStep1Material", sourceArea: "scannerSourceArea", sourceCell: "scannerSourceCell", destinationArea: "scannerDestinationArea", destinationCell: "scannerDestinationCell" },
-    2: { sourceMode: "scannerFifoChainStep2SourceMode", material: "scannerFifoChainStep2Material", sourceArea: "scannerSecondSourceArea", sourceCell: "scannerSecondSourceCell", destinationArea: "scannerSecondDestinationArea", destinationCell: "scannerSecondDestinationCell" },
-    3: { sourceMode: "scannerFifoChainStep3SourceMode", material: "scannerFifoChainStep3Material", sourceArea: "scannerFifoChainStep3SourceArea", sourceCell: "scannerFifoChainStep3SourceCell", destinationArea: "scannerFifoChainStep3DestinationArea", destinationCell: "scannerFifoChainStep3DestinationCell" },
-    4: { sourceMode: "scannerFifoChainStep4SourceMode", material: "scannerFifoChainStep4Material", sourceArea: "scannerFifoChainStep4SourceArea", sourceCell: "scannerFifoChainStep4SourceCell", destinationArea: "scannerFifoChainStep4DestinationArea", destinationCell: "scannerFifoChainStep4DestinationCell" },
-    5: { sourceMode: "scannerFifoChainStep5SourceMode", material: "scannerFifoChainStep5Material", sourceArea: "scannerFifoChainStep5SourceArea", sourceCell: "scannerFifoChainStep5SourceCell", destinationArea: "scannerFifoChainStep5DestinationArea", destinationCell: "scannerFifoChainStep5DestinationCell" },
+    1: { sourceMode: "scannerFifoChainStep1SourceMode", material: "scannerFifoChainStep1Material", taskTyp: "scannerFifoChainStep1TaskTyp", sourceArea: "scannerSourceArea", sourceCell: "scannerSourceCell", destinationArea: "scannerDestinationArea", destinationCell: "scannerDestinationCell" },
+    2: { sourceMode: "scannerFifoChainStep2SourceMode", material: "scannerFifoChainStep2Material", taskTyp: "scannerFifoChainStep2TaskTyp", sourceArea: "scannerSecondSourceArea", sourceCell: "scannerSecondSourceCell", destinationArea: "scannerSecondDestinationArea", destinationCell: "scannerSecondDestinationCell" },
+    3: { sourceMode: "scannerFifoChainStep3SourceMode", material: "scannerFifoChainStep3Material", taskTyp: "scannerFifoChainStep3TaskTyp", sourceArea: "scannerFifoChainStep3SourceArea", sourceCell: "scannerFifoChainStep3SourceCell", destinationArea: "scannerFifoChainStep3DestinationArea", destinationCell: "scannerFifoChainStep3DestinationCell" },
+    4: { sourceMode: "scannerFifoChainStep4SourceMode", material: "scannerFifoChainStep4Material", taskTyp: "scannerFifoChainStep4TaskTyp", sourceArea: "scannerFifoChainStep4SourceArea", sourceCell: "scannerFifoChainStep4SourceCell", destinationArea: "scannerFifoChainStep4DestinationArea", destinationCell: "scannerFifoChainStep4DestinationCell" },
+    5: { sourceMode: "scannerFifoChainStep5SourceMode", material: "scannerFifoChainStep5Material", taskTyp: "scannerFifoChainStep5TaskTyp", sourceArea: "scannerFifoChainStep5SourceArea", sourceCell: "scannerFifoChainStep5SourceCell", destinationArea: "scannerFifoChainStep5DestinationArea", destinationCell: "scannerFifoChainStep5DestinationCell" },
   },
   qr: {
-    1: { sourceMode: "qrFifoChainStep1SourceMode", material: "qrFifoChainStep1Material", sourceArea: "qrSourceArea", sourceCell: "qrSourceCell", destinationArea: "qrDestinationArea", destinationCell: "qrDestinationCell" },
-    2: { sourceMode: "qrFifoChainStep2SourceMode", material: "qrFifoChainStep2Material", sourceArea: "qrSecondSourceArea", sourceCell: "qrSecondSourceCell", destinationArea: "qrSecondDestinationArea", destinationCell: "qrSecondDestinationCell" },
-    3: { sourceMode: "qrFifoChainStep3SourceMode", material: "qrFifoChainStep3Material", sourceArea: "qrFifoChainStep3SourceArea", sourceCell: "qrFifoChainStep3SourceCell", destinationArea: "qrFifoChainStep3DestinationArea", destinationCell: "qrFifoChainStep3DestinationCell" },
-    4: { sourceMode: "qrFifoChainStep4SourceMode", material: "qrFifoChainStep4Material", sourceArea: "qrFifoChainStep4SourceArea", sourceCell: "qrFifoChainStep4SourceCell", destinationArea: "qrFifoChainStep4DestinationArea", destinationCell: "qrFifoChainStep4DestinationCell" },
-    5: { sourceMode: "qrFifoChainStep5SourceMode", material: "qrFifoChainStep5Material", sourceArea: "qrFifoChainStep5SourceArea", sourceCell: "qrFifoChainStep5SourceCell", destinationArea: "qrFifoChainStep5DestinationArea", destinationCell: "qrFifoChainStep5DestinationCell" },
+    1: { sourceMode: "qrFifoChainStep1SourceMode", material: "qrFifoChainStep1Material", taskTyp: "qrFifoChainStep1TaskTyp", sourceArea: "qrSourceArea", sourceCell: "qrSourceCell", destinationArea: "qrDestinationArea", destinationCell: "qrDestinationCell" },
+    2: { sourceMode: "qrFifoChainStep2SourceMode", material: "qrFifoChainStep2Material", taskTyp: "qrFifoChainStep2TaskTyp", sourceArea: "qrSecondSourceArea", sourceCell: "qrSecondSourceCell", destinationArea: "qrSecondDestinationArea", destinationCell: "qrSecondDestinationCell" },
+    3: { sourceMode: "qrFifoChainStep3SourceMode", material: "qrFifoChainStep3Material", taskTyp: "qrFifoChainStep3TaskTyp", sourceArea: "qrFifoChainStep3SourceArea", sourceCell: "qrFifoChainStep3SourceCell", destinationArea: "qrFifoChainStep3DestinationArea", destinationCell: "qrFifoChainStep3DestinationCell" },
+    4: { sourceMode: "qrFifoChainStep4SourceMode", material: "qrFifoChainStep4Material", taskTyp: "qrFifoChainStep4TaskTyp", sourceArea: "qrFifoChainStep4SourceArea", sourceCell: "qrFifoChainStep4SourceCell", destinationArea: "qrFifoChainStep4DestinationArea", destinationCell: "qrFifoChainStep4DestinationCell" },
+    5: { sourceMode: "qrFifoChainStep5SourceMode", material: "qrFifoChainStep5Material", taskTyp: "qrFifoChainStep5TaskTyp", sourceArea: "qrFifoChainStep5SourceArea", sourceCell: "qrFifoChainStep5SourceCell", destinationArea: "qrFifoChainStep5DestinationArea", destinationCell: "qrFifoChainStep5DestinationCell" },
   },
 };
 const btnCloseQrRuleModal = $("btnCloseQrRuleModal");
@@ -680,13 +719,35 @@ const qrTransitionActive = $("qrTransitionActive");
 const btnSaveQrTransitionRule = $("btnSaveQrTransitionRule");
 const btnNewQrTransitionRule = $("btnNewQrTransitionRule");
 const btnDisableQrTransitionRule = $("btnDisableQrTransitionRule");
+const btnRestoreQrTransitionRule = $("btnRestoreQrTransitionRule");
+const showDeletedQrTransitions = $("showDeletedQrTransitions");
+const qrTransitionRecordState = $("qrTransitionRecordState");
 const qrTransitionRulesList = $("qrTransitionRulesList");
+const qrTransitionValidationResult = $("qrTransitionValidationResult");
 const qrTransitionPreviewOrderId = $("qrTransitionPreviewOrderId");
 const btnPreviewQrTransition = $("btnPreviewQrTransition");
 const btnApplyQrTransition = $("btnApplyQrTransition");
 const qrTransitionPreviewResult = $("qrTransitionPreviewResult");
 const btnRefreshQrTransitionLogs = $("btnRefreshQrTransitionLogs");
 const qrTransitionLogsList = $("qrTransitionLogsList");
+const qrTransitionHistoryTableBody = $("qrTransitionHistoryTableBody");
+const qrTransitionHistoryState = $("qrTransitionHistoryState");
+const qrTransitionHistoryToggle = $("qrTransitionHistoryToggle");
+const qrTransitionHistoryChevron = $("qrTransitionHistoryChevron");
+const qrTransitionHistoryContent = $("qrTransitionHistoryContent");
+const qrTransitionHistoryCount = $("qrTransitionHistoryCount");
+const qrTransitionHistorySummary = $("qrTransitionHistorySummary");
+const btnOpenQrTransitionHistory = $("btnOpenQrTransitionHistory");
+const qrTransitionHistoryModal = $("qrTransitionHistoryModal");
+const qrTransitionHistoryModalCount = $("qrTransitionHistoryModalCount");
+const qrTransitionHistoryModalSummary = $("qrTransitionHistoryModalSummary");
+const qrTransitionHistoryModalList = $("qrTransitionHistoryModalList");
+const qrTransitionHistoryModalTableBody = $("qrTransitionHistoryModalTableBody");
+const qrTransitionHistoryModalState = $("qrTransitionHistoryModalState");
+const qrTransitionHistoryDetail = $("qrTransitionHistoryDetail");
+const btnRefreshQrTransitionLogsModal = $("btnRefreshQrTransitionLogsModal");
+const btnCloseQrTransitionHistory = $("btnCloseQrTransitionHistory");
+const btnCloseQrTransitionHistoryX = $("btnCloseQrTransitionHistoryX");
 const scanTerminalId = $("scanTerminalId");
 const scanTerminalCode = $("scanTerminalCode");
 const scanTerminalName = $("scanTerminalName");
@@ -703,7 +764,19 @@ const btnSaveScanTerminal = $("btnSaveScanTerminal");
 const btnNewScanTerminal = $("btnNewScanTerminal");
 const btnRefreshScanTerminals = $("btnRefreshScanTerminals");
 const btnDisableScanTerminal = $("btnDisableScanTerminal");
+const btnRestoreScanTerminal = $("btnRestoreScanTerminal");
+const showDeletedScanTerminals = $("showDeletedScanTerminals");
+const scanTerminalRecordState = $("scanTerminalRecordState");
 const scanTerminalsList = $("scanTerminalsList");
+const qrDeleteRestoreModal = $("qrDeleteRestoreModal");
+const qrDeleteRestoreTitle = $("qrDeleteRestoreTitle");
+const qrDeleteRestoreBody = $("qrDeleteRestoreBody");
+const qrDeleteConfirmWrap = $("qrDeleteConfirmWrap");
+const qrDeleteConfirmCheck = $("qrDeleteConfirmCheck");
+const qrDeleteRestoreError = $("qrDeleteRestoreError");
+const btnCloseQrDeleteRestoreModal = $("btnCloseQrDeleteRestoreModal");
+const btnCancelQrDeleteRestore = $("btnCancelQrDeleteRestore");
+const btnConfirmQrDeleteRestore = $("btnConfirmQrDeleteRestore");
 const scanQrScannerSelect = $("scanQrScannerSelect");
 const scanQrScannerManual = $("scanQrScannerManual");
 const scanQrScannerHelp = $("scanQrScannerHelp");
@@ -906,10 +979,16 @@ let scannerStations = [];
 let qrActionRules = [];
 let qrTransitionRules = [];
 let qrTransitionLogs = [];
+let qrTransitionLogsLoaded = false;
+let qrTransitionLogsLoading = false;
+let qrTransitionLogsError = "";
+const qrTransitionHistoryFilters = { status: "", rule: "", order: "", rack: "", qr: "", scanner: "", execution: "", search: "", limit: "200" };
 const qrRuleImageObjectUrls = new Map();
 let qrRuleModalImageObjectUrl = null;
 let scanEvents = [];
 let scanTerminals = [];
+let adminAreas = [];
+let adminMaterials = [];
 let scanQrPreviewInFlight = false;
 
 const BASE_CELL = 22;
@@ -2865,7 +2944,15 @@ async function fetchJson(url, options = {}) {
   const text = await res.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch (_) {}
-  if (!res.ok) throw new Error((data && data.detail) || text || `HTTP ${res.status}`);
+  if (!res.ok) {
+    const detail = data?.detail;
+    const message = typeof detail === "string" ? detail : (detail?.message || data?.message || text || `HTTP ${res.status}`);
+    const error = new Error(message);
+    error.status = res.status;
+    error.data = data;
+    error.detail = detail;
+    throw error;
+  }
   return data;
 }
 
@@ -2881,7 +2968,7 @@ function renderDiagnosisTable(target, rows, columns, emptyText = "Sin hallazgos.
 }
 
 function setCleanupActionButtonsDisabled(disabled) {
-  [btnSelectSafeCleanup, btnCleanSelected, btnCloseSelectedOrders, btnReleaseSelectedRacks, btnResolveSelectedInconsistentRacks].forEach((btn) => {
+  [btnSelectSafeCleanup, btnCleanSelected, btnCloseSelectedOrders, btnReleaseSelectedRacks, btnResolveSelectedInconsistentRacks, btnRepairInconsistentLocations].forEach((btn) => {
     if (btn) btn.disabled = !!disabled || !adminToken;
   });
   if (btnForceReleaseOldActiveRacks) btnForceReleaseOldActiveRacks.disabled = !!disabled || !adminToken;
@@ -2901,13 +2988,41 @@ function renderSelectableDiagnosisTable(target, rows, columns, options = {}) {
   const header = `<th></th>${columns.map(col => `<th>${escapeHtml(col.label)}</th>`).join("")}<th>Seguro</th>`;
   const body = rows.map(row => {
     const idValue = row?.[idKey] ?? "";
-    const safe = row?.safe === true;
+    const safe = options.safeKey ? row?.[options.safeKey] === true : row?.safe === true;
     const reason = row?.safe_reason || (safe ? "Sí" : "No seguro");
     const checkbox = `<input type="checkbox" data-cleanup-select="1" data-cleanup-type="${escapeHtml(type)}" data-cleanup-section="${escapeHtml(section)}" data-cleanup-id="${escapeHtml(idValue)}" ${safe ? "" : "disabled"} />`;
     const cells = columns.map(col => `<td>${escapeHtml(row?.[col.key] ?? "-")}</td>`).join("");
     return `<tr class="${safe ? "" : "diagnosis-row-disabled"}"><td>${checkbox}</td>${cells}<td>${escapeHtml(safe ? "Sí" : reason)}</td></tr>`;
   }).join("");
   target.innerHTML = `<table class="diagnosis-table"><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table>`;
+}
+
+function displayAgeMinutes(value, prefix) {
+  return value === null || value === undefined ? `${prefix}: Sin dato` : `${prefix}: ${Number(value)} min`;
+}
+
+function renderOldActiveRecoveryRows(rows) {
+  if (!diagnosisOldActiveRacks) return;
+  if (!Array.isArray(rows) || !rows.length) {
+    diagnosisOldActiveRacks.innerHTML = `<div class="small">Sin racks bloqueados por órdenes activas viejas.</div>`;
+    return;
+  }
+  const body = rows.map(row => {
+    const selectable = row?.safe_to_release === true;
+    const warning = row?.rcs_still_active_warning === true || row?.requires_force_confirmation === true;
+    const reason = row?.reason || row?.motivo || row?.safe_reason || "Sin motivo";
+    const checkbox = `<input type="checkbox" data-cleanup-select="1" data-cleanup-type="rack" data-cleanup-section="old-active-rack" data-cleanup-id="${escapeHtml(row?.rack_id ?? "")}" ${selectable ? "" : "disabled"} />`;
+    const ages = [
+      displayAgeMinutes(row?.order_age_minutes, "Edad"),
+      row?.last_query_age_minutes == null ? "Consulta RCS: Sin dato" : `Consulta RCS: hace ${Number(row.last_query_age_minutes)} min`,
+      row?.last_meaningful_rcs_change_age_minutes == null ? "Estado sin cambio: Sin dato" : `Estado sin cambio: ${Number(row.last_meaningful_rcs_change_age_minutes)} min`,
+    ].map(escapeHtml).join("<br/>");
+    const state = warning
+      ? `<span class="cleanup-recovery-warning"><b>Recuperable con confirmación · RCS aún activo</b><br/>Se permite únicamente cierre local manual. Esta acción no detiene el robot ni cancela la tarea en RCS.</span>`
+      : (selectable ? "Recuperable mediante cierre local" : escapeHtml(reason));
+    return `<tr class="${selectable ? "" : "diagnosis-row-disabled"}"><td>${checkbox}</td><td>${escapeHtml(row?.rack_code ?? row?.rack_id ?? "-")}</td><td>${escapeHtml(row?.order_id ?? "-")}</td><td>${escapeHtml(row?.order_status ?? "-")}</td><td>${escapeHtml(row?.rcs_status ?? "Sin dato")}</td><td>${ages}</td><td>${escapeHtml(reason)}</td><td>${state}</td></tr>`;
+  }).join("");
+  diagnosisOldActiveRacks.innerHTML = `<table class="diagnosis-table"><thead><tr><th></th><th>Rack</th><th>Orden</th><th>Estado local</th><th>RCS</th><th>Edades</th><th>Motivo</th><th>Recuperación</th></tr></thead><tbody>${body}</tbody></table>`;
 }
 
 function getSelectedCleanupIds() {
@@ -2995,15 +3110,7 @@ function renderCleanupDiagnosis(data = {}) {
     { key: "order_status", label: "Status orden" },
     { key: "rcs_status", label: "RCS" },
   ], { type: "rack", section: "inconsistent-rack", idKey: "rack_id" });
-  renderSelectableDiagnosisTable(diagnosisOldActiveRacks, data.old_active_racks, [
-    { key: "rack_id", label: "Rack ID" },
-    { key: "rack_code", label: "Rack" },
-    { key: "order_id", label: "Orden ID" },
-    { key: "order_status", label: "Status orden" },
-    { key: "rcs_status", label: "RCS status" },
-    { key: "age_minutes", label: "Edad (min)" },
-    { key: "motivo", label: "Motivo" },
-  ], { type: "rack", section: "old-active-rack", idKey: "rack_id", emptyText: "Sin racks bloqueados por órdenes activas viejas." });
+  renderOldActiveRecoveryRows(data.old_active_racks);
   renderSelectableDiagnosisTable(diagnosisStuckCancelRecoverable, data.stuck_cancel_recoverable, [
     { key: "order_id", label: "Orden ID" },
     { key: "rack_id", label: "Rack ID" },
@@ -3012,15 +3119,33 @@ function renderCleanupDiagnosis(data = {}) {
     { key: "motivo_detectado", label: "Motivo" },
     { key: "safe_recovery", label: "safe_recovery" },
   ], { type: "rack", section: "old-active-rack", idKey: "rack_id", emptyText: "Sin cancelaciones atoradas recuperables." });
-  renderDiagnosisTable(diagnosisInconsistentLocations, data.inconsistent_locations, [
+  const locationIssueLabels = {
+    occupied_without_rack: "Ocupada sin rack",
+    free_with_rack: "Libre con rack",
+    rack_reference_missing: "Referencia de rack inexistente",
+    multiple_locations_same_rack: "Rack asociado a varias Locations",
+  };
+  const inconsistentLocationRows = (data.inconsistent_locations || []).map(row => ({
+    ...row,
+    issue_label: locationIssueLabels[row?.issue_code] || row?.issue_code || "Inconsistencia",
+    blocking_text: Array.isArray(row?.blocking_reasons) && row.blocking_reasons.length ? row.blocking_reasons.join(" · ") : "Sin bloqueos",
+    warning_text: Array.isArray(row?.operational_warnings) && row.operational_warnings.length ? row.operational_warnings.join(" · ") : "-",
+    repair_label: row?.safe_to_repair === true ? "Marcar como libre" : "Revisión manual",
+  }));
+  renderSelectableDiagnosisTable(diagnosisInconsistentLocations, inconsistentLocationRows, [
     { key: "location_id", label: "Location ID" },
+    { key: "code", label: "Código" },
+    { key: "area_name", label: "Área" },
     { key: "x", label: "X" },
     { key: "y", label: "Y" },
     { key: "status", label: "Status" },
     { key: "rack_id", label: "Rack ID" },
-    { key: "rack_code", label: "Rack" },
+    { key: "issue_label", label: "Tipo" },
     { key: "reason", label: "Motivo" },
-  ]);
+    { key: "blocking_text", label: "Bloqueos" },
+    { key: "warning_text", label: "Advertencias" },
+    { key: "repair_label", label: "Reparación" },
+  ], { type: "location", section: "inconsistent-location", idKey: "location_id", safeKey: "safe_to_repair" });
   renderIntegrityCheck(diagnosisIntegrityCheck, data.integrity_check);
   setCleanupActionButtonsDisabled(false);
 }
@@ -3121,25 +3246,78 @@ async function resolveSelectedInconsistentRacks() {
   }
 }
 
-async function forceReleaseSelectedOldActiveRacks() {
+function updateForceReleaseConfirmState() {
+  if (btnConfirmForceRelease) btnConfirmForceRelease.disabled = !(forceReleasePhysicalConfirm?.checked && forceReleaseReason?.value.trim());
+}
+
+function closeForceReleaseConfirmModal() {
+  forceReleaseConfirmModal?.classList.add("hidden");
+  if (forceReleaseConfirmMsg) forceReleaseConfirmMsg.textContent = "";
+}
+
+function openForceReleaseConfirmModal() {
   if (!adminToken) throw new Error("Admin bloqueado.");
   const rackIds = [...new Set(getSelectedOldActiveRackIds())];
   if (!rackIds.length) throw new Error("Selecciona al menos un rack seguro para recuperación avanzada.");
-  const confirmed = window.confirm("Esta acción cerrará localmente órdenes activas viejas y liberará sus racks SOLO en el despacho local. No cancela tareas dentro del RCS. Úsese únicamente si confirmaste que la tarea ya no existe o quedó atascada. ¿Continuar?");
-  if (!confirmed) return;
+  if (forceReleasePhysicalConfirm) forceReleasePhysicalConfirm.checked = false;
+  if (forceReleaseReason) forceReleaseReason.value = "";
+  updateForceReleaseConfirmState();
+  forceReleaseConfirmModal?.classList.remove("hidden");
+}
+
+async function forceReleaseSelectedOldActiveRacks() {
+  const rackIds = [...new Set(getSelectedOldActiveRackIds())];
+  const reason = forceReleaseReason?.value.trim() || "";
+  if (!rackIds.length) throw new Error("La selección ya no está disponible. Vuelve a seleccionar el rack.");
+  if (!forceReleasePhysicalConfirm?.checked || !reason) throw new Error("La confirmación física y el motivo son obligatorios.");
   if (cleanupDiagnosisMsg) cleanupDiagnosisMsg.textContent = "Ejecutando recuperación avanzada...";
   if (btnRefreshCleanupDiagnosis) btnRefreshCleanupDiagnosis.disabled = true;
   setCleanupActionButtonsDisabled(true);
   try {
-    const result = await fetchJson(API.adminForceReleaseOldActiveRacks, { method: "POST", headers: { "Content-Type": "application/json", ...fetchHeaders() }, body: JSON.stringify({ rack_ids: rackIds }) });
+    const result = await fetchJson(API.adminForceReleaseOldActiveRacks, { method: "POST", headers: { "Content-Type": "application/json", ...fetchHeaders() }, body: JSON.stringify({ rack_ids: rackIds, confirm_local_only: true, reason }) });
+    closeForceReleaseConfirmModal();
+    document.querySelectorAll('[data-cleanup-section="old-active-rack"]:checked').forEach(input => { input.checked = false; });
     await loadCleanupDiagnosis();
     const closed = Array.isArray(result?.closed_orders) ? result.closed_orders.length : 0;
     const racks = Array.isArray(result?.released_racks) ? result.released_racks.length : 0;
     const skipped = Array.isArray(result?.skipped) ? result.skipped.length : 0;
     const skippedText = skipped ? ` Omitidos: ${skipped}. ${result.skipped.map(row => row.reason || "").filter(Boolean).join(" | ")}` : " Omitidos: 0.";
-    if (cleanupDiagnosisMsg) cleanupDiagnosisMsg.textContent = `Recuperación avanzada terminada. Órdenes cerradas localmente: ${closed}. Racks liberados: ${racks}.${skippedText}`;
+    if (cleanupDiagnosisMsg) cleanupDiagnosisMsg.textContent = `Se cerraron localmente ${closed} órdenes y se liberaron ${racks} racks.${skippedText}`;
     await Promise.all([loadMovementOrders(), loadCatalog(), loadLocations()]);
     draw();
+  } finally {
+    if (btnRefreshCleanupDiagnosis) btnRefreshCleanupDiagnosis.disabled = false;
+    setCleanupActionButtonsDisabled(false);
+  }
+}
+
+async function repairSelectedInconsistentLocations() {
+  if (!adminToken) throw new Error("Admin bloqueado.");
+  const locationIds = [...document.querySelectorAll('[data-cleanup-section="inconsistent-location"]:checked')]
+    .map(input => Number(input.dataset.cleanupId || 0)).filter(Boolean);
+  if (!locationIds.length) throw new Error("Selecciona al menos una Location segura.");
+  const confirmed = window.confirm(
+    `Se repararán únicamente ${new Set(locationIds).size} inconsistencias que el servidor confirme como seguras. ` +
+    "Solo se cambiará el estado de la celda a libre; no se moverán racks ni se cambiarán materiales. ¿Continuar?"
+  );
+  if (!confirmed) return;
+  if (cleanupDiagnosisMsg) cleanupDiagnosisMsg.textContent = "Revalidando y reparando Locations seleccionadas...";
+  setCleanupActionButtonsDisabled(true);
+  if (btnRefreshCleanupDiagnosis) btnRefreshCleanupDiagnosis.disabled = true;
+  try {
+  const result = await fetchJson(API.adminRepairInconsistentLocations, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...fetchHeaders() },
+    body: JSON.stringify({ location_ids: [...new Set(locationIds)], repair_mode: "safe", reason: "Corrección desde Diagnóstico y limpieza" }),
+  });
+  const repaired = Array.isArray(result?.repaired) ? result.repaired.length : 0;
+  const skippedRows = Array.isArray(result?.skipped) ? result.skipped : [];
+  await Promise.all([loadCleanupDiagnosis(), loadMovementOrders(null, true), loadLocations()]);
+  draw();
+  const skippedDetail = skippedRows.length
+    ? ` Omitidas: ${skippedRows.length}. ${skippedRows.map(row => `Location ${row.location_id}: ${row.reason || "sin motivo"}`).join(" | ")}`
+    : " Omitidas: 0.";
+  if (cleanupDiagnosisMsg) cleanupDiagnosisMsg.textContent = `Locations reparadas: ${repaired}.${skippedDetail}`;
   } finally {
     if (btnRefreshCleanupDiagnosis) btnRefreshCleanupDiagnosis.disabled = false;
     setCleanupActionButtonsDisabled(false);
@@ -3501,7 +3679,7 @@ function setAdminUI(enabled) {
     "podPositionRack", "btnQueryPodPosition", "rcsPodPositionEndpoint", "rcsRackSyncQueryEndpoint", "rcsRackSyncBindEndpoint", "rcsRackSyncScheduleEnabled", "rcsRackSyncScheduleTime", "btnRackSyncPreview", "btnRackSyncQuery", "btnRackSyncBind", "btnRackSyncHistory",
     "operatorButtonIndex", "operatorButtonActive", "operatorButtonLabel", "operatorButtonColor", "operatorButtonMode", "operatorButtonPriority", "operatorButtonSourceArea", "operatorButtonDestinationArea", "operatorButtonPointDestinationArea", "operatorButtonMaterial", "operatorButtonSourceCell", "operatorButtonDestinationCell", "btnOperatorButtonPickSource", "btnOperatorButtonPickDestination", "operatorButtonAgv", "operatorButtonTaskTyp", "operatorButtonComment", "btnSaveOperatorButton", "btnAddOperatorPointField",
     "btnRefreshScanTerminals",
-    "qrTransitionName", "qrTransitionDescription", "qrTransitionScope", "qrTransitionMatchMode", "qrTransitionIgnoreCurrentMaterial", "qrTransitionSourceMatchMode", "qrTransitionQrRule", "qrTransitionScanner", "qrTransitionSourceArea", "qrTransitionDestinationArea", "qrTransitionSourceCell", "qrTransitionDestinationCell", "qrTransitionCurrentMaterial", "qrTransitionCurrentRackStatus", "qrTransitionNextMaterial", "qrTransitionNextRackStatus", "qrTransitionNextQuantity", "qrTransitionClearQuantity", "qrTransitionNextComment", "qrTransitionAppendComment", "qrTransitionApplyOn", "qrTransitionPriority", "qrTransitionActive", "btnSaveQrTransitionRule", "btnNewQrTransitionRule", "btnDisableQrTransitionRule", "qrTransitionPreviewOrderId", "btnPreviewQrTransition", "btnApplyQrTransition", "btnRefreshQrTransitionLogs"
+    "qrTransitionName", "qrTransitionDescription", "qrTransitionScope", "qrTransitionMatchMode", "qrTransitionIgnoreCurrentMaterial", "qrTransitionSourceMatchMode", "qrTransitionQrRule", "qrTransitionScanner", "qrTransitionSourceArea", "qrTransitionDestinationArea", "qrTransitionSourceCell", "qrTransitionDestinationCell", "qrTransitionCurrentMaterial", "qrTransitionCurrentRackStatus", "qrTransitionNextMaterial", "qrTransitionNextRackStatus", "qrTransitionNextQuantity", "qrTransitionClearQuantity", "qrTransitionNextComment", "qrTransitionAppendComment", "qrTransitionApplyOn", "qrTransitionPriority", "qrTransitionActive", "btnSaveQrTransitionRule", "btnNewQrTransitionRule", "btnDisableQrTransitionRule", "qrTransitionPreviewOrderId", "btnPreviewQrTransition", "btnApplyQrTransition", "btnRefreshQrTransitionLogs", "qrTransitionHistoryToggle", "btnOpenQrTransitionHistory", "btnRefreshQrTransitionLogsModal"
   ]);
 
   const disabledPlaceholderIds = new Set([
@@ -3542,6 +3720,12 @@ function setAdminUI(enabled) {
   updateAddFreeCellAvailability();
   updateRackSyncButtons();
   syncRouteModeSections();
+  updateQrAdminRecordState("scanner", selectedQrAdminRow("scanner"));
+  updateQrAdminRecordState("qr", selectedQrAdminRow("qr"));
+  updateQrAdminRecordState("terminal", selectedQrAdminRow("terminal"));
+  updateQrAdminRecordState("transition", selectedQrAdminRow("transition"));
+  updateCatalogRecordState("area", adminAreas.find(row => Number(row.id) === Number(areaId?.value || 0)) || null);
+  updateCatalogRecordState("material", adminMaterials.find(row => Number(row.id) === Number(materialId?.value || 0)) || null);
 }
 function applyAgvOverlayConfigFromGrid(cfg = {}) {
   agvOverlayConfig.scale_x = Number(cfg.agv_overlay_scale_x ?? 1) || 1;
@@ -3602,10 +3786,24 @@ async function loadCatalog() {
   renderMaterialOptions();
   renderRackOptions();
   renderPodPositionRackOptions();
+  if (adminToken) await loadAdminAreaMaterialRecords();
+  else {
+    adminAreas = [...(catalog.areas || [])];
+    adminMaterials = [...(catalog.materials || [])];
+  }
   renderAreaList();
   renderMaterialList();
   renderRackList();
   renderQrCatalogOptions();
+}
+async function loadAdminAreaMaterialRecords() {
+  if (!adminToken) return;
+  const areaSuffix = showDeletedAreas?.checked ? "?include_inactive=true" : "";
+  const materialSuffix = showDeletedMaterials?.checked ? "?include_inactive=true" : "";
+  [adminAreas, adminMaterials] = await Promise.all([
+    fetchJson(`${API.adminAreas}${areaSuffix}`, { headers: fetchHeaders() }),
+    fetchJson(`${API.adminMaterials}${materialSuffix}`, { headers: fetchHeaders() }),
+  ]);
 }
 
 function applyRuntimeSnapshotData(snapshot, preferredOrderId = null, options = {}) {
@@ -3744,11 +3942,11 @@ function renderAreaList(renderOptions = {}) {
     deferAdminRefresh();
     return;
   }
-  areasList.innerHTML = catalog.areas.map(a => `<button type="button" class="list-item" data-kind="area" data-id="${a.id}"><span class="swatch" style="background:${a.color}"></span><b>${a.code}</b> ${a.name}<small>${a.area_type} · prioridad ${a.priority} · Matter Area: ${escapeHtml(a.matter_area || '-')}</small></button>`).join("") || `<div class="small">Sin áreas capturadas.</div>`;
+  areasList.innerHTML = adminAreas.map(a => `<button type="button" class="list-item ${Number(a.is_active ?? 0) === 1 ? "" : "qr-deleted-row"}" data-kind="area" data-id="${a.id}"><span class="swatch" style="background:${a.color}"></span><b>${escapeHtml(a.code)}</b> ${escapeHtml(a.name)} ${Number(a.is_active ?? 0) === 1 ? "" : '<span class="qr-deleted-badge">Eliminado</span>'}<small>${escapeHtml(a.area_type)} · prioridad ${a.priority} · Matter Area: ${escapeHtml(a.matter_area || '-')}</small></button>`).join("") || `<div class="small">Sin áreas capturadas.</div>`;
   areasList.querySelectorAll("[data-kind='area']").forEach(btn => btn.addEventListener("click", () => loadAreaForm(Number(btn.dataset.id))));
 }
 function renderMaterialList() {
-  materialsList.innerHTML = catalog.materials.map(m => `<button type="button" class="list-item" data-kind="material" data-id="${m.id}"><span class="swatch" style="background:${escapeHtml(m.color || "#7c3aed")}"></span><b>${m.code}</b> ${m.name}<small>${m.is_active ? "activo" : "inactivo"}</small></button>`).join("") || `<div class="small">Sin materiales capturados.</div>`;
+  materialsList.innerHTML = adminMaterials.map(m => `<button type="button" class="list-item ${Number(m.is_active ?? 0) === 1 ? "" : "qr-deleted-row"}" data-kind="material" data-id="${m.id}"><span class="swatch" style="background:${escapeHtml(m.color || "#7c3aed")}"></span><b>${escapeHtml(m.code)}</b> ${escapeHtml(m.name)} ${Number(m.is_active ?? 0) === 1 ? "" : '<span class="qr-deleted-badge">Eliminado</span>'}<small>${Number(m.is_active ?? 0) === 1 ? "activo" : "eliminado"}</small></button>`).join("") || `<div class="small">Sin materiales capturados.</div>`;
   materialsList.querySelectorAll("[data-kind='material']").forEach(btn => btn.addEventListener("click", () => loadMaterialForm(Number(btn.dataset.id))));
 }
 function renderRackList() {
@@ -3881,6 +4079,25 @@ function moveFifoChainNode(target, node) {
   if (!target || !node || target.contains(node)) return;
   target.appendChild(node);
 }
+function fifoChainTaskTypValue(owner, step) {
+  const ids = FIFO_CHAIN_DOM_IDS[owner]?.[step] || {};
+  return String($(ids.taskTyp)?.value || "").trim();
+}
+function setFifoChainTaskTypValue(owner, step, value) {
+  const ids = FIFO_CHAIN_DOM_IDS[owner]?.[step] || {};
+  const el = $(ids.taskTyp);
+  if (el) el.value = String(value || "");
+}
+function resetFifoChainTaskTypControls(owner) {
+  for (let step = 1; step <= 5; step += 1) setFifoChainTaskTypValue(owner, step, "");
+}
+function ensureTaskTypGlobalHelp(inputEl) {
+  if (!inputEl || inputEl.parentElement?.querySelector("[data-task-typ-global-help]")) return;
+  inputEl.insertAdjacentHTML(
+    "afterend",
+    `<div class="small" data-task-typ-global-help>En fifo_chain, este Task type se usa como respaldo si un tramo no tiene Task type propio.</div>`
+  );
+}
 function removeEmptyFifoChainRows(scope) {
   if (!scope) return;
   scope.querySelectorAll(".row").forEach((row) => {
@@ -3904,10 +4121,14 @@ function organizeFifoChainStepUi(owner, step) {
     <div class="qr-fifo-chain-panel" data-fifo-chain-destination-panel="${owner}_step${step}">
       <div class="qr-fifo-chain-panel-title">DESTINO</div>
     </div>
+    <div class="qr-fifo-chain-panel" data-fifo-chain-task-typ-panel="${owner}_step${step}">
+      <div class="qr-fifo-chain-panel-title">TASK TYPE</div>
+    </div>
   `;
   title.insertAdjacentElement("afterend", layout);
   const originPanel = layout.querySelector(`[data-fifo-chain-origin-panel="${owner}_step${step}"]`);
   const destinationPanel = layout.querySelector(`[data-fifo-chain-destination-panel="${owner}_step${step}"]`);
+  const taskTypPanel = layout.querySelector(`[data-fifo-chain-task-typ-panel="${owner}_step${step}"]`);
   moveFifoChainNode(originPanel, $(ids.sourceMode)?.parentElement);
   moveFifoChainNode(originPanel, $(ids.material)?.parentElement);
   moveFifoChainNode(originPanel, document.querySelector(`[data-fifo-chain-source${step}="${owner}"]`));
@@ -3918,6 +4139,7 @@ function organizeFifoChainStepUi(owner, step) {
   moveFifoChainNode(destinationPanel, $(ids.destinationArea)?.parentElement);
   moveFifoChainNode(destinationPanel, $(ids.destinationCell)?.parentElement);
   moveFifoChainNode(destinationPanel, document.querySelector(`[data-fifo-chain-destination-selected="${owner}_step${step}"]`));
+  moveFifoChainNode(taskTypPanel, $(ids.taskTyp)?.parentElement);
   const scope = layout.parentElement;
   removeEmptyFifoChainRows(scope);
 }
@@ -3927,12 +4149,24 @@ function organizeFifoChainUi() {
   });
 }
 function ensureFifoChainFlexibleUi() {
+  ensureTaskTypGlobalHelp(scannerTaskTyp);
+  ensureTaskTypGlobalHelp(qrTaskTyp);
   ["scanner", "qr"].forEach((owner) => {
     for (let step = 1; step <= 5; step += 1) {
       const ids = FIFO_CHAIN_DOM_IDS[owner]?.[step];
       const sourceMode = $(ids?.sourceMode);
       if (sourceMode && !sourceMode.querySelector('option[value="selected_areas_by_material"]')) {
         sourceMode.insertAdjacentHTML("beforeend", `<option value="selected_areas_by_material">&Aacute;reas seleccionadas por material</option>`);
+      }
+      const material = $(ids?.material);
+      if (material && ids?.taskTyp && !$(ids.taskTyp)) {
+        material.parentElement?.insertAdjacentHTML("afterend", `
+          <div class="hidden" data-fifo-chain-task-typ="${owner}_step${step}">
+            <label>Task type tramo ${step}</label>
+            <input disabled id="${ids.taskTyp}" maxlength="64" type="text" />
+            <div class="small">Si se deja vac&iacute;o, usar&aacute; el Task type global o el del Scanner/Perfil.</div>
+          </div>
+        `);
       }
       const note = document.querySelector(`[data-fifo-chain-global-note="${owner}_step${step}"]`);
       if (note && !$(fifoChainAreaSelectId(owner, step, "source"))) {
@@ -4012,6 +4246,8 @@ function scannerCancelReturnAreaFromScanner(scanner) {
   return null;
 }
 function scannerCancelReturnAreaListSummary(scanner) {
+  const mode = String(scanner?.cancel_return_mode || "configured_area").trim() || "configured_area";
+  if (mode === "current_step_source") return `<small><b>Cancelar/devolver:</b> Origen del tramo actual: Matter Area del area origen real</small>`;
   const areaId = scanner?.cancel_return_area_id;
   if (!areaId) return `<small><b>Area de devolucion:</b> Sin configurar</small>`;
   const area = scannerCancelReturnAreaFromScanner(scanner);
@@ -4026,6 +4262,13 @@ function scannerCancelReturnAreaListSummary(scanner) {
 }
 function renderScannerCancelReturnAreaWarning(scanner = null) {
   if (!scannerCancelReturnAreaWarning) return;
+  const mode = String(scannerCancelReturnMode?.value || "configured_area").trim() || "configured_area";
+  if (scannerCancelReturnArea) scannerCancelReturnArea.disabled = !adminToken || mode === "current_step_source";
+  if (mode === "current_step_source") {
+    scannerCancelReturnAreaWarning.classList.remove("hidden", "warn");
+    scannerCancelReturnAreaWarning.innerHTML = `<div>Se usara automaticamente el Matter Area del area origen real de la orden/tramo que se esta cancelando.</div>`;
+    return;
+  }
   const areaId = scannerCancelReturnArea?.value ? Number(scannerCancelReturnArea.value) : null;
   if (!areaId) {
     scannerCancelReturnAreaWarning.classList.add("hidden");
@@ -4214,6 +4457,13 @@ function fifoChainStep5MaterialDisplay(item) {
   if (item?.fifo_chain_step5_material_group_id) return `Material ID ${item.fifo_chain_step5_material_group_id}`;
   return "-";
 }
+function fifoChainTaskTypSummary(item) {
+  if (normalizeRouteMode(item?.route_mode) !== "fifo_chain") return "-";
+  for (let step = 1; step <= normalizeFifoChainTotalSteps(item?.fifo_chain_total_steps); step += 1) {
+    if (String(item?.[`fifo_chain_step${step}_task_typ`] || "").trim()) return "Task type por tramo configurado";
+  }
+  return "Usa fallback global";
+}
 function syncFifoMaterialPolicyHelp() {
   const anyQr = normalizeFifoMaterialPolicy(qrFifoMaterialPolicy?.value) === "any_available_from_source" && (qrActionType?.value || "") === "fifo_request";
   if (qrFifoMaterialPolicyHelp) qrFifoMaterialPolicyHelp.classList.toggle("hidden", !anyQr);
@@ -4251,6 +4501,8 @@ function syncFifoChainUi(owner, routeMode, totalSteps, step1SourceMode, step2Sou
       document.querySelectorAll(`[data-fifo-chain-source-selected="${owner}_step${step}"]`).forEach(el => el.classList.add("hidden"));
       document.querySelectorAll(`[data-fifo-chain-destination-selected="${owner}_step${step}"]`).forEach(el => el.classList.add("hidden"));
       document.querySelectorAll(`[data-fifo-chain-global-note="${owner}_step${step}"]`).forEach(el => el.classList.add("hidden"));
+      document.querySelectorAll(`[data-fifo-chain-task-typ="${owner}_step${step}"]`).forEach(el => el.classList.add("hidden"));
+      setFifoChainTaskTypValue(owner, step, "");
       continue;
     }
     const sourceMode = normalizeFifoChainSourceMode(sourceModes[step]);
@@ -4262,6 +4514,12 @@ function syncFifoChainUi(owner, routeMode, totalSteps, step1SourceMode, step2Sou
     const usesConfiguredDestination = hasStep && destinationMode === "configured_area";
     const usesSelectedDestination = hasStep && destinationMode === "selected_areas_with_space";
     document.querySelectorAll(`[data-fifo-chain-flex-step="${owner}_step${step}"]`).forEach(el => el.classList.toggle("hidden", !hasStep));
+    document.querySelectorAll(`[data-fifo-chain-task-typ="${owner}_step${step}"]`).forEach(el => el.classList.toggle("hidden", !hasStep));
+    const taskTypEl = $(ids.taskTyp);
+    if (taskTypEl) {
+      taskTypEl.disabled = !hasStep || !adminToken;
+      if (!hasStep) taskTypEl.value = "";
+    }
     document.querySelectorAll(`[data-fifo-chain-source${step}="${owner}"]`).forEach(el => el.classList.toggle("hidden", usesFlexibleSource));
     document.querySelectorAll(`[data-fifo-chain-global-note="${owner}_step${step}"]`).forEach(el => {
       el.classList.toggle("hidden", !usesAnySource);
@@ -4331,10 +4589,13 @@ function addFifoChainFlexiblePayload(owner, payload) {
     const ids = FIFO_CHAIN_DOM_IDS[owner]?.[step] || {};
     const sourceMode = normalizeFifoChainSourceMode($(ids.sourceMode)?.value);
     const destinationMode = normalizeFifoChainDestinationMode($(fifoChainDestinationModeId(owner, step))?.value);
+    const taskTyp = fifoChainTaskTypValue(owner, step);
+    if (taskTyp.length > 64) throw new Error(`El Task type del tramo ${step} no debe exceder 64 caracteres.`);
     payload[`fifo_chain_step${step}_source_mode`] = sourceMode;
     payload[`fifo_chain_step${step}_source_area_ids_json`] = sourceMode === "selected_areas_by_material" ? selectedFifoChainAreaIds(owner, step, "source") : null;
     payload[`fifo_chain_step${step}_destination_mode`] = destinationMode;
     payload[`fifo_chain_step${step}_destination_area_ids_json`] = destinationMode === "selected_areas_with_space" ? selectedFifoChainAreaIds(owner, step, "destination") : null;
+    payload[`fifo_chain_step${step}_task_typ`] = taskTyp || null;
     if (sourceMode !== "configured_area") {
       payload[fields.sourceArea] = null;
       payload[fields.sourceCell] = null;
@@ -4346,6 +4607,7 @@ function addFifoChainFlexiblePayload(owner, payload) {
   }
 }
 function resetFifoChainFlexibleControls(owner) {
+  resetFifoChainTaskTypControls(owner);
   for (let step = 1; step <= 5; step += 1) {
     const destinationMode = $(fifoChainDestinationModeId(owner, step));
     if (destinationMode) destinationMode.value = "configured_area";
@@ -4355,6 +4617,7 @@ function resetFifoChainFlexibleControls(owner) {
 }
 function loadFifoChainFlexibleControls(owner, item = {}) {
   for (let step = 1; step <= 5; step += 1) {
+    setFifoChainTaskTypValue(owner, step, item[`fifo_chain_step${step}_task_typ`] || "");
     const destinationMode = $(fifoChainDestinationModeId(owner, step));
     if (destinationMode) destinationMode.value = normalizeFifoChainDestinationMode(item[`fifo_chain_step${step}_destination_mode`]);
     setFifoChainAreaSelection(owner, step, "source", parseFifoChainAreaIds(item[`fifo_chain_step${step}_source_area_ids_json`]));
@@ -4365,6 +4628,7 @@ function clearInactiveFifoChainStep(payload, step) {
   const fields = FIFO_CHAIN_STEP_FIELDS[step];
   payload[`fifo_chain_step${step}_source_mode`] = "configured_area";
   payload[`fifo_chain_step${step}_material_group_id`] = null;
+  payload[`fifo_chain_step${step}_task_typ`] = null;
   payload[`fifo_chain_step${step}_source_area_ids_json`] = null;
   payload[`fifo_chain_step${step}_destination_mode`] = "configured_area";
   payload[`fifo_chain_step${step}_destination_area_ids_json`] = null;
@@ -4415,6 +4679,7 @@ function validateRouteConfig(prefix, payload) {
   const mode = normalizeRouteMode(payload.route_mode);
   payload.route_mode = mode;
   if (mode !== "fifo_chain") {
+    for (let step = 1; step <= 5; step += 1) payload[`fifo_chain_step${step}_task_typ`] = null;
     payload.fifo_chain_step5_source_mode = "configured_area";
     payload.fifo_chain_step5_material_group_id = null;
     payload.fifo_chain_step5_source_area_id = null;
@@ -4502,6 +4767,7 @@ function clearScannerStationForm() {
   if (scannerSecondDestinationCell) scannerSecondDestinationCell.value = "";
   scannerStorageArea.value = "";
   scannerEmptyRackArea.value = "";
+  if (scannerCancelReturnMode) scannerCancelReturnMode.value = "configured_area";
   if (scannerCancelReturnArea) {
     scannerCancelReturnArea.innerHTML = buildScannerCancelReturnAreaOptions("");
     scannerCancelReturnArea.value = "";
@@ -4538,9 +4804,11 @@ function clearScannerStationForm() {
   scannerPriority.value = 0;
   scannerRequirePreview.value = "0";
   scannerAllowExecute.value = "1";
+  if (scannerAllowSameCellMove) scannerAllowSameCellMove.checked = false;
   scannerActive.value = "1";
   renderQrCellSummaries();
   syncRouteModeSections();
+  updateQrAdminRecordState("scanner", null);
 }
 function loadScannerStationForm(id) {
   const item = scannerStations.find(x => Number(x.id) === Number(id));
@@ -4572,6 +4840,7 @@ function loadScannerStationForm(id) {
   syncRouteModeSections();
   scannerStorageArea.value = item.storage_area_id || "";
   scannerEmptyRackArea.value = item.empty_rack_area_id || "";
+  if (scannerCancelReturnMode) scannerCancelReturnMode.value = item.cancel_return_mode || "configured_area";
   if (scannerCancelReturnArea) {
     scannerCancelReturnArea.innerHTML = buildScannerCancelReturnAreaOptions(item.cancel_return_area_id || "", item);
     scannerCancelReturnArea.value = item.cancel_return_area_id || "";
@@ -4627,7 +4896,9 @@ function loadScannerStationForm(id) {
   scannerPriority.value = item.priority ?? 0;
   scannerRequirePreview.value = String(item.require_preview ?? 0);
   scannerAllowExecute.value = String(item.allow_execute ?? 1);
+  if (scannerAllowSameCellMove) scannerAllowSameCellMove.checked = !!item.allow_same_cell_move;
   scannerActive.value = String(item.is_active ?? 1);
+  updateQrAdminRecordState("scanner", item);
 }
 function scannerStationPayload() {
   const payload = {
@@ -4671,6 +4942,7 @@ function scannerStationPayload() {
     storage_area_id: scannerStorageArea.value ? Number(scannerStorageArea.value) : null,
     empty_rack_area_id: scannerEmptyRackArea.value ? Number(scannerEmptyRackArea.value) : null,
     cancel_return_area_id: scannerCancelReturnArea?.value ? Number(scannerCancelReturnArea.value) : null,
+    cancel_return_mode: scannerCancelReturnMode?.value || "configured_area",
     default_material_group_id: scannerDefaultMaterial.value ? Number(scannerDefaultMaterial.value) : null,
     fifo_material_policy: normalizeFifoMaterialPolicy(scannerFifoMaterialPolicy?.value),
     agv_code: scannerAgvCode.value.trim() || null,
@@ -4678,6 +4950,7 @@ function scannerStationPayload() {
     priority: Number(scannerPriority.value || 0),
     require_preview: Number(scannerRequirePreview.value || 0),
     allow_execute: Number(scannerAllowExecute.value || 0),
+    allow_same_cell_move: !!scannerAllowSameCellMove?.checked,
     is_active: Number(scannerActive.value || 0),
   };
   addFifoChainFlexiblePayload("scanner", payload);
@@ -4691,8 +4964,8 @@ function renderScannerStationsList() {
     return;
   }
   const rows = scannerStations.map(s => `
-    <tr class="clickable-row" data-scanner-id="${s.id}">
-      <td><b>${escapeHtml(s.scanner_code || "")}</b><div class="small">${escapeHtml(s.name || "")}</div></td>
+    <tr class="clickable-row ${Number(s.is_active ?? 0) ? "" : "qr-deleted-row"}" data-scanner-id="${s.id}">
+      <td><b>${escapeHtml(s.scanner_code || "")}</b><div class="small">${escapeHtml([s.name || "", s.allow_same_cell_move ? "Permite misma celda" : ""].filter(Boolean).join(" · "))}</div></td>
       <td>${escapeHtml(fifoChainFlowLabel(s))}</td>
       <td>${escapeHtml(routeEndpointLabel(s, "source"))}</td>
       <td>${escapeHtml(routeEndpointLabel(s, "destination"))}</td>
@@ -4709,16 +4982,17 @@ function renderScannerStationsList() {
       <td>${escapeHtml(fifoChainStep5EndpointLabel(s, "source"))}</td>
       <td>${escapeHtml(fifoChainStep5EndpointLabel(s, "destination"))}</td>
       <td>${escapeHtml(fifoChainStep5MaterialDisplayForList(s))}</td>
+      <td>${escapeHtml(fifoChainTaskTypSummary(s))}</td>
       <td>${escapeHtml(s.default_action || "-")}</td>
       <td>${escapeHtml(fifoMaterialPolicyLabel(s.fifo_material_policy))}</td>
-      <td>${Number(s.is_active ?? 0) ? "Activo" : "Inactivo"}</td>
+      <td>${Number(s.is_active ?? 0) ? "Activo" : '<span class="qr-deleted-badge">Eliminado</span>'}</td>
     </tr>`).join("");
-  scannerStationsList.innerHTML = `<table class="diagnosis-table qr-route-table"><thead><tr><th>C&oacute;digo scanner</th><th>Modo de ruta</th><th>Origen 1</th><th>Destino 1</th><th>Material tramo 1</th><th>Origen 2</th><th>Destino 2</th><th>Material tramo 2</th><th>Origen 3</th><th>Destino 3</th><th>Material tramo 3</th><th>Origen 4</th><th>Destino 4</th><th>Material tramo 4</th><th>Origen 5</th><th>Destino 5</th><th>Material tramo 5</th><th>Default action</th><th>Modo selecci&oacute;n</th><th>Activo</th></tr></thead><tbody>${rows}</tbody></table>`;
+  scannerStationsList.innerHTML = `<table class="diagnosis-table qr-route-table"><thead><tr><th>C&oacute;digo scanner</th><th>Modo de ruta</th><th>Origen 1</th><th>Destino 1</th><th>Material tramo 1</th><th>Origen 2</th><th>Destino 2</th><th>Material tramo 2</th><th>Origen 3</th><th>Destino 3</th><th>Material tramo 3</th><th>Origen 4</th><th>Destino 4</th><th>Material tramo 4</th><th>Origen 5</th><th>Destino 5</th><th>Material tramo 5</th><th>Task por tramo</th><th>Default action</th><th>Modo selecci&oacute;n</th><th>Activo</th></tr></thead><tbody>${rows}</tbody></table>`;
   scannerStationsList.querySelectorAll("[data-scanner-id]").forEach(btn => btn.addEventListener("click", () => loadScannerStationForm(Number(btn.dataset.scannerId))));
 }
 function buildScannerStationOptions(selectedValue = "") {
   const selectedText = String(selectedValue || "");
-  return `<option value="">Selecciona scanner</option>` + (scannerStations || []).map(s => {
+  return `<option value="">Selecciona scanner</option>` + (scannerStations || []).filter(s => Number(s.is_active ?? 0) === 1).map(s => {
     const inactive = Number(s.is_active ?? 0) === 1 ? "" : " - inactivo";
     const label = `${s.scanner_code || ""}${s.name ? ` - ${s.name}` : ""}${inactive}`;
     return `<option value="${s.id}" ${selectedText === String(s.id) ? "selected" : ""}>${escapeHtml(label)}</option>`;
@@ -4732,7 +5006,7 @@ function renderScanTerminalScannerOptions() {
 function renderQrTransitionScannerOptions() {
   if (!qrTransitionScanner) return;
   const cur = qrTransitionScanner.value;
-  qrTransitionScanner.innerHTML = `<option value="">Cualquier scanner</option>` + (scannerStations || []).map(s => {
+  qrTransitionScanner.innerHTML = `<option value="">Cualquier scanner</option>` + (scannerStations || []).filter(s => Number(s.is_active ?? 0) === 1).map(s => {
     const inactive = Number(s.is_active ?? 0) === 1 ? "" : " - inactivo";
     const label = `${s.scanner_code || ""}${s.name ? ` - ${s.name}` : ""}${inactive}`;
     return `<option value="${s.id}" ${String(cur) === String(s.id) ? "selected" : ""}>${escapeHtml(label)}</option>`;
@@ -4740,7 +5014,8 @@ function renderQrTransitionScannerOptions() {
 }
 async function loadScannerStations() {
   if (!adminToken) return;
-  scannerStations = await fetchJson(API.adminScannerStations, { headers: fetchHeaders() });
+  const suffix = showDeletedScannerStations?.checked ? "?include_inactive=true" : "";
+  scannerStations = await fetchJson(`${API.adminScannerStations}${suffix}`, { headers: fetchHeaders() });
   renderScannerStationsList();
   renderScanTerminalScannerOptions();
   renderQrTransitionScannerOptions();
@@ -4748,6 +5023,7 @@ async function loadScannerStations() {
 }
 async function saveScannerStation() {
   if (!adminToken) throw new Error("Admin bloqueado.");
+  if (selectedQrAdminRow("scanner") && Number(selectedQrAdminRow("scanner").is_active ?? 0) !== 1) throw new Error("No se puede editar un Scanner eliminado. Restáuralo primero.");
   const id = scannerStationId.value ? Number(scannerStationId.value) : null;
   const url = id ? API.adminScannerStation(id) : API.adminScannerStations;
   const method = id ? "PUT" : "POST";
@@ -4761,13 +5037,7 @@ async function saveScannerStation() {
   }
 }
 async function disableScannerStation() {
-  if (!adminToken) throw new Error("Admin bloqueado.");
-  const id = scannerStationId.value ? Number(scannerStationId.value) : null;
-  if (!id) throw new Error("Selecciona un scanner.");
-  const row = await fetchJson(API.adminScannerStation(id), { method: "DELETE", headers: fetchHeaders() });
-  await loadScannerStations();
-  loadScannerStationForm(row.id);
-  if (qrAdminMsg) qrAdminMsg.textContent = "Scanner desactivado.";
+  return openQrDeleteRestoreModal("scanner", "delete");
 }
 function clearQrRuleForm() {
   if (!qrRuleId) return;
@@ -4818,10 +5088,12 @@ function clearQrRuleForm() {
   qrAgvCode.value = "";
   qrTaskTyp.value = "";
   qrRequiresScanner.value = "1";
+  if (qrAllowSameCellMove) qrAllowSameCellMove.checked = false;
   qrActive.value = "1";
   renderQrCellSummaries();
   syncRouteModeSections();
   syncFifoMaterialPolicyHelp();
+  updateQrAdminRecordState("qr", null);
 }
 function loadQrRuleForm(id) {
   const item = qrActionRules.find(x => Number(x.id) === Number(id));
@@ -4901,8 +5173,10 @@ function loadQrRuleForm(id) {
   qrAgvCode.value = item.agv_code || "";
   qrTaskTyp.value = item.task_typ || "";
   qrRequiresScanner.value = String(item.requires_scanner_station ?? 1);
+  if (qrAllowSameCellMove) qrAllowSameCellMove.checked = !!item.allow_same_cell_move;
   qrActive.value = String(item.is_active ?? 1);
   syncFifoMaterialPolicyHelp();
+  updateQrAdminRecordState("qr", item);
 }
 function qrRulePayload() {
   const payload = {
@@ -4951,6 +5225,7 @@ function qrRulePayload() {
     task_typ: qrTaskTyp.value.trim() || null,
     agv_code: qrAgvCode.value.trim() || null,
     requires_scanner_station: Number(qrRequiresScanner.value || 0),
+    allow_same_cell_move: !!qrAllowSameCellMove?.checked,
     is_active: Number(qrActive.value || 0),
   };
   addFifoChainFlexiblePayload("qr", payload);
@@ -5109,6 +5384,7 @@ function renderQrRuleMetaHtml(q) {
     ["Modo seleccion", fifoMaterialPolicyLabel(q?.fifo_material_policy)],
     ["Rack", q?.rack_code || (q?.rack_id ? `Rack ID ${q.rack_id}` : "-")],
     ["Modo de ruta", fifoChainFlowLabel(q)],
+    ["Misma celda", q?.allow_same_cell_move ? "Permite misma celda" : "-"],
     ["Origen tramo 1", routeEndpointLabel(q, "source")],
     ["Material tramo 1", fifoChainStep1MaterialDisplay(q)],
     ["Destino 1", routeEndpointLabel(q, "destination")],
@@ -5230,7 +5506,7 @@ function renderQrRulesList() {
     return;
   }
   const rows = qrActionRules.map(q => `
-    <tr class="clickable-row" data-qr-rule-id="${q.id}" tabindex="0">
+    <tr class="clickable-row ${Number(q.is_active ?? 0) ? "" : "qr-deleted-row"}" data-qr-rule-id="${q.id}" tabindex="0">
       <td>
         <button type="button" class="qr-thumb-button" data-qr-preview-id="${q.id}" title="Ver QR ${escapeHtml(q.qr_value || "")}" aria-label="Ver QR ${escapeHtml(q.qr_value || "")}">
           <span class="qr-thumb-loading">QR</span>
@@ -5238,7 +5514,7 @@ function renderQrRulesList() {
           <span class="qr-thumb-error hidden">QR no disponible</span>
         </button>
       </td>
-      <td><b>${escapeHtml(q.qr_value || "")}</b><div class="small">${escapeHtml(q.qr_alias || "")}</div></td>
+      <td><b>${escapeHtml(q.qr_value || "")}</b><div class="small">${escapeHtml([q.qr_alias || "", q.allow_same_cell_move ? "Permite misma celda" : ""].filter(Boolean).join(" · "))}</div></td>
       <td>${escapeHtml(q.action_type || "-")}</td>
       <td>${escapeHtml(qrRuleMaterialDisplay(q))}</td>
       <td>${escapeHtml(fifoMaterialPolicyLabel(q.fifo_material_policy))}</td>
@@ -5260,9 +5536,10 @@ function renderQrRulesList() {
       <td>${escapeHtml(fifoChainStep5MaterialDisplayForList(q))}</td>
       <td>${escapeHtml(q.agv_code || "-")}</td>
       <td>${escapeHtml(q.task_typ || "-")}</td>
-      <td>${Number(q.is_active ?? 0) ? "Activo" : "Inactivo"}</td>
+      <td>${escapeHtml(fifoChainTaskTypSummary(q))}</td>
+      <td>${Number(q.is_active ?? 0) ? "Activo" : '<span class="qr-deleted-badge">Eliminado</span>'}</td>
     </tr>`).join("");
-  qrRulesList.innerHTML = `<table class="diagnosis-table qr-route-table"><thead><tr><th>QR le&iacute;do</th><th>Valor</th><th>Acci&oacute;n</th><th>Material</th><th>Modo selecci&oacute;n</th><th>Modo de ruta</th><th>Origen tramo 1</th><th>Destino 1</th><th>Material tramo 1</th><th>Origen 2</th><th>Destino 2</th><th>Material tramo 2</th><th>Origen 3</th><th>Destino 3</th><th>Material tramo 3</th><th>Origen 4</th><th>Destino 4</th><th>Material tramo 4</th><th>Origen 5</th><th>Destino 5</th><th>Material tramo 5</th><th>AGV</th><th>Task type</th><th>Activo</th></tr></thead><tbody>${rows}</tbody></table>`;
+  qrRulesList.innerHTML = `<table class="diagnosis-table qr-route-table"><thead><tr><th>QR le&iacute;do</th><th>Valor</th><th>Acci&oacute;n</th><th>Material</th><th>Modo selecci&oacute;n</th><th>Modo de ruta</th><th>Origen tramo 1</th><th>Destino 1</th><th>Material tramo 1</th><th>Origen 2</th><th>Destino 2</th><th>Material tramo 2</th><th>Origen 3</th><th>Destino 3</th><th>Material tramo 3</th><th>Origen 4</th><th>Destino 4</th><th>Material tramo 4</th><th>Origen 5</th><th>Destino 5</th><th>Material tramo 5</th><th>AGV</th><th>Task type global</th><th>Task por tramo</th><th>Activo</th></tr></thead><tbody>${rows}</tbody></table>`;
   qrRulesList.querySelectorAll("[data-qr-rule-id]").forEach(row => {
     row.addEventListener("click", (ev) => {
       if (ev.target.closest("[data-qr-preview-id]")) return;
@@ -5283,12 +5560,14 @@ function renderQrRulesList() {
 }
 async function loadQrActionRules() {
   if (!adminToken) return;
-  qrActionRules = await fetchJson(API.adminQrActionRules, { headers: fetchHeaders() });
+  const suffix = showDeletedQrRules?.checked ? "?include_inactive=true" : "";
+  qrActionRules = await fetchJson(`${API.adminQrActionRules}${suffix}`, { headers: fetchHeaders() });
   renderQrRulesList();
   renderQrTransitionQrOptions();
 }
 async function saveQrRule() {
   if (!adminToken) throw new Error("Admin bloqueado.");
+  if (selectedQrAdminRow("qr") && Number(selectedQrAdminRow("qr").is_active ?? 0) !== 1) throw new Error("No se puede editar un QR eliminado. Restáuralo primero.");
   const id = qrRuleId.value ? Number(qrRuleId.value) : null;
   const url = id ? API.adminQrActionRule(id) : API.adminQrActionRules;
   const method = id ? "PUT" : "POST";
@@ -5297,17 +5576,11 @@ async function saveQrRule() {
   if (qrAdminMsg) qrAdminMsg.textContent = "QR guardado.";
 }
 async function disableQrRule() {
-  if (!adminToken) throw new Error("Admin bloqueado.");
-  const id = qrRuleId.value ? Number(qrRuleId.value) : null;
-  if (!id) throw new Error("Selecciona un QR.");
-  const row = await fetchJson(API.adminQrActionRule(id), { method: "DELETE", headers: fetchHeaders() });
-  await loadQrActionRules();
-  loadQrRuleForm(row.id);
-  if (qrAdminMsg) qrAdminMsg.textContent = "QR desactivado.";
+  return openQrDeleteRestoreModal("qr", "delete");
 }
 function buildQrActionRuleOptions(selectedValue = "") {
   const selectedText = String(selectedValue || "");
-  return `<option value="">Cualquier QR</option>` + (qrActionRules || []).map(q => {
+  return `<option value="">Cualquier QR</option>` + (qrActionRules || []).filter(q => Number(q.is_active ?? 0) === 1).map(q => {
     const alias = q.qr_alias ? ` - ${q.qr_alias}` : "";
     const inactive = Number(q.is_active ?? 0) === 1 ? "" : " - inactivo";
     return `<option value="${q.id}" ${selectedText === String(q.id) ? "selected" : ""}>${escapeHtml((q.qr_value || "") + alias + inactive)}</option>`;
@@ -5329,6 +5602,9 @@ function normalizeQrTransitionSourceMatchMode(value) {
 }
 function qrTransitionSourceMatchModeLabel(value) {
   return normalizeQrTransitionSourceMatchMode(value) === "any_source" ? "Cualquier area" : "Origen configurado";
+}
+function qrTransitionTierLabel(value) {
+  return Number(value) === 0 ? "QR directo" : (Number(value) === 1 ? "Scanner directo" : "General");
 }
 function syncQrTransitionModeOptions({ applyDefaults = false } = {}) {
   const mode = qrTransitionMatchMode?.value || "advanced";
@@ -5384,6 +5660,7 @@ function clearQrTransitionRuleForm() {
   qrTransitionPriority.value = 0;
   qrTransitionActive.value = "1";
   syncQrTransitionModeOptions();
+  updateQrAdminRecordState("transition", null);
 }
 function loadQrTransitionRuleForm(id) {
   const item = qrTransitionRules.find(x => Number(x.id) === Number(id));
@@ -5417,6 +5694,7 @@ function loadQrTransitionRuleForm(id) {
   qrTransitionPriority.value = item.priority ?? 0;
   qrTransitionActive.value = String(item.is_active ?? 1);
   syncQrTransitionModeOptions();
+  updateQrAdminRecordState("transition", item);
 }
 function qrTransitionRulePayload() {
   const payload = {
@@ -5484,7 +5762,7 @@ function renderQrTransitionRulesList() {
     return;
   }
   const rows = qrTransitionRules.map(rule => `
-    <tr>
+    <tr class="${Number(rule.is_active ?? 0) ? "" : "qr-deleted-row"}">
       <td>${escapeHtml(rule.name || "-")}</td>
       <td>${escapeHtml(qrTransitionScopeLabel(rule.scope))}</td>
       <td>${escapeHtml(qrTransitionMatchModeLabel(rule.match_mode))}</td>
@@ -5497,37 +5775,51 @@ function renderQrTransitionRulesList() {
       <td>${escapeHtml(transitionLabel(rule.next_material_group_code, rule.next_material_group_name))}</td>
       <td>${Number(rule.ignore_current_material ?? 0) ? "Si" : "No"}</td>
       <td>${escapeHtml(rule.priority ?? 0)}</td>
-      <td>${Number(rule.is_active ?? 0) ? "Si" : "No"}</td>
+      <td>${Number(rule.is_active ?? 0) ? "Sí" : '<span class="qr-deleted-badge">Eliminado</span>'}</td>
       <td>${escapeHtml(rule.applied_count ?? 0)}</td>
       <td>${escapeHtml(rule.last_applied_at ? (toLocalInputValue(rule.last_applied_at).replace("T", " ") || rule.last_applied_at) : "-")}</td>
-      <td><button class="btn ghost small-btn" type="button" data-qr-transition-edit="${rule.id}">Editar</button></td>
+      <td><button class="btn ghost small-btn" type="button" data-qr-transition-edit="${rule.id}">${Number(rule.is_active ?? 0) ? "Editar" : "Ver"}</button></td>
     </tr>`).join("");
   qrTransitionRulesList.innerHTML = `<table class="diagnosis-table"><thead><tr><th>Nombre</th><th>Alcance</th><th>Modo</th><th>Origen de transici&oacute;n</th><th>QR asociado</th><th>Scanner</th><th>Origen</th><th>Destino</th><th>Material actual</th><th>Material siguiente</th><th>Ignorar material actual</th><th>Prioridad</th><th>Activo</th><th>Applied count</th><th>Last applied</th><th>Acciones</th></tr></thead><tbody>${rows}</tbody></table>`;
   qrTransitionRulesList.querySelectorAll("[data-qr-transition-edit]").forEach(btn => btn.addEventListener("click", () => loadQrTransitionRuleForm(Number(btn.dataset.qrTransitionEdit))));
 }
 async function loadQrTransitionRules() {
   if (!adminToken) return;
-  qrTransitionRules = await fetchJson(API.adminQrTransitionRules, { headers: fetchHeaders() });
+  const suffix = showDeletedQrTransitions?.checked ? "?include_inactive=true" : "";
+  qrTransitionRules = await fetchJson(`${API.adminQrTransitionRules}${suffix}`, { headers: fetchHeaders() });
   renderQrTransitionRulesList();
 }
 async function saveQrTransitionRule() {
   if (!adminToken) throw new Error("Admin bloqueado.");
+  if (selectedQrAdminRow("transition") && Number(selectedQrAdminRow("transition").is_active ?? 0) !== 1) throw new Error("No se puede editar una Transición eliminada. Restáurala primero.");
   const id = qrTransitionRuleId.value ? Number(qrTransitionRuleId.value) : null;
+  const payload = qrTransitionRulePayload();
+  const diagnostic = await fetchJson(API.adminQrTransitionRuleValidate, { method: "POST", headers: { "Content-Type": "application/json", ...fetchHeaders() }, body: JSON.stringify({ ...payload, rule_id: id }) });
+  renderQrTransitionValidation(diagnostic);
+  if (!diagnostic.valid) throw new Error(diagnostic.blocking_conflicts?.[0]?.reason || "La transición tiene conflictos.");
   const url = id ? API.adminQrTransitionRule(id) : API.adminQrTransitionRules;
   const method = id ? "PUT" : "POST";
-  await fetchJson(url, { method, headers: { "Content-Type": "application/json", ...fetchHeaders() }, body: JSON.stringify(qrTransitionRulePayload()) });
+  await fetchJson(url, { method, headers: { "Content-Type": "application/json", ...fetchHeaders() }, body: JSON.stringify(payload) });
   await loadQrTransitionRules();
   if (id) loadQrTransitionRuleForm(id);
   if (qrAdminMsg) qrAdminMsg.textContent = "Transicion guardada.";
 }
+function renderQrTransitionValidation(data) {
+  if (!qrTransitionValidationResult) return;
+  if (!data) {
+    qrTransitionValidationResult.textContent = "Sin validar.";
+    return;
+  }
+  const blockers = data.blocking_conflicts || [];
+  const warnings = data.warnings || [];
+  qrTransitionValidationResult.innerHTML = [
+    `<b>${data.valid ? "Validación correcta" : "Validación bloqueada"}</b>`,
+    ...blockers.map(item => `<div>${escapeHtml(item.code)}: ${escapeHtml(item.reason || "Conflicto")}${item.rule_id ? ` (regla ${escapeHtml(item.rule_id)})` : ""}</div>`),
+    ...warnings.map(item => `<div>Advertencia ${escapeHtml(item.code)}: ${escapeHtml(item.reason || "Solapamiento")}${item.rule_id ? ` (regla ${escapeHtml(item.rule_id)})` : ""}${item.selection_reason ? `; desempate: ${escapeHtml(item.selection_reason)}` : ""}</div>`),
+  ].join("");
+}
 async function disableQrTransitionRule() {
-  if (!adminToken) throw new Error("Admin bloqueado.");
-  const id = qrTransitionRuleId.value ? Number(qrTransitionRuleId.value) : null;
-  if (!id) throw new Error("Selecciona una transicion.");
-  const row = await fetchJson(API.adminQrTransitionRule(id), { method: "DELETE", headers: fetchHeaders() });
-  await loadQrTransitionRules();
-  loadQrTransitionRuleForm(row.id);
-  if (qrAdminMsg) qrAdminMsg.textContent = "Transicion desactivada.";
+  return openQrDeleteRestoreModal("transition", "delete");
 }
 function renderQrTransitionPreview(data) {
   if (!qrTransitionPreviewResult) return;
@@ -5537,6 +5829,7 @@ function renderQrTransitionPreview(data) {
   }
   const rack = data.rack || {};
   const rule = data.matched_rule || null;
+  const matched = data.matched_rules || [];
   const simpleRuleMessage = rule?.match_mode === "route_simple" ? "Regla simple por origen/destino encontrada." : "";
   const anySourceMessage = normalizeQrTransitionSourceMatchMode(rule?.source_match_mode) === "any_source"
     ? "Regla desde cualquier area encontrada."
@@ -5546,6 +5839,9 @@ function renderQrTransitionPreview(data) {
     <div><b>Rack:</b> ${escapeHtml(transitionLabel(rack.code, rack.name))}</div>
     <div><b>Material actual:</b> ${escapeHtml(transitionLabel(data.current_material?.code, data.current_material?.name))}</div>
     <div><b>Regla encontrada:</b> ${escapeHtml(rule ? transitionLabel(rule.id, rule.name) : "No hay transicion configurada para esta orden.")}</div>
+    <div><b>Nivel:</b> ${escapeHtml(data.selected_match_tier == null ? "-" : qrTransitionTierLabel(data.selected_match_tier))}</div>
+    <div><b>Prioridad:</b> ${escapeHtml(rule?.priority ?? "-")}</div>
+    <div><b>Especificidad:</b> ${escapeHtml(rule ? (matched.find(item => Number(item.id) === Number(rule.id))?.specificity ?? "-") : "-")}</div>
     ${simpleRuleMessage ? `<div><b>${escapeHtml(simpleRuleMessage)}</b></div>` : ""}
     ${anySourceMessage ? `<div><b>${escapeHtml(anySourceMessage)}</b></div>` : ""}
     <div><b>Alcance:</b> ${escapeHtml(rule ? qrTransitionScopeLabel(rule.scope) : "-")}</div>
@@ -5554,6 +5850,8 @@ function renderQrTransitionPreview(data) {
     <div><b>Ignorar material actual:</b> ${escapeHtml(rule ? (Number(rule.ignore_current_material ?? 0) ? "Si" : "No") : "-")}</div>
     <div><b>Material siguiente:</b> ${escapeHtml(transitionLabel(data.next_material?.code, data.next_material?.name))}</div>
     <div><b>Candidatas:</b> ${escapeHtml(data.candidate_count ?? 0)}</div>
+    <div><b>Reglas coincidentes:</b> ${matched.length ? matched.map(item => `${escapeHtml(item.id)} - ${escapeHtml(item.name || "-")} (prioridad ${escapeHtml(item.priority ?? 0)}, especificidad ${escapeHtml(item.specificity ?? 0)})`).join("<br>") : "-"}</div>
+    <div><b>Ganadora:</b> ${escapeHtml(data.selected_rule_id || "-")} — ${escapeHtml(data.selection_reason || "-")}</div>
     <div><b>Mensaje:</b> ${escapeHtml(data.message || "-")}</div>
   `;
 }
@@ -5565,29 +5863,162 @@ async function previewQrTransition() {
   renderQrTransitionPreview(data);
   if (qrAdminMsg) qrAdminMsg.textContent = "Preview de transicion generado. No se modifico ningun dato.";
 }
-function renderQrTransitionLogs() {
-  if (!qrTransitionLogsList) return;
-  if (!qrTransitionLogs.length) {
-    qrTransitionLogsList.innerHTML = `<div class="small">Sin historial de transiciones.</div>`;
-    return;
-  }
-  const rows = qrTransitionLogs.map(log => `
-    <tr>
-      <td>${escapeHtml(log.created_at ? (toLocalInputValue(log.created_at).replace("T", " ") || log.created_at) : "-")}</td>
+function normalizeTransitionHistoryResult(log) {
+  const raw = String(log?.status || "").trim().toLowerCase();
+  const normalized = raw.replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+  if (["applied", "success", "completed", "qr_transition_applied"].includes(normalized)) return "applied";
+  if (["skipped", "not_matched", "no_match", "qr_transition_skipped"].includes(normalized)) return "skipped";
+  if (["error", "failed", "apply_error", "qr_transition_error"].includes(normalized)) return "error";
+  if (["ambiguous", "transition_ambiguous", "qr_transition_conflict"].includes(normalized)) return "ambiguous";
+  return "unknown";
+}
+function getFilteredQrTransitionHistoryRows() {
+  const includes = (value, query) => !query || String(value || "").toLowerCase().includes(String(query).toLowerCase());
+  const rows = qrTransitionLogs.filter(log => {
+    const result = normalizeTransitionHistoryResult(log);
+    const scannerText = [log.origin_scanner_code, log.origin_scanner_name, log.scanner_code, log.scanner_name, log.rule_scanner_code, log.rule_scanner_name].join(" ");
+    const searchable = [log.order_code, log.movement_order_id, log.remote_task_code, log.rack_code, log.rack_id, log.transition_rule_name, log.transition_rule_id, log.qr_value, log.qr_alias, scannerText, log.execution_id, log.message].join(" ");
+    return (!qrTransitionHistoryFilters.status || result === qrTransitionHistoryFilters.status)
+      && (!qrTransitionHistoryFilters.rule || String(log.transition_rule_id || "") === qrTransitionHistoryFilters.rule)
+      && includes(`${log.movement_order_id || ""} ${log.order_code || ""} ${log.remote_task_code || ""}`, qrTransitionHistoryFilters.order)
+      && includes(`${log.rack_id || ""} ${log.rack_code || ""}`, qrTransitionHistoryFilters.rack)
+      && includes(log.qr_value, qrTransitionHistoryFilters.qr)
+      && includes(scannerText, qrTransitionHistoryFilters.scanner)
+      && includes(log.execution_id, qrTransitionHistoryFilters.execution)
+      && includes(searchable, qrTransitionHistoryFilters.search);
+  });
+  return rows.slice(0, Number(qrTransitionHistoryFilters.limit || 200));
+}
+function qrTransitionHistorySummaryHtml() {
+  const counts = { applied: 0, skipped: 0, error: 0, ambiguous: 0 };
+  qrTransitionLogs.forEach(log => { const key = normalizeTransitionHistoryResult(log); if (key in counts) counts[key] += 1; });
+  const badge = (key, label) => `<button aria-label="Filtrar por ${label.toLowerCase()}" class="qr-history-badge ${key}${qrTransitionHistoryFilters.status === key ? " active" : ""}" data-qr-history-result="${key}" type="button">${label}: ${counts[key]}</button>`;
+  return badge("applied", "Aplicadas") + badge("skipped", "Omitidas") + badge("error", "Errores") + badge("ambiguous", "Ambiguas");
+}
+function syncQrTransitionHistoryControls() {
+  const ruleOptions = [...new Map(qrTransitionLogs.filter(log => log.transition_rule_id).map(log => [String(log.transition_rule_id), transitionLabel(log.transition_rule_id, log.transition_rule_name)])).entries()];
+  document.querySelectorAll('[data-qr-history-filter="rule"]').forEach(el => {
+    el.innerHTML = `<option value="">Todas</option>` + ruleOptions.map(([id, label]) => `<option value="${escapeHtml(id)}">${escapeHtml(label)}</option>`).join("");
+  });
+  document.querySelectorAll("[data-qr-history-filter]").forEach(el => { el.value = qrTransitionHistoryFilters[el.dataset.qrHistoryFilter] ?? ""; });
+}
+function qrTransitionHistoryRowsHtml(rows, wide = false) {
+  return rows.map(log => {
+    const result = normalizeTransitionHistoryResult(log);
+    const message = log.message || "-";
+    if (!wide) return `<tr>
+      <td class="qr-history-nowrap">${escapeHtml(log.created_at ? (toLocalInputValue(log.created_at).replace("T", " ") || log.created_at) : "No disponible")}</td>
       <td>${escapeHtml(transitionLabel(log.transition_rule_id, log.transition_rule_name))}</td>
-      <td>${escapeHtml(transitionLabel(log.movement_order_id, log.order_code))}</td>
-      <td>${escapeHtml(transitionLabel(log.rack_code, log.rack_id))}</td>
-      <td>${escapeHtml(transitionLabel(log.previous_material_group_name, log.previous_material_group_id))}</td>
-      <td>${escapeHtml(transitionLabel(log.next_material_group_name, log.next_material_group_id))}</td>
-      <td>${escapeHtml(log.status || "-")}</td>
-      <td>${escapeHtml(log.message || "-")}</td>
-    </tr>`).join("");
-  qrTransitionLogsList.innerHTML = `<table class="diagnosis-table"><thead><tr><th>Fecha</th><th>Regla</th><th>Orden</th><th>Rack</th><th>Material anterior</th><th>Material nuevo</th><th>Status</th><th>Mensaje</th></tr></thead><tbody>${rows}</tbody></table>`;
+      <td class="qr-history-nowrap">${escapeHtml(transitionLabel(log.movement_order_id, log.order_code))}</td>
+      <td class="qr-history-nowrap">${escapeHtml(transitionLabel(log.rack_code, log.rack_id))}</td>
+      <td>${escapeHtml(transitionLabel(log.previous_material_group_name, log.previous_material_group_id))} &rarr; ${escapeHtml(transitionLabel(log.next_material_group_name, log.next_material_group_id))}</td>
+      <td><span class="qr-history-status ${escapeHtml(result)}">${escapeHtml(result)}</span></td>
+      <td class="qr-history-message" title="${escapeHtml(message)}">${escapeHtml(message)}</td>
+      <td><button class="btn ghost small-btn" data-qr-transition-log-detail="${log.id}" type="button">Ver detalle</button></td></tr>`;
+    return `<tr>
+      <td class="qr-history-nowrap">${escapeHtml(log.created_at ? (toLocalInputValue(log.created_at).replace("T", " ") || log.created_at) : "-")}</td>
+      <td title="${escapeHtml(transitionLabel(log.transition_rule_id, log.transition_rule_name))}">${escapeHtml(transitionLabel(log.transition_rule_id, log.transition_rule_name))}</td>
+      <td class="qr-history-nowrap">${escapeHtml(transitionLabel(log.movement_order_id, log.order_code))}</td>
+      <td>${escapeHtml(log.qr_value ?? "No disponible")}</td><td>${escapeHtml(log.origin_scanner_code ?? log.scanner_code ?? "No disponible")}</td>
+      <td class="qr-history-nowrap">${escapeHtml(transitionLabel(log.rack_code, log.rack_id))}</td>
+      <td title="${escapeHtml(transitionLabel(log.previous_material_group_name, log.previous_material_group_id))}">${escapeHtml(transitionLabel(log.previous_material_group_name, log.previous_material_group_id))}</td>
+      <td title="${escapeHtml(transitionLabel(log.next_material_group_name, log.next_material_group_id))}">${escapeHtml(transitionLabel(log.next_material_group_name, log.next_material_group_id))}</td>
+      <td><span class="qr-history-status ${escapeHtml(result)}">${escapeHtml(log.status || "-")}</span></td>
+      <td>${escapeHtml(result)}</td><td class="qr-history-message" title="${escapeHtml(message)}">${escapeHtml(message)}</td>
+      <td><button class="btn ghost small-btn" data-qr-transition-log-detail="${log.id}" type="button">Ver detalle</button></td>
+    </tr>`;
+  }).join("");
+}
+function showQrTransitionLogDetail(id) {
+  const log = qrTransitionLogs.find(item => Number(item.id) === Number(id));
+  if (!log || !qrTransitionHistoryDetail) return;
+  if (qrTransitionHistoryModal?.classList.contains("hidden")) openQrTransitionHistoryModal();
+  const fields = [
+    ["transition_log_id", log.id], ["transition_rule_id", log.transition_rule_id], ["movement_order_id", log.movement_order_id], ["movement_order_code", log.movement_order_code ?? log.order_code], ["taskCode remoto", log.remote_task_code], ["execution_id", log.execution_id], ["resultado", normalizeTransitionHistoryResult(log)],
+    ["QR capturado", log.qr_value], ["QR alias", log.qr_alias], ["qr_action_rule_id", log.qr_action_rule_id],
+    ["scanner de origen", [log.origin_scanner_code, log.origin_scanner_name].filter(Boolean).join(" - ") || null], ["scanner configurado en regla", [log.rule_scanner_code, log.rule_scanner_name].filter(Boolean).join(" - ") || null], ["terminal", log.terminal_code],
+    ["nivel de coincidencia", log.selected_match_tier == null ? null : `${qrTransitionTierLabel(log.selected_match_tier)} (${log.selected_match_tier})`], ["motivo de selección", log.selection_reason], ["prioridad", log.priority], ["especificidad", log.specificity], ["origen de especificidad", log.specificity_source],
+    ["coincidencia QR directa", log.direct_qr_match], ["coincidencia scanner directa", log.direct_scanner_match],
+    ["material anterior", transitionLabel(log.previous_material_group_name, log.previous_material_group_id)], ["material siguiente", transitionLabel(log.next_material_group_name, log.next_material_group_id)],
+    ["cantidad anterior", log.previous_quantity], ["cantidad siguiente", log.next_quantity], ["status anterior", log.previous_rack_status], ["status siguiente", log.next_rack_status],
+    ["comentario anterior", log.previous_comment], ["comentario siguiente", log.next_comment], ["message", log.message], ["created_at", log.created_at],
+  ];
+  qrTransitionHistoryDetail.innerHTML = `<div class="qr-transition-history-detail-header"><b>Detalle del registro ${escapeHtml(log.id)}</b><button class="btn ghost small-btn" data-close-qr-transition-detail type="button">Cerrar detalle</button></div><dl>${fields.map(([label, value]) => `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value ?? "No disponible")}</dd>`).join("")}</dl>`;
+  qrTransitionHistoryDetail.classList.remove("hidden");
+  qrTransitionHistoryDetail.querySelector("[data-close-qr-transition-detail]")?.addEventListener("click", () => qrTransitionHistoryDetail.classList.add("hidden"));
+}
+function bindQrTransitionHistoryDetailButtons(container) {
+  container?.querySelectorAll("[data-qr-transition-log-detail]").forEach(btn => btn.addEventListener("click", () => showQrTransitionLogDetail(Number(btn.dataset.qrTransitionLogDetail))));
+}
+function qrTransitionHistoryStateText(rows) {
+  const total = qrTransitionLogs.length;
+  if (qrTransitionLogsLoading) return "Cargando historial de transiciones…";
+  if (qrTransitionLogsError) return `No fue posible cargar el historial: ${qrTransitionLogsError}`;
+  if (!qrTransitionLogsLoaded) return "Expande para cargar el historial.";
+  if (!total) return "No hay registros de transiciones.";
+  if (!rows.length && qrTransitionHistoryFilters.status === "ambiguous") return `No hay transiciones ambiguas en los ${total} registros cargados.`;
+  if (!rows.length && qrTransitionHistoryFilters.status === "error") return `No hay errores de transición en los ${total} registros cargados.`;
+  if (!rows.length) return "No hay registros que coincidan con los filtros seleccionados.";
+  return `Mostrando ${rows.length} de ${total} registros.`;
+}
+function bindQrTransitionHistoryBadges() {
+  document.querySelectorAll("[data-qr-history-result]").forEach(btn => btn.addEventListener("click", () => {
+    qrTransitionHistoryFilters.status = btn.dataset.qrHistoryResult || "";
+    renderQrTransitionLogs();
+  }));
+}
+function renderQrTransitionLogs() {
+  const total = qrTransitionLogs.length;
+  if (qrTransitionHistoryCount) qrTransitionHistoryCount.textContent = String(total);
+  if (qrTransitionHistoryModalCount) qrTransitionHistoryModalCount.textContent = String(total);
+  const summary = qrTransitionHistorySummaryHtml();
+  if (qrTransitionHistorySummary) qrTransitionHistorySummary.innerHTML = summary;
+  if (qrTransitionHistoryModalSummary) qrTransitionHistoryModalSummary.innerHTML = summary;
+  syncQrTransitionHistoryControls();
+  bindQrTransitionHistoryBadges();
+  const rows = getFilteredQrTransitionHistoryRows();
+  const stateText = qrTransitionHistoryStateText(rows);
+  const showTable = qrTransitionLogsLoaded && !qrTransitionLogsLoading && !qrTransitionLogsError && rows.length > 0;
+  const targets = [
+    [qrTransitionLogsList, qrTransitionHistoryTableBody, qrTransitionHistoryState, false],
+    [qrTransitionHistoryModalList, qrTransitionHistoryModalTableBody, qrTransitionHistoryModalState, true],
+  ];
+  targets.forEach(([wrap, tbody, state, wide]) => {
+    if (!wrap || !tbody || !state) return;
+    tbody.innerHTML = showTable ? qrTransitionHistoryRowsHtml(rows, wide) : "";
+    wrap.classList.toggle("hidden", !showTable);
+    state.classList.remove("hidden");
+    state.classList.toggle("error", Boolean(qrTransitionLogsError));
+    state.textContent = stateText;
+    bindQrTransitionHistoryDetailButtons(tbody);
+  });
 }
 async function loadQrTransitionLogs() {
-  if (!adminToken) return;
-  qrTransitionLogs = await fetchJson(API.adminQrTransitionLogs, { headers: fetchHeaders() });
-  renderQrTransitionLogs();
+  if (!adminToken || qrTransitionLogsLoading) return;
+  qrTransitionLogsLoading = true; qrTransitionLogsError = ""; renderQrTransitionLogs();
+  try {
+    qrTransitionLogs = await fetchJson(API.adminQrTransitionLogs, { headers: fetchHeaders() });
+    qrTransitionLogsLoaded = true;
+  } catch (err) {
+    qrTransitionLogsError = String(err); throw err;
+  } finally {
+    qrTransitionLogsLoading = false; renderQrTransitionLogs();
+  }
+}
+function setQrTransitionHistoryExpanded(expanded) {
+  const next = Boolean(expanded);
+  qrTransitionHistoryToggle?.setAttribute("aria-expanded", String(next));
+  if (qrTransitionHistoryChevron) qrTransitionHistoryChevron.innerHTML = next ? "&#9660;" : "&#9654;";
+  qrTransitionHistoryContent?.classList.toggle("hidden", !next);
+  if (next && !qrTransitionLogsLoaded && !qrTransitionLogsLoading) loadQrTransitionLogs().catch(() => {});
+}
+function openQrTransitionHistoryModal() {
+  qrTransitionHistoryModal?.classList.remove("hidden"); qrTransitionHistoryModal?.setAttribute("aria-hidden", "false");
+  qrTransitionHistoryDetail?.classList.add("hidden"); renderQrTransitionLogs();
+  if (!qrTransitionLogsLoaded && !qrTransitionLogsLoading) loadQrTransitionLogs().catch(() => {});
+}
+function closeQrTransitionHistoryModal() {
+  qrTransitionHistoryModal?.classList.add("hidden"); qrTransitionHistoryModal?.setAttribute("aria-hidden", "true");
 }
 async function applyQrTransitionManual() {
   if (!adminToken) throw new Error("Admin bloqueado.");
@@ -5601,7 +6032,8 @@ async function applyQrTransitionManual() {
     candidate_count: "-",
     message: result.message || "-",
   });
-  await Promise.all([loadQrTransitionRules(), loadQrTransitionLogs()]);
+  await loadQrTransitionRules();
+  if (qrTransitionLogsLoaded) await loadQrTransitionLogs();
   if (qrAdminMsg) qrAdminMsg.textContent = result.message || "Aplicacion de transicion finalizada.";
 }
 function clearScanTerminalForm() {
@@ -5618,6 +6050,7 @@ function clearScanTerminalForm() {
   scanTerminalActive.value = "1";
   scanTerminalLastSeen.value = "-";
   scanTerminalLastIp.value = "-";
+  updateQrAdminRecordState("terminal", null);
 }
 function formatScanTerminalLastSeen(value) {
   return value ? (toLocalInputValue(value).replace("T", " ") || String(value)) : "-";
@@ -5638,6 +6071,7 @@ function loadScanTerminalForm(id) {
   scanTerminalActive.value = String(item.is_active ?? 1);
   scanTerminalLastSeen.value = formatScanTerminalLastSeen(item.last_seen_at);
   scanTerminalLastIp.value = item.last_ip || "-";
+  updateQrAdminRecordState("terminal", item);
 }
 function scanTerminalPayload() {
   return {
@@ -5655,16 +6089,17 @@ function scanTerminalPayload() {
 function renderScanTerminalsList() {
   if (!scanTerminalsList) return;
   scanTerminalsList.innerHTML = scanTerminals.map(t => `
-    <button type="button" class="list-item" data-scan-terminal-id="${t.id}">
-      <b>${escapeHtml(t.terminal_code || "")}</b> ${escapeHtml(t.name || "")}
-      <small>${escapeHtml(t.scanner_code || "sin scanner")} - ${escapeHtml(t.mode || "preview")} - ${Number(t.is_active ?? 0) ? "activo" : "inactivo"} - Last seen: ${escapeHtml(formatScanTerminalLastSeen(t.last_seen_at))} - Last IP: ${escapeHtml(t.last_ip || "-")}</small>
+    <button type="button" class="list-item ${Number(t.is_active ?? 0) ? "" : "qr-deleted-row"}" data-scan-terminal-id="${t.id}">
+      <b>${escapeHtml(t.terminal_code || "")}</b> ${escapeHtml(t.name || "")} ${Number(t.is_active ?? 0) ? "" : '<span class="qr-deleted-badge">Eliminado</span>'}
+      <small>${escapeHtml(t.scanner_code || "sin scanner")} - ${escapeHtml(t.mode || "preview")} - ${Number(t.is_active ?? 0) ? "activo" : "eliminado"} - Last seen: ${escapeHtml(formatScanTerminalLastSeen(t.last_seen_at))} - Last IP: ${escapeHtml(t.last_ip || "-")}</small>
     </button>`).join("") || `<div class="small">Sin terminales PDA configurados.</div>`;
   scanTerminalsList.querySelectorAll("[data-scan-terminal-id]").forEach(btn => btn.addEventListener("click", () => loadScanTerminalForm(Number(btn.dataset.scanTerminalId))));
 }
 async function loadScanTerminals() {
   if (!adminToken) return;
   const selectedId = scanTerminalId?.value || "";
-  scanTerminals = await fetchJson(API.adminScanTerminals, { headers: fetchHeaders() });
+  const suffix = showDeletedScanTerminals?.checked ? "?include_inactive=true" : "";
+  scanTerminals = await fetchJson(`${API.adminScanTerminals}${suffix}`, { headers: fetchHeaders() });
   renderScanTerminalsList();
   if (selectedId && scanTerminals.some(t => String(t.id) === String(selectedId))) {
     loadScanTerminalForm(Number(selectedId));
@@ -5672,6 +6107,7 @@ async function loadScanTerminals() {
 }
 async function saveScanTerminal() {
   if (!adminToken) throw new Error("Admin bloqueado.");
+  if (selectedQrAdminRow("terminal") && Number(selectedQrAdminRow("terminal").is_active ?? 0) !== 1) throw new Error("No se puede editar una Terminal eliminada. Restáurala primero.");
   const id = scanTerminalId.value ? Number(scanTerminalId.value) : null;
   const url = id ? API.adminScanTerminal(id) : API.adminScanTerminals;
   const method = id ? "PUT" : "POST";
@@ -5680,13 +6116,185 @@ async function saveScanTerminal() {
   if (qrAdminMsg) qrAdminMsg.textContent = "Terminal PDA guardado.";
 }
 async function disableScanTerminal() {
+  return openQrDeleteRestoreModal("terminal", "delete");
+}
+
+let qrDeleteRestoreContext = null;
+function qrAdminEntityConfig(type) {
+  const configs = {
+    material: { entity: "Material", gender: "eliminado", restored: "restaurado", idEl: materialId, rows: () => adminMaterials, panelId: "card-materials", stateEl: materialRecordState, saveBtn: btnSaveMaterial, deleteBtn: btnDeleteMaterial, restoreBtn: btnRestoreMaterial, baseUrl: API.adminMaterial, dependenciesUrl: API.adminMaterialDependencies, restoreUrl: API.adminMaterialRestore, label: row => row.code || row.name || row.id, clear: clearMaterialForm, load: loadMaterialForm, catalogType: "material" },
+    area: { entity: "Área", gender: "eliminada", restored: "restaurada", idEl: areaId, rows: () => adminAreas, panelId: "card-areas", stateEl: areaRecordState, saveBtn: btnSaveArea, deleteBtn: btnDeleteArea, restoreBtn: btnRestoreArea, baseUrl: API.adminArea, dependenciesUrl: API.adminAreaDependencies, restoreUrl: API.adminAreaRestore, label: row => row.code || row.name || row.id, clear: clearAreaForm, load: loadAreaForm, catalogType: "area" },
+    scanner: { entity: "Scanner", gender: "eliminado", restored: "restaurado", idEl: scannerStationId, rows: () => scannerStations, panelId: "qrPanelStations", stateEl: scannerRecordState, saveBtn: btnSaveScannerStation, deleteBtn: btnDisableScannerStation, restoreBtn: btnRestoreScannerStation, baseUrl: API.adminScannerStation, dependenciesUrl: API.adminScannerStationDependencies, restoreUrl: API.adminScannerStationRestore, label: row => row.scanner_code || row.name || row.id, clear: clearScannerStationForm, load: loadScannerStationForm, blockers: ["active_terminals", "active_transitions"] },
+    qr: { entity: "QR", gender: "eliminado", restored: "restaurado", idEl: qrRuleId, rows: () => qrActionRules, panelId: "qrPanelRules", stateEl: qrRuleRecordState, saveBtn: btnSaveQrRule, deleteBtn: btnDisableQrRule, restoreBtn: btnRestoreQrRule, baseUrl: API.adminQrActionRule, dependenciesUrl: API.adminQrActionRuleDependencies, restoreUrl: API.adminQrActionRuleRestore, label: row => row.qr_value || row.qr_alias || row.id, clear: clearQrRuleForm, load: loadQrRuleForm, blockers: ["active_transitions"] },
+    terminal: { entity: "Terminal", gender: "eliminada", restored: "restaurada", idEl: scanTerminalId, rows: () => scanTerminals, panelId: "qrPanelTerminals", stateEl: scanTerminalRecordState, saveBtn: btnSaveScanTerminal, deleteBtn: btnDisableScanTerminal, restoreBtn: btnRestoreScanTerminal, baseUrl: API.adminScanTerminal, dependenciesUrl: API.adminScanTerminalDependencies, restoreUrl: API.adminScanTerminalRestore, label: row => row.terminal_code || row.name || row.id, clear: clearScanTerminalForm, load: loadScanTerminalForm, blockers: [] },
+    transition: { entity: "Transición", gender: "eliminada", restored: "restaurada", idEl: qrTransitionRuleId, rows: () => qrTransitionRules, panelId: "qrPanelTransitions", stateEl: qrTransitionRecordState, saveBtn: btnSaveQrTransitionRule, deleteBtn: btnDisableQrTransitionRule, restoreBtn: btnRestoreQrTransitionRule, baseUrl: API.adminQrTransitionRule, dependenciesUrl: API.adminQrTransitionRuleDependencies, restoreUrl: API.adminQrTransitionRuleRestore, label: row => row.name || row.id, clear: clearQrTransitionRuleForm, load: loadQrTransitionRuleForm, blockers: [] },
+  };
+  return configs[type];
+}
+function selectedQrAdminRow(type) {
+  const config = qrAdminEntityConfig(type);
+  const id = Number(config?.idEl?.value || 0);
+  return id ? config.rows().find(row => Number(row.id) === id) || null : null;
+}
+function updateQrAdminRecordState(type, row) {
+  const config = qrAdminEntityConfig(type);
+  if (!config) return;
+  const persisted = !!row?.id;
+  const active = persisted && Number(row.is_active ?? 0) === 1;
+  const deleted = persisted && !active;
+  const panel = document.getElementById(config.panelId);
+  panel?.querySelectorAll("input, textarea, select").forEach(control => {
+    if (control === config.idEl || control.id?.startsWith("showDeleted")) return;
+    control.disabled = !adminToken || deleted;
+  });
+  if (config.stateEl) {
+    config.stateEl.textContent = deleted ? "Eliminado" : (active ? "Editando activo" : "Nuevo");
+    config.stateEl.classList.toggle("deleted", deleted);
+  }
+  if (config.saveBtn) config.saveBtn.disabled = !adminToken || deleted;
+  if (config.deleteBtn) config.deleteBtn.disabled = !adminToken || !active;
+  if (config.restoreBtn) {
+    config.restoreBtn.classList.toggle("hidden", !deleted);
+    config.restoreBtn.disabled = !adminToken || !deleted;
+  }
+}
+function qrDependencyHtml(dependencies = {}) {
+  const labels = { active_terminals: "Terminales activas", active_transitions: "Transiciones activas", scan_events: "Eventos históricos", movement_orders: "Órdenes relacionadas", transition_logs: "Logs históricos" };
+  const parts = [];
+  Object.entries(dependencies).forEach(([key, value]) => {
+    if (Array.isArray(value) && value.length) {
+      const items = value.map(item => `<li>${escapeHtml(item.code || item.name || item.id || "-")}</li>`).join("");
+      parts.push(`<div><b>${escapeHtml(labels[key] || key)}:</b><ul class="qr-dependency-list">${items}</ul></div>`);
+    } else if (!Array.isArray(value) && Number(value || 0) > 0) {
+      parts.push(`<div><b>${escapeHtml(labels[key] || key)}:</b> ${escapeHtml(value)}</div>`);
+    }
+  });
+  return parts.join("") || '<div class="small">Sin dependencias registradas.</div>';
+}
+const catalogDependencyLabels = {
+  racks: "Racks", qr_rules: "Reglas QR", scanners: "Scanners", transitions: "Transiciones",
+  active_orders: "Órdenes activas", operator_buttons: "Botones configurables", locations: "Locations habilitadas o visibles",
+  cancel_return_configs: "Configuraciones cancel_return_area", movement_orders: "Órdenes finalizadas",
+  scan_events: "Eventos históricos", transition_logs: "Logs de transición",
+};
+function catalogDependencyHtml(payload = {}, type = "material") {
+  const active = payload.active_dependencies || {};
+  const historical = payload.historical_references || {};
+  const activeParts = Object.entries(active).filter(([, rows]) => Array.isArray(rows) && rows.length).map(([key, rows]) => {
+    const items = rows.map(item => `<li>${escapeHtml(item.code || item.name || item.location || item.order_code || item.id || "-")}</li>`).join("");
+    return `<div><b>${escapeHtml(catalogDependencyLabels[key] || key)}:</b><ul class="qr-dependency-list">${items}</ul></div>`;
+  }).join("");
+  const historyParts = Object.entries(historical).filter(([, count]) => Number(count || 0) > 0).map(([key, count]) => `<li>${escapeHtml(catalogDependencyLabels[key] || key)}: ${Number(count)}</li>`).join("");
+  const locationWarning = type === "area" && Array.isArray(active.locations) && active.locations.length
+    ? "<p><b>No se puede eliminar el área porque todavía contiene Locations habilitadas o visibles. Deshabilita o archiva primero esas Locations.</b></p>" : "";
+  return `${locationWarning}<h4>Dependencias activas</h4>${activeParts || '<div class="small">Sin dependencias activas.</div>'}<h4>Referencias históricas</h4>${historyParts ? `<ul class="qr-dependency-list">${historyParts}</ul><p>Estas referencias no impiden eliminar la configuración.</p>` : '<div class="small">Sin referencias históricas.</div>'}`;
+}
+function closeQrDeleteRestoreModal() {
+  qrDeleteRestoreContext = null;
+  qrDeleteRestoreModal?.classList.add("hidden");
+  qrDeleteRestoreModal?.setAttribute("aria-hidden", "true");
+}
+async function openQrDeleteRestoreModal(type, action) {
   if (!adminToken) throw new Error("Admin bloqueado.");
-  const id = scanTerminalId.value ? Number(scanTerminalId.value) : null;
-  if (!id) throw new Error("Selecciona un terminal.");
-  const row = await fetchJson(API.adminScanTerminal(id), { method: "DELETE", headers: fetchHeaders() });
-  await loadScanTerminals();
-  loadScanTerminalForm(row.id);
-  if (qrAdminMsg) qrAdminMsg.textContent = "Terminal PDA desactivado.";
+  const config = qrAdminEntityConfig(type);
+  const row = selectedQrAdminRow(type);
+  if (!config || !row) throw new Error("Selecciona una configuración guardada.");
+  if (action === "delete" && Number(row.is_active ?? 0) !== 1) throw new Error("La configuración ya está eliminada.");
+  if (action === "restore" && Number(row.is_active ?? 0) === 1) throw new Error("La configuración ya está activa.");
+  const dependencies = action === "delete" ? await fetchJson(config.dependenciesUrl(row.id), { headers: fetchHeaders() }) : {};
+  const blocked = action === "delete" && (config.catalogType ? dependencies.can_delete === false : config.blockers.some(key => Array.isArray(dependencies[key]) && dependencies[key].length));
+  qrDeleteRestoreContext = { type, action, id: row.id, row, dependencies, blocked, busy: false };
+  qrDeleteRestoreTitle.textContent = action === "delete" ? `¿Eliminar ${config.entity} ${config.label(row)}?` : `¿Restaurar ${config.entity} ${config.label(row)}?`;
+  if (action === "delete") {
+    if (config.catalogType) {
+      const availability = config.catalogType === "material" ? "nuevas configuraciones y asignaciones" : "nuevas tareas y configuraciones";
+      qrDeleteRestoreBody.innerHTML = `${blocked ? '<p><b>No se puede eliminar mientras tenga dependencias activas.</b></p>' : ""}<p>${escapeHtml(config.entity)} dejará de estar disponible para ${availability}.</p>${catalogDependencyHtml(dependencies, config.catalogType)}<p>Esta acción realiza una eliminación lógica. Las órdenes, eventos y nombres históricos permanecerán.</p>`;
+    } else {
+      qrDeleteRestoreBody.innerHTML = `${blocked ? '<p><b>No se puede eliminar mientras tenga dependencias activas.</b></p>' : `<p>${escapeHtml(config.entity)} dejará de estar disponible para nuevos escaneos y configuraciones.</p>`}${qrDependencyHtml(dependencies)}<p>Esta acción desactiva la configuración. No elimina el historial ni los registros asociados.</p>${blocked ? '<p>Elimina o reasigna primero esas configuraciones.</p>' : ""}`;
+    }
+  } else {
+    const areaNote = config.catalogType === "area" ? "<p>Las Locations no se activarán automáticamente.</p>" : "";
+    qrDeleteRestoreBody.innerHTML = `<p>${escapeHtml(config.entity)} volverá a estar disponible para nuevas configuraciones y asignaciones.</p>${areaNote}<p>Las dependencias eliminadas no se restaurarán automáticamente.</p>`;
+  }
+  qrDeleteConfirmWrap?.classList.toggle("hidden", action !== "delete" || blocked);
+  if (qrDeleteConfirmCheck) { qrDeleteConfirmCheck.checked = false; qrDeleteConfirmCheck.disabled = blocked; }
+  qrDeleteRestoreError?.classList.add("hidden");
+  if (qrDeleteRestoreError) qrDeleteRestoreError.textContent = "";
+  btnConfirmQrDeleteRestore.textContent = action === "delete" ? "Eliminar configuración" : "Restaurar";
+  btnConfirmQrDeleteRestore.classList.toggle("danger", action === "delete");
+  btnConfirmQrDeleteRestore.disabled = blocked || action === "delete";
+  qrDeleteRestoreModal?.classList.remove("hidden");
+  qrDeleteRestoreModal?.setAttribute("aria-hidden", "false");
+  qrDeleteRestoreModal?.focus();
+}
+async function refreshQrAdminCatalogs() {
+  await Promise.all([loadScannerStations(), loadQrActionRules(), loadScanTerminals(), loadQrTransitionRules()]);
+  renderScanTerminalScannerOptions();
+  renderQrTransitionScannerOptions();
+  renderQrTransitionQrOptions();
+  renderScanQrScannerOptions();
+}
+async function refreshCatalogEntityDependents(type) {
+  await Promise.all([loadCatalog(), loadLocations()]);
+  if (adminToken) await refreshQrAdminCatalogs();
+  renderAreaOptions({ force: true });
+  renderMaterialOptions();
+  renderRackOptions({ force: true });
+  renderQrCatalogOptions();
+  draw();
+}
+function qrRestoreErrorMessage(context, error) {
+  const base = String(error?.message || error);
+  if (context.type === "terminal") {
+    const scanner = context.row?.scanner_code || context.row?.scanner_station_name || context.row?.scanner_station_id || "asociado";
+    return `No se puede restaurar la Terminal porque su Scanner está eliminado. Restaura primero el Scanner ${scanner}. ${base}`;
+  }
+  if (context.type === "transition") {
+    const dependencies = [
+      context.row?.scanner_station_code ? `Scanner: ${context.row.scanner_station_code}` : "",
+      context.row?.qr_action_rule_value ? `QR: ${context.row.qr_action_rule_value}` : "",
+    ].filter(Boolean).join(" · ");
+    return `No se puede restaurar la Transición porque depende de configuraciones eliminadas.${dependencies ? ` ${dependencies}.` : ""} ${base}`;
+  }
+  return base;
+}
+async function confirmQrDeleteRestore() {
+  const context = qrDeleteRestoreContext;
+  if (!context || context.busy || context.blocked) return;
+  if (context.action === "delete" && !qrDeleteConfirmCheck?.checked) return;
+  const config = qrAdminEntityConfig(context.type);
+  context.busy = true;
+  btnConfirmQrDeleteRestore.disabled = true;
+  btnConfirmQrDeleteRestore.textContent = context.action === "delete" ? "Eliminando…" : "Restaurando…";
+  try {
+    const result = await fetchJson(context.action === "delete" ? config.baseUrl(context.id) : config.restoreUrl(context.id), { method: context.action === "delete" ? "DELETE" : "POST", headers: fetchHeaders() });
+    closeQrDeleteRestoreModal();
+    config.clear();
+    if (config.catalogType) await refreshCatalogEntityDependents(config.catalogType);
+    else await refreshQrAdminCatalogs();
+    if (context.action === "restore") config.load(result.id);
+    const targetMsg = config.catalogType === "material" ? materialMsg : (config.catalogType === "area" ? areaMsg : qrAdminMsg);
+    if (targetMsg) targetMsg.textContent = context.action === "delete" ? `${config.entity} ${config.gender} correctamente. El historial se conservó.` : `${config.entity} ${config.restored} correctamente.`;
+  } catch (error) {
+    context.busy = false;
+    if (config.catalogType && error?.status === 409 && error?.detail && typeof error.detail === "object") {
+      context.dependencies = error.detail;
+      context.blocked = true;
+      qrDeleteRestoreBody.innerHTML = `<p><b>Las dependencias cambiaron y ya no se puede eliminar.</b></p>${catalogDependencyHtml(error.detail, config.catalogType)}<p>La selección y el formulario se conservaron.</p>`;
+      qrDeleteConfirmWrap?.classList.add("hidden");
+    }
+    if (config.catalogType && error?.status === 404) {
+      await loadCatalog().catch(() => {});
+    }
+    if (qrDeleteRestoreError) {
+      const permissionHint = [401, 403].includes(Number(error?.status)) ? " La sesión administrativa no es válida o no tiene permisos." : "";
+      const missingHint = Number(error?.status) === 404 ? " El registro ya no existe; se refrescó el catálogo." : "";
+      qrDeleteRestoreError.textContent = `${context.action === "restore" ? qrRestoreErrorMessage(context, error) : String(error?.message || error)}${permissionHint}${missingHint}`;
+      qrDeleteRestoreError.classList.remove("hidden");
+    }
+    btnConfirmQrDeleteRestore.disabled = context.blocked || (context.action === "delete" ? !qrDeleteConfirmCheck?.checked : false);
+    btnConfirmQrDeleteRestore.textContent = context.action === "delete" ? "Eliminar configuración" : "Restaurar";
+  }
 }
 function focusScanQrInput() {
   if (!scanQrValue) return;
@@ -5782,14 +6390,78 @@ function previewFifoChainDestinationLabel(step) {
   return `${entityLabel(step?.destination?.area, "") || "-"} / ${cellPayloadLabel(step?.destination?.cell)}`;
 }
 function operatorDiagnosisMessage(diagnosis) {
-  const reason = String(diagnosis?.reason || diagnosis?.code || "").trim();
+  const reason = String(diagnosis?.error_code || diagnosis?.reason || diagnosis?.code || "").trim();
   const map = {
     source_material_not_available_in_selected_areas: "No hay rack disponible con el material requerido dentro de las areas origen seleccionadas.",
     destination_space_not_available_in_selected_areas: "No hay celda libre en las areas destino seleccionadas.",
     destination_space_not_available_any_area: "No hay celda libre en ninguna area operativa.",
     invalid_selected_area_list: "La lista de areas seleccionadas esta vacia o contiene areas no disponibles.",
+    same_source_destination_cell: "La celda origen y destino no pueden ser la misma, salvo que se habilite Permitir origen y destino en la misma celda.",
+    same_area_no_free_destination_cell: "No hay otra celda destino libre en la misma area.",
   };
-  return map[reason] || diagnosis?.message || "";
+  return diagnosis?.operator_message || diagnosis?.failure_summary || map[reason] || diagnosis?.message || "";
+}
+function sameCellMoveMessageFromResult(result) {
+  if (!result) return "";
+  if (result.same_cell_move_message) return result.same_cell_move_message;
+  const projectionSteps = Array.isArray(result?.fifo_chain_projection?.steps) ? result.fifo_chain_projection.steps : [];
+  const checklistSteps = Array.isArray(result?.fifo_chain_preflight_checklist?.steps)
+    ? result.fifo_chain_preflight_checklist.steps
+    : (Array.isArray(result?.operator_diagnosis?.fifo_chain_preflight_checklist?.steps) ? result.operator_diagnosis.fifo_chain_preflight_checklist.steps : []);
+  const step = [...projectionSteps, ...checklistSteps].find(item => item?.same_cell_move || item?.same_cell_move_message);
+  if (step?.same_cell_move_message) return step.same_cell_move_message;
+  const sourceCell = result?.source?.cell?.code || result?.source?.cell?.cell_code;
+  const destinationCell = result?.destination?.cell?.code || result?.destination?.cell?.cell_code;
+  if (result.same_cell_move && sourceCell && destinationCell) {
+    return `Movimiento en la misma celda permitido por configuración: ${sourceCell} -> ${destinationCell}.`;
+  }
+  return "";
+}
+function sameCellBlockedSuggestion(result) {
+  const code = String(result?.error_code || result?.operator_diagnosis?.error_code || result?.operator_diagnosis?.reason || "").trim();
+  if (!["same_source_destination_cell", "same_area_no_free_destination_cell"].includes(code)) return "";
+  return "Habilita 'Permitir origen y destino en la misma celda' solo si este QR debe permitir KARA-01 -> KARA-01.";
+}
+function fifoChainChecklistStepMessage(step) {
+  const stepNumber = Number(step?.step || 0) || "-";
+  if (step?.ok === false) {
+    return step?.failure_summary || step?.summary || step?.message || `Tramo ${stepNumber} FALLÓ`;
+  }
+  const projectedMessage = step?.source_filled_by_previous_step_message;
+  if (step?.ok === true && (step?.same_cell_move || step?.same_cell_move_message)) {
+    return step.same_cell_move_message || "Movimiento en la misma celda permitido por configuración.";
+  }
+  if (step?.ok === true && projectedMessage) {
+    return projectedMessage;
+  }
+  const filled = step?.source_check?.filled_by_step;
+  if (step?.ok === true && filled) {
+    return `El origen será ocupado por el rack ${filled.rack_code || "-"} desde el tramo ${filled.step || "-"}.`;
+  }
+  return step?.summary || step?.message || `Tramo ${stepNumber} OK`;
+}
+function previewFifoChainChecklistRows(result) {
+  const checklist = result?.fifo_chain_preflight_checklist || result?.operator_diagnosis?.fifo_chain_preflight_checklist;
+  const steps = Array.isArray(checklist?.steps) ? checklist.steps : [];
+  if (!steps.length) return "";
+  return steps.map((step) => {
+    const stepNumber = Number(step?.step || 0) || "-";
+    const status = step?.ok === true ? "OK" : "FALLÓ";
+    const summary = fifoChainChecklistStepMessage(step);
+    const source = step?.source_check || {};
+    const destination = step?.destination_check || {};
+    const projectedOrigin = !!(step?.source_filled_by_previous_step || step?.source_filled_by_previous_step_message || source?.filled_by_step);
+    const details = [
+      projectedOrigin ? "Origen proyectado" : "",
+      source?.mode ? `Origen: ${source.mode}` : "",
+      source?.material ? `Material: ${source.material}` : "",
+      Array.isArray(source?.areas) && source.areas.length ? `Áreas origen: ${source.areas.join(", ")}` : "",
+      destination?.mode ? `Destino: ${destination.mode}` : "",
+      Array.isArray(destination?.areas) && destination.areas.length ? `Áreas destino: ${destination.areas.join(", ")}` : "",
+      step?.transition_preview ? `Transición: ${step.transition_preview}` : "",
+    ].filter(Boolean).join(" | ");
+    return previewDetailRow(`Checklist tramo ${stepNumber}`, `${status}: ${summary}${details ? ` (${details})` : ""}`);
+  }).join("");
 }
 function previewFifoChainStepsRows(result) {
   const steps = Array.isArray(result?.fifo_chain_steps) ? result.fifo_chain_steps.slice() : (Array.isArray(result?.trmx_steps) ? result.trmx_steps.slice() : []);
@@ -5798,6 +6470,7 @@ function previewFifoChainStepsRows(result) {
     steps.push({
       step: 3,
       source_mode: result?.fifo_chain_step3_source_mode,
+      task_typ: result?.fifo_chain_step3_task_typ,
       step3_material: result?.fifo_chain_step3_material,
       source: result?.fifo_chain_step3_source,
       destination: result?.fifo_chain_step3_destination,
@@ -5807,6 +6480,7 @@ function previewFifoChainStepsRows(result) {
     steps.push({
       step: 4,
       source_mode: result?.fifo_chain_step4_source_mode,
+      task_typ: result?.fifo_chain_step4_task_typ,
       step4_material: result?.fifo_chain_step4_material,
       source: result?.fifo_chain_step4_source,
       destination: result?.fifo_chain_step4_destination,
@@ -5816,6 +6490,7 @@ function previewFifoChainStepsRows(result) {
     steps.push({
       step: 5,
       source_mode: result?.fifo_chain_step5_source_mode,
+      task_typ: result?.fifo_chain_step5_task_typ,
       step5_material: result?.fifo_chain_step5_material,
       source: result?.fifo_chain_step5_source,
       destination: result?.fifo_chain_step5_destination,
@@ -5835,17 +6510,19 @@ function previewFifoChainStepsRows(result) {
     const stepNumber = Number(step?.step || 0);
     const rowLabel = `Tramo ${stepNumber || "-"}`;
     const row = previewDetailRow(rowLabel, `${source} -> ${destination}`);
+    const stepTaskTyp = String(step?.task_typ || result?.[`fifo_chain_step${stepNumber}_task_typ`] || "").trim();
+    const taskRow = previewDetailRow(`Task type tramo ${stepNumber || "-"}`, stepTaskTyp || "usando fallback/global");
     if (isGlobalStep1) {
       const rack = entityLabel(step?.source?.rack, "");
       const cell = cellPayloadLabel(step?.source?.cell);
       const candidate = rack || cell ? previewDetailRow("Candidato tramo 1", `${rack || "-"} / ${cell}`) : "";
-      return row + candidate + previewDetailRow("Nota tramo 1", "El rack del tramo 1 se seleccionara al ejecutar.");
+      return row + taskRow + candidate + previewDetailRow("Nota tramo 1", "El rack del tramo 1 se seleccionara al ejecutar.");
     }
-    if (isGlobalStep2) return row + previewDetailRow("Nota tramo 2", "El rack del tramo 2 se revalidara al finalizar el tramo 1.");
-    if (isGlobalStep3) return row + previewDetailRow("Nota tramo 3", "El rack del tramo 3 se revalidara al finalizar el tramo 2.");
-    if (isGlobalStep4) return row + previewDetailRow("Nota tramo 4", "El rack se revalidara al finalizar el tramo anterior.");
-    if (isGlobalStep5) return row + previewDetailRow("Nota tramo 5", "El rack se revalidara al finalizar el tramo anterior.");
-    return row;
+    if (isGlobalStep2) return row + taskRow + previewDetailRow("Nota tramo 2", "El rack del tramo 2 se revalidara al finalizar el tramo 1.");
+    if (isGlobalStep3) return row + taskRow + previewDetailRow("Nota tramo 3", "El rack del tramo 3 se revalidara al finalizar el tramo 2.");
+    if (isGlobalStep4) return row + taskRow + previewDetailRow("Nota tramo 4", "El rack se revalidara al finalizar el tramo anterior.");
+    if (isGlobalStep5) return row + taskRow + previewDetailRow("Nota tramo 5", "El rack se revalidara al finalizar el tramo anterior.");
+    return row + taskRow;
   }).join("");
 }
 function renderScanQrPreviewResult(result) {
@@ -5863,6 +6540,8 @@ function renderScanQrPreviewResult(result) {
       ${previewDetailRow("Status", ok ? "preview_ok" : "error")}
       ${previewDetailRow("Mensaje", result?.message || "-")}
       ${previewDetailRow("Diagnostico", operatorDiagnosisMessage(result?.operator_diagnosis || result?.diagnosis))}
+      ${previewDetailRow("Misma celda", sameCellMoveMessageFromResult(result))}
+      ${previewDetailRow("Sugerencia", sameCellBlockedSuggestion(result))}
       ${previewDetailRow("Accion", result?.action || "-")}
       ${previewDetailRow("Scanner", entityLabel(scanner))}
       ${previewDetailRow("QR leido", qr.qr_value || "-")}
@@ -5875,6 +6554,7 @@ function renderScanQrPreviewResult(result) {
       ${previewDetailRow("Destino", `${entityLabel(destination.area)} / ${cellPayloadLabel(destination.cell)}`)}
       ${previewRoutePointsRows(result)}
       ${previewFifoChainStepsRows(result)}
+      ${previewFifoChainChecklistRows(result)}
       ${previewDetailRow("Orden", result?.movement_order_id || result?.existing_movement_order_id || "-")}
       ${previewDetailRow("RCS", result?.dispatch_status || result?.rcs_status || result?.movement_order?.dispatch_status || "-")}
       ${previewDetailRow("Evento", result?.scan_event_id || "-")}
@@ -5986,7 +6666,7 @@ async function loadQrAdminData() {
   renderQrCatalogOptions();
   if (!adminToken) return;
   await loadScannerStations();
-  await Promise.all([loadQrActionRules(), loadScanTerminals(), loadScanEvents(), loadQrTransitionRules(), loadQrTransitionLogs()]);
+  await Promise.all([loadQrActionRules(), loadScanTerminals(), loadScanEvents(), loadQrTransitionRules()]);
 }
 function activateQrPanel(name) {
   document.querySelectorAll("#card-qr-scanners .qr-tab").forEach(btn => btn.classList.toggle("active", btn.dataset.qrTab === name));
@@ -6003,37 +6683,76 @@ function activateQrPanel(name) {
     renderQrTransitionScannerOptions();
     renderQrTransitionQrOptions();
     loadQrTransitionRules().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; });
-    loadQrTransitionLogs().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; });
+    renderQrTransitionLogs();
   }
 }
 
 function clearAreaForm() {
   finishEditingLock("areas", { applyPending: false });
   areaId.value = ""; areaCode.value = ""; areaName.value = ""; areaType.value = "almacen"; areaColor.value = "#4f46e5"; areaPriority.value = 0; areaActive.value = 1; if (areaMatterArea) areaMatterArea.value = ""; areaDescription.value = "";
+  updateCatalogRecordState("area", null);
 }
 function loadAreaForm(id) {
   finishEditingLock("areas", { applyPending: false });
-  const item = catalog.areas.find(a => Number(a.id) === Number(id));
+  const item = adminAreas.find(a => Number(a.id) === Number(id));
   if (!item) return;
   areaId.value = item.id; areaCode.value = item.code; areaName.value = item.name; areaType.value = item.area_type; areaColor.value = item.color || "#4f46e5"; areaPriority.value = item.priority ?? 0; areaActive.value = String(item.is_active ?? 1); if (areaMatterArea) areaMatterArea.value = item.matter_area || ""; areaDescription.value = item.description || "";
+  updateCatalogRecordState("area", item);
 }
 function clearMaterialForm() {
   materialId.value = ""; materialCode.value = ""; materialName.value = ""; materialColor.value = randomMaterialColor(); materialActive.value = 1; materialDescription.value = "";
+  updateCatalogRecordState("material", null);
 }
 function loadMaterialForm(id) {
-  const item = catalog.materials.find(m => Number(m.id) === Number(id));
+  const item = adminMaterials.find(m => Number(m.id) === Number(id));
   if (!item) return;
   materialId.value = item.id; materialCode.value = item.code; materialName.value = item.name; materialColor.value = item.color || randomMaterialColor(); materialActive.value = String(item.is_active ?? 1); materialDescription.value = item.description || "";
+  updateCatalogRecordState("material", item);
+}
+function catalogRecordConfig(type) {
+  return type === "area"
+    ? { inputs: [areaCode, areaName, areaType, areaColor, areaPriority, areaActive, areaMatterArea, areaDescription], state: areaRecordState, save: btnSaveArea, remove: btnDeleteArea, restore: btnRestoreArea }
+    : { inputs: [materialCode, materialName, materialColor, materialActive, materialDescription], state: materialRecordState, save: btnSaveMaterial, remove: btnDeleteMaterial, restore: btnRestoreMaterial };
+}
+function updateCatalogRecordState(type, row) {
+  const config = catalogRecordConfig(type);
+  const persisted = !!row?.id;
+  const active = persisted && Number(row.is_active ?? 0) === 1;
+  const deleted = persisted && !active;
+  config.inputs.filter(Boolean).forEach(control => { control.disabled = !adminToken || deleted; });
+  config.state.textContent = deleted ? "Eliminado" : (active ? "Editando activo" : "Nuevo");
+  config.state.classList.toggle("deleted", deleted);
+  config.save.disabled = !adminToken || deleted;
+  config.remove.disabled = !adminToken || !active;
+  config.restore.classList.toggle("hidden", !deleted);
+  config.restore.disabled = !adminToken || !deleted;
 }
 function clearRackForm() {
   const templateRows = getRackCustomFieldEditorRows();
   rackId.value = ""; rackCode.value = ""; rackName.value = ""; rackStatus.value = "disponible"; rackMaterial.value = ""; if (rackReservationState) rackReservationState.value = "0"; rackReservationOriginal = "0"; if (rackReservationTask) rackReservationTask.value = ""; rackLot.value = ""; rackQty.value = 0; rackMfgCode.value = ""; rackFifo.value = ""; rackMoved.value = ""; rackComment.value = ""; renderRackCustomFieldEditor(templateRows);
+  if (rackReservationState) rackReservationState.disabled = false;
+  rackActiveOrderWarning?.classList.add("hidden");
+  btnRackOpenCleanup?.classList.add("hidden");
 }
 function loadRackForm(id) {
   const item = catalog.racks.find(r => Number(r.id) === Number(id));
   if (!item) return;
   const reservation = getRackReservationSnapshot(item);
   rackId.value = item.id; rackCode.value = item.code; rackName.value = item.name || ""; rackStatus.value = item.status || "disponible"; rackMaterial.value = item.material_group_id || ""; if (rackReservationState) rackReservationState.value = isReservedState(reservation.reservation_status) ? "1" : "0"; rackReservationOriginal = rackReservationState ? String(rackReservationState.value || "0") : "0"; if (rackReservationTask) rackReservationTask.value = reservationTaskLabel(reservation); rackLot.value = item.lot || ""; rackQty.value = item.quantity || 0; rackMfgCode.value = item.manufacturer_code || ""; rackFifo.value = toLocalInputValue(item.fifo_entered_at); rackMoved.value = toLocalInputValue(item.last_moved_at); rackComment.value = item.comment || ""; renderRackCustomFieldEditor(item.custom_fields || []);
+  updateRackActiveOrderWarning();
+}
+
+function activeOrderForEditedRack() {
+  const id = Number(rackId?.value || 0);
+  return movementOrders.find(order => Number(order.rack_id) === id && ["pending_dispatch","dispatched","in_progress","cancel_requested_total","cancel_requested_undo","cancel_error"].includes(String(order.status || "").toLowerCase())) || null;
+}
+
+function updateRackActiveOrderWarning() {
+  const order = activeOrderForEditedRack();
+  rackActiveOrderWarning?.classList.toggle("hidden", !order);
+  btnRackOpenCleanup?.classList.toggle("hidden", !order);
+  if (rackActiveOrderWarning) rackActiveOrderWarning.textContent = order ? `Este rack está asociado a la orden activa ${order.order_code || order.order_id}. No puede ponerse disponible desde esta pantalla.` : "";
+  if (rackReservationState) rackReservationState.disabled = !!order;
 }
 function refreshRackReservationFieldsForSelection() {
   if (!rackId?.value) return;
@@ -6136,6 +6855,7 @@ function renderRcsResolvedInfo(data) {
     return;
   }
   const lines = [
+    `Modo simulador: ${Number(data.simulator_enabled ?? 0) === 1 ? 'Activo' : 'Inactivo'}`,
     `Base URL resuelta: ${data.resolved_base_url || 'Sin definir'}`,
     `Endpoint crear tarea: ${data.create_task_endpoint || '/rcs/task/create'}`,
     `Endpoint consulta tarea: ${data.query_task_status_endpoint || '/rcms/services/rest/hikRpcService/queryTaskStatus'}`,
@@ -6174,6 +6894,7 @@ async function loadPublicRcsMonitorConfig() {
 
 async function adminLoadRcsConfig() {
   const data = await fetchJson(API.adminRcsConfigGet, { headers: fetchHeaders() });
+  if (rcsSimulatorEnabled) rcsSimulatorEnabled.checked = Number(data.simulator_enabled ?? 0) === 1;
   rcsBaseUrl.value = data.base_url || '';
   rcsEndpoint.value = data.create_task_endpoint || '/rcs/task/create';
   if (rcsQueryEndpoint) rcsQueryEndpoint.value = data.query_task_status_endpoint || '/rcms/services/rest/hikRpcService/queryTaskStatus';
@@ -6208,6 +6929,7 @@ async function adminLoadRcsConfig() {
 
 async function adminSaveRcsConfig() {
   const payload = {
+    simulator_enabled: rcsSimulatorEnabled?.checked ? 1 : 0,
     base_url: rcsBaseUrl.value.trim() || '',
     create_task_endpoint: rcsEndpoint.value.trim() || '/rcs/task/create',
     query_task_status_endpoint: (rcsQueryEndpoint?.value || '').trim() || '/rcms/services/rest/hikRpcService/queryTaskStatus',
@@ -6721,6 +7443,8 @@ async function saveFreeLocationLayout(loc) {
   return saved;
 }
 async function saveArea() {
+  const selected = adminAreas.find(a => Number(a.id) === Number(areaId.value));
+  if (selected && Number(selected.is_active ?? 0) !== 1) throw new Error("No se puede editar un área eliminada. Restáurala primero.");
   const payload = { code: areaCode.value.trim(), name: areaName.value.trim(), description: areaDescription.value.trim() || null, matter_area: areaMatterArea?.value?.trim() || null, color: areaColor.value || "#4f46e5", area_type: areaType.value.trim() || "almacen", is_active: Number(areaActive.value || 1), priority: Number(areaPriority.value || 0) };
   const url = areaId.value ? API.adminArea(Number(areaId.value)) : API.adminAreas;
   const method = areaId.value ? "PUT" : "POST";
@@ -6732,6 +7456,8 @@ async function saveArea() {
   if (!wasUpdate) clearAreaForm();
 }
 async function saveMaterial() {
+  const selected = adminMaterials.find(m => Number(m.id) === Number(materialId.value));
+  if (selected && Number(selected.is_active ?? 0) !== 1) throw new Error("No se puede editar un material eliminado. Restáuralo primero.");
   const payload = { code: materialCode.value.trim(), name: materialName.value.trim(), description: materialDescription.value.trim() || null, color: materialColor.value || randomMaterialColor(), is_active: Number(materialActive.value || 1) };
   const url = materialId.value ? API.adminMaterial(Number(materialId.value)) : API.adminMaterials;
   const method = materialId.value ? "PUT" : "POST";
@@ -6742,26 +7468,11 @@ async function saveMaterial() {
 }
 
 async function deleteArea() {
-  if (!areaId.value) throw new Error('Selecciona un área.');
-  const item = catalog.areas.find(a => Number(a.id) === Number(areaId.value));
-  const name = item ? `${item.code} - ${item.name}` : `ID ${areaId.value}`;
-  if (!window.confirm(`¿Deseas borrar el área ${name}?`)) return;
-  await fetchJson(API.adminArea(Number(areaId.value)), { method: "DELETE", headers: { ...fetchHeaders() } });
-  finishEditingLock("areas", { applyPending: false });
-  await loadCatalog();
-  clearAreaForm();
-  areaMsg.textContent = 'Área eliminada.';
+  return openQrDeleteRestoreModal("area", "delete");
 }
 
 async function deleteMaterial() {
-  if (!materialId.value) throw new Error('Selecciona un material.');
-  const item = catalog.materials.find(m => Number(m.id) === Number(materialId.value));
-  const name = item ? `${item.code} - ${item.name}` : `ID ${materialId.value}`;
-  if (!window.confirm(`¿Deseas borrar el material ${name}?`)) return;
-  await fetchJson(API.adminMaterial(Number(materialId.value)), { method: "DELETE", headers: { ...fetchHeaders() } });
-  await loadCatalog();
-  clearMaterialForm();
-  materialMsg.textContent = 'Material eliminado.';
+  return openQrDeleteRestoreModal("material", "delete");
 }
 
 async function deleteRack() {
@@ -7124,6 +7835,25 @@ function historyOrderCanCancel(order) {
   return status !== 'completed' && !!order?.can_undo;
 }
 
+function cancelRecoveryFromError(error) {
+  return error?.detail?.cancel_recovery || error?.data?.detail?.cancel_recovery || error?.data?.cancel_recovery || null;
+}
+
+function renderHistoryCancelError(error) {
+  const recovery = cancelRecoveryFromError(error);
+  if (!recovery) return `Error: ${escapeHtml(error?.message || String(error))}`;
+  const order = movementOrders.find(item => item.order_id === (actionModalContext.orderId || selectedOrderId)) || {};
+  const eligible = recovery.eligible === true;
+  return `<div class="cleanup-warning">
+    <b>No fue posible cancelar la tarea en RCS.</b><br/>
+    Orden: ${escapeHtml(order.order_code || order.order_id || "Sin dato")} · RCS: ${escapeHtml(order.rcs_status || "Sin dato")}<br/>
+    Edad: ${escapeHtml(recovery.order_age_minutes ?? "Sin dato")} min · Elegible: ${eligible ? "Sí" : "No"}<br/>
+    Motivo: ${escapeHtml(error?.message || "Rechazo del RCS")}<br/>
+    Acción sugerida: ${escapeHtml(recovery.suggested_action || "Revisar con un administrador.")}
+    ${eligible ? `<br/><button type="button" class="btn warn" data-open-cleanup-recovery="1">Abrir Diagnóstico y limpieza</button>` : ""}
+  </div>`;
+}
+
 function renderSelectedOrderDetail(order) {
   if (!orderDetailBox) return;
   if (!order) {
@@ -7255,6 +7985,10 @@ async function deleteSelectedOrder() {
 async function saveRack() {
   const desiredReservation = Number(rackReservationState?.value || 0) === 1 ? "1" : "0";
   let rackStatusValue = rackStatus.value.trim() || "available";
+  const activeOrder = activeOrderForEditedRack();
+  if (activeOrder && desiredReservation === "0") {
+    throw new Error(`Este rack está asociado a la orden activa ${activeOrder.order_code || activeOrder.order_id}. Usa Diagnóstico y limpieza.`);
+  }
   if (desiredReservation === "1") rackStatusValue = "reserved";
   if (desiredReservation === "0") rackStatusValue = "available";
   const payload = { code: rackCode.value.trim(), name: rackName.value.trim() || null, status: rackStatusValue, material_group_id: rackMaterial.value ? Number(rackMaterial.value) : null, lot: rackLot.value.trim() || null, quantity: Number(rackQty.value || 0), manufacturer_code: rackMfgCode.value.trim() || null, fifo_entered_at: fromLocalInputValue(rackFifo.value), last_moved_at: fromLocalInputValue(rackMoved.value), comment: rackComment.value.trim() || null, custom_fields: getRackCustomFieldRows() };
@@ -8401,9 +9135,21 @@ btnReleaseSelectedRacks?.addEventListener("click", () => openCleanupConfirmModal
 btnResolveSelectedInconsistentRacks?.addEventListener("click", () => resolveSelectedInconsistentRacks().catch(err => {
   if (cleanupDiagnosisMsg) cleanupDiagnosisMsg.textContent = `Error: ${String(err)}`;
 }));
-btnForceReleaseOldActiveRacks?.addEventListener("click", () => forceReleaseSelectedOldActiveRacks().catch(err => {
+btnForceReleaseOldActiveRacks?.addEventListener("click", () => {
+  try { openForceReleaseConfirmModal(); } catch (err) {
   if (cleanupDiagnosisMsg) cleanupDiagnosisMsg.textContent = `Error: ${String(err)}`;
+  }
+});
+btnRepairInconsistentLocations?.addEventListener("click", () => repairSelectedInconsistentLocations().catch(err => {
+  if (cleanupDiagnosisMsg) cleanupDiagnosisMsg.textContent = `Error: ${err?.message || String(err)}`;
 }));
+forceReleasePhysicalConfirm?.addEventListener("change", updateForceReleaseConfirmState);
+forceReleaseReason?.addEventListener("input", updateForceReleaseConfirmState);
+btnCancelForceRelease?.addEventListener("click", closeForceReleaseConfirmModal);
+btnConfirmForceRelease?.addEventListener("click", () => forceReleaseSelectedOldActiveRacks().catch(err => {
+  if (forceReleaseConfirmMsg) forceReleaseConfirmMsg.textContent = `Error: ${err?.message || String(err)}`;
+}));
+btnRackOpenCleanup?.addEventListener("click", () => openCleanupDiagnosisModal());
 btnCancelCleanupClose?.addEventListener("click", () => closeCleanupConfirmModal());
 btnConfirmCleanupClose?.addEventListener("click", () => executeSelectedCleanup().catch(err => {
   if (cleanupConfirmMsg) cleanupConfirmMsg.textContent = `Error: ${String(err)}`;
@@ -8550,6 +9296,15 @@ btnUploadBg?.addEventListener("click", async () => {
 [bgScaleX, bgScaleY, bgOffX, bgOffY].forEach(el => el?.addEventListener("input", () => { bgState.scale_x = Number(bgScaleX.value || 1); bgState.scale_y = Number(bgScaleY.value || 1); bgState.offset_x = Number(bgOffX.value || 0); bgState.offset_y = Number(bgOffY.value || 0); draw(); }));
 btnSaveClientIp?.addEventListener("click", () => adminSaveClientIp().catch(err => adminMsg.textContent = `Error: ${String(err)}`));
 btnSaveRcsConfig?.addEventListener("click", () => adminSaveRcsConfig().catch(err => rcsConfigMsg.textContent = `Error: ${String(err)}`));
+rcsSimulatorEnabled?.addEventListener("change", () => {
+  if (!adminToken) return;
+  adminSaveRcsConfig().then(() => {
+    if (rcsConfigMsg) rcsConfigMsg.textContent = rcsSimulatorEnabled.checked ? "Simulador RCS activado." : "Simulador RCS desactivado.";
+  }).catch(err => {
+    rcsSimulatorEnabled.checked = !rcsSimulatorEnabled.checked;
+    if (rcsConfigMsg) rcsConfigMsg.textContent = `Error: ${String(err)}`;
+  });
+});
 btnTestRcsConfig?.addEventListener("click", () => adminTestRcsConfig().catch(err => rcsConfigMsg.textContent = `Error: ${String(err)}`));
 btnRackSyncPreview?.addEventListener("click", () => loadRackSyncPreview().catch(err => {
   if (rackSyncMsg) rackSyncMsg.textContent = `Error: ${String(err)}`;
@@ -8580,7 +9335,11 @@ btnChangePwd?.addEventListener("click", async () => {
     oldPwd.value = ""; newPwd.value = ""; adminMsg.textContent = "Contraseña cambiada correctamente.";
   } catch (err) { adminMsg.textContent = `Error: ${String(err)}`; }
 });
-btnSaveCell?.addEventListener("click", () => saveSelectedCell().catch(err => cellMsg.textContent = `Error: ${String(err)}`));
+btnSaveCell?.addEventListener("click", () => saveSelectedCell().catch(err => {
+  const current = locations[idx(selected.x, selected.y)];
+  if (current && !isMultiSelectionActive()) fillCellForm(current);
+  cellMsg.textContent = `Error: ${err?.message || String(err)}`;
+}));
 btnSelectCellsByArea?.addEventListener("click", () => {
   multiSelectMode = !multiSelectMode;
   if (btnSelectCellsByArea) {
@@ -8595,9 +9354,13 @@ btnSelectCellsByArea?.addEventListener("click", () => {
 btnNewArea?.addEventListener("click", clearAreaForm);
 btnSaveArea?.addEventListener("click", () => saveArea().catch(err => areaMsg.textContent = `Error: ${String(err)}`));
 btnDeleteArea?.addEventListener("click", () => deleteArea().catch(err => areaMsg.textContent = `Error: ${String(err)}`));
+btnRestoreArea?.addEventListener("click", () => openQrDeleteRestoreModal("area", "restore").catch(err => areaMsg.textContent = `Error: ${String(err)}`));
+showDeletedAreas?.addEventListener("change", () => loadAdminAreaMaterialRecords().then(() => { clearAreaForm(); renderAreaList({ force: true }); }).catch(err => areaMsg.textContent = `Error: ${String(err)}`));
 btnNewMaterial?.addEventListener("click", clearMaterialForm);
 btnSaveMaterial?.addEventListener("click", () => saveMaterial().catch(err => materialMsg.textContent = `Error: ${String(err)}`));
 btnDeleteMaterial?.addEventListener("click", () => deleteMaterial().catch(err => materialMsg.textContent = `Error: ${String(err)}`));
+btnRestoreMaterial?.addEventListener("click", () => openQrDeleteRestoreModal("material", "restore").catch(err => materialMsg.textContent = `Error: ${String(err)}`));
+showDeletedMaterials?.addEventListener("change", () => loadAdminAreaMaterialRecords().then(() => { clearMaterialForm(); renderMaterialList(); }).catch(err => materialMsg.textContent = `Error: ${String(err)}`));
 btnNewRack?.addEventListener("click", clearRackForm);
 btnSaveRack?.addEventListener("click", () => saveRack().catch(err => rackMsg.textContent = `Error: ${String(err)}`));
 btnDeleteRack?.addEventListener("click", () => deleteRack().catch(err => rackMsg.textContent = `Error: ${String(err)}`));
@@ -8605,7 +9368,10 @@ document.querySelectorAll("#card-qr-scanners .qr-tab").forEach(btn => btn.addEve
 btnNewScannerStation?.addEventListener("click", () => { clearScannerStationForm(); if (qrAdminMsg) qrAdminMsg.textContent = ""; });
 btnSaveScannerStation?.addEventListener("click", () => saveScannerStation().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
 btnDisableScannerStation?.addEventListener("click", () => disableScannerStation().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
+btnRestoreScannerStation?.addEventListener("click", () => openQrDeleteRestoreModal("scanner", "restore").catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
+showDeletedScannerStations?.addEventListener("change", () => loadScannerStations().then(() => clearScannerStationForm()).catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
 scannerCancelReturnArea?.addEventListener("change", () => renderScannerCancelReturnAreaWarning());
+scannerCancelReturnMode?.addEventListener("change", () => renderScannerCancelReturnAreaWarning());
 scannerRouteMode?.addEventListener("change", syncRouteModeSections);
 scannerFifoChainTotalSteps?.addEventListener("change", syncRouteModeSections);
 scannerFifoChainStep1SourceMode?.addEventListener("change", syncRouteModeSections);
@@ -8616,6 +9382,8 @@ scannerFifoChainStep5SourceMode?.addEventListener("change", syncRouteModeSection
 btnNewQrRule?.addEventListener("click", () => { clearQrRuleForm(); if (qrAdminMsg) qrAdminMsg.textContent = ""; });
 btnSaveQrRule?.addEventListener("click", () => saveQrRule().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
 btnDisableQrRule?.addEventListener("click", () => disableQrRule().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
+btnRestoreQrRule?.addEventListener("click", () => openQrDeleteRestoreModal("qr", "restore").catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
+showDeletedQrRules?.addEventListener("change", () => loadQrActionRules().then(() => clearQrRuleForm()).catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
 qrRouteMode?.addEventListener("change", syncRouteModeSections);
 qrFifoChainTotalSteps?.addEventListener("change", syncRouteModeSections);
 qrFifoChainStep1SourceMode?.addEventListener("change", syncRouteModeSections);
@@ -8651,16 +9419,42 @@ qrFifoMaterialPolicy?.addEventListener("change", syncFifoMaterialPolicyHelp);
 btnNewQrTransitionRule?.addEventListener("click", () => { clearQrTransitionRuleForm(); renderQrTransitionQrOptions(); renderQrTransitionScannerOptions(); renderQrCatalogOptions(); if (qrAdminMsg) qrAdminMsg.textContent = ""; });
 btnSaveQrTransitionRule?.addEventListener("click", () => saveQrTransitionRule().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
 btnDisableQrTransitionRule?.addEventListener("click", () => disableQrTransitionRule().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
+btnRestoreQrTransitionRule?.addEventListener("click", () => openQrDeleteRestoreModal("transition", "restore").catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
+showDeletedQrTransitions?.addEventListener("change", () => loadQrTransitionRules().then(() => clearQrTransitionRuleForm()).catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
 btnPreviewQrTransition?.addEventListener("click", () => previewQrTransition().catch(err => { if (qrTransitionPreviewResult) qrTransitionPreviewResult.textContent = `Error: ${String(err)}`; }));
 qrTransitionMatchMode?.addEventListener("change", () => syncQrTransitionModeOptions({ applyDefaults: qrTransitionMatchMode.value === "route_simple" }));
 qrTransitionSourceMatchMode?.addEventListener("change", syncQrTransitionModeOptions);
 qrTransitionIgnoreCurrentMaterial?.addEventListener("change", syncQrTransitionModeOptions);
 btnApplyQrTransition?.addEventListener("click", () => applyQrTransitionManual().catch(err => { if (qrTransitionPreviewResult) qrTransitionPreviewResult.textContent = `Error: ${String(err)}`; }));
 btnRefreshQrTransitionLogs?.addEventListener("click", () => loadQrTransitionLogs().then(() => { if (qrAdminMsg) qrAdminMsg.textContent = "Historial de transiciones actualizado."; }).catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
+btnRefreshQrTransitionLogsModal?.addEventListener("click", () => loadQrTransitionLogs().catch(() => {}));
+qrTransitionHistoryToggle?.addEventListener("click", () => setQrTransitionHistoryExpanded(qrTransitionHistoryToggle.getAttribute("aria-expanded") !== "true"));
+btnOpenQrTransitionHistory?.addEventListener("click", openQrTransitionHistoryModal);
+btnCloseQrTransitionHistory?.addEventListener("click", closeQrTransitionHistoryModal);
+btnCloseQrTransitionHistoryX?.addEventListener("click", closeQrTransitionHistoryModal);
+qrTransitionHistoryModal?.addEventListener("click", ev => { if (ev.target === qrTransitionHistoryModal) closeQrTransitionHistoryModal(); });
+document.querySelectorAll("[data-qr-history-filter]").forEach(el => {
+  const eventName = el.tagName === "INPUT" ? "input" : "change";
+  el.addEventListener(eventName, () => {
+    qrTransitionHistoryFilters[el.dataset.qrHistoryFilter] = el.value;
+    renderQrTransitionLogs();
+  });
+});
+document.addEventListener("keydown", ev => { if (ev.key === "Escape" && !qrTransitionHistoryModal?.classList.contains("hidden")) closeQrTransitionHistoryModal(); });
+setQrTransitionHistoryExpanded(false);
+renderQrTransitionLogs();
 btnNewScanTerminal?.addEventListener("click", () => { clearScanTerminalForm(); renderScanTerminalScannerOptions(); if (qrAdminMsg) qrAdminMsg.textContent = ""; });
 btnSaveScanTerminal?.addEventListener("click", () => saveScanTerminal().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
 btnRefreshScanTerminals?.addEventListener("click", () => loadScanTerminals().then(() => { if (qrAdminMsg) qrAdminMsg.textContent = "Terminales PDA actualizados."; }).catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
 btnDisableScanTerminal?.addEventListener("click", () => disableScanTerminal().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
+btnRestoreScanTerminal?.addEventListener("click", () => openQrDeleteRestoreModal("terminal", "restore").catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
+showDeletedScanTerminals?.addEventListener("change", () => loadScanTerminals().then(() => clearScanTerminalForm()).catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
+qrDeleteConfirmCheck?.addEventListener("change", () => { if (btnConfirmQrDeleteRestore && qrDeleteRestoreContext?.action === "delete" && !qrDeleteRestoreContext.blocked && !qrDeleteRestoreContext.busy) btnConfirmQrDeleteRestore.disabled = !qrDeleteConfirmCheck.checked; });
+btnConfirmQrDeleteRestore?.addEventListener("click", () => confirmQrDeleteRestore());
+btnCancelQrDeleteRestore?.addEventListener("click", closeQrDeleteRestoreModal);
+btnCloseQrDeleteRestoreModal?.addEventListener("click", closeQrDeleteRestoreModal);
+qrDeleteRestoreModal?.addEventListener("click", ev => { if (ev.target === qrDeleteRestoreModal) closeQrDeleteRestoreModal(); });
+document.addEventListener("keydown", ev => { if (ev.key === "Escape" && !qrDeleteRestoreModal?.classList.contains("hidden")) closeQrDeleteRestoreModal(); });
 btnRefreshScanEvents?.addEventListener("click", () => loadScanEvents().catch(err => { if (qrAdminMsg) qrAdminMsg.textContent = `Error: ${String(err)}`; }));
 [scannerSourceCell, scannerDestinationCell, scannerSecondSourceCell, scannerSecondDestinationCell, scannerFifoChainStep3SourceCell, scannerFifoChainStep3DestinationCell, scannerFifoChainStep4SourceCell, scannerFifoChainStep4DestinationCell, scannerFifoChainStep5SourceCell, scannerFifoChainStep5DestinationCell, qrSourceCell, qrDestinationCell, qrSecondSourceCell, qrSecondDestinationCell, qrFifoChainStep3SourceCell, qrFifoChainStep3DestinationCell, qrFifoChainStep4SourceCell, qrFifoChainStep4DestinationCell, qrFifoChainStep5SourceCell, qrFifoChainStep5DestinationCell].forEach(el => el?.addEventListener("change", renderQrCellSummaries));
 btnScanQrPreview?.addEventListener("click", () => runScanQrPreview());
@@ -8807,7 +9601,16 @@ btnOperatorActionPickDestination?.addEventListener("click", () => {
   draw();
   if (operatorWindowMsg) operatorWindowMsg.textContent = 'Haz clic en la matriz para elegir la celda destino.';
 });
-btnOperatorActionConfirm?.addEventListener("click", () => confirmOperatorActionModal().catch(err => operatorActionModalMsg.textContent = `Error: ${String(err)}`));
+btnOperatorActionConfirm?.addEventListener("click", () => confirmOperatorActionModal().catch(err => {
+  if (operatorActionModalMsg) operatorActionModalMsg.innerHTML = renderHistoryCancelError(err);
+}));
+operatorActionModalMsg?.addEventListener("click", (event) => {
+  if (!event.target.closest('[data-open-cleanup-recovery="1"]')) return;
+  closeOperatorActionModal();
+  openCleanupDiagnosisModal().catch(err => {
+    if (cleanupDiagnosisMsg) cleanupDiagnosisMsg.textContent = `Error: ${err?.message || String(err)}`;
+  });
+});
 btnOperatorActionPreview?.addEventListener("click", async () => {
   try {
     await validateOperatorActionModal();

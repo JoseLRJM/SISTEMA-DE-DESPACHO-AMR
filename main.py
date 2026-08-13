@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Union
 import asyncio
 import contextlib
+import contextvars
 import shutil
 import stat
 import threading
@@ -20,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import traceback
+import uuid
 import zipfile
 from pathlib import PurePosixPath
 
@@ -27,13 +29,13 @@ from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile, W
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select, func, delete, text
+from sqlalchemy import select, func, delete, text, or_
 
 from logging_config import ensure_log_file, get_logger
-from rcs_client import RcsClient, RcsError, RcsTaskRequest, RcsTaskResponse
+from rcs_client import RcsClient, RcsError, RcsSimpleResponse, RcsTaskRequest, RcsTaskResponse, RcsTaskStatusResponse
 from monitor_service import TaskMonitor, build_auto_status_query_payload, generate_req_code_ms, apply_remote_status_to_order, _normalize_remote_status, _single_task_response_item, _task_code_from_error_message
-from scanner_service import ScanPreviewError, execute_scan, preview_scan, resolve_scan_terminal, resolve_scanner_cancel_return_area, terminal_preview_scan
-from qr_transition_service import apply_transition_for_completed_order, preview_transition_for_order, validate_transition_rule_payload
+from scanner_service import ScanPreviewError, execute_scan, preview_scan, resolve_cancel_return_target, resolve_scan_terminal, terminal_preview_scan
+from qr_transition_service import apply_transition_for_completed_order, diagnose_transition_rule_payload, enforce_transition_rule_diagnostics, preview_transition_for_order, transition_match_metadata, transition_match_tier, transition_selection_reason, transition_specificity, validate_transition_rule_payload
 from fifo_chain_service import set_fifo_chain_default_dispatch_func
 
 from fifo_service import (
@@ -53,6 +55,7 @@ from models import (
     DB_GRID_H,
     DB_GRID_W,
     DebugConsoleEvent,
+    ConfigAuditLog,
     RackSyncEvent,
     Location,
     MaterialGroup,
@@ -84,9 +87,24 @@ ROBOT_MONITOR_CACHE_MAX_AGE_SECONDS = 5.0
 NO_MATERIAL_CODE = "SIN_MATERIAL"
 NO_MATERIAL_NAME = "Sin material"
 NO_MATERIAL_COLOR = "#94a3b8"
-RACK_RESERVATION_ACTIVE_STATUSES = ("pending_dispatch", "dispatched", "in_progress", "cancel_requested_total", "cancel_requested_undo")
+RACK_RESERVATION_ACTIVE_STATUSES = ("pending_dispatch", "dispatched", "in_progress", "cancel_requested_total", "cancel_requested_undo", "cancel_error")
 logger = get_logger("app.main")
 SOFTWARE_UPDATE_LOCK = threading.Lock()
+CONFIG_AUDIT_CONTEXT = contextvars.ContextVar("CONFIG_AUDIT_CONTEXT", default={})
+
+
+def _set_config_audit_context(**values):
+    current = dict(CONFIG_AUDIT_CONTEXT.get() or {})
+    current.update({k: v for k, v in values.items() if v is not None})
+    return CONFIG_AUDIT_CONTEXT.set(current)
+
+
+def _reset_config_audit_context(token):
+    CONFIG_AUDIT_CONTEXT.reset(token)
+
+
+def _config_audit_context() -> dict:
+    return dict(CONFIG_AUDIT_CONTEXT.get() or {})
 SOFTWARE_BUILD_INFO_REL_PATH = "static/build_info.json"
 RACK_POSITION_POLL_INTERVAL_SECONDS = 10
 RACK_POSITION_POLL_TIMEOUT_SECONDS = 10 * 60
@@ -276,6 +294,7 @@ class ClientIPIn(BaseModel):
 
 class RcsConfigIn(BaseModel):
     base_url: str = Field(default="", max_length=512)
+    simulator_enabled: int = Field(default=0, ge=0, le=1)
     create_task_endpoint: str = Field(default="/rcs/task/create", max_length=256)
     query_task_status_endpoint: str = Field(default="/rcms/services/rest/hikRpcService/queryTaskStatus", max_length=256)
     cancel_task_endpoint: str = Field(default="/rcms/services/rest/hikRpcService/cancelTask", max_length=256)
@@ -326,6 +345,7 @@ class RcsConfigIn(BaseModel):
         "enable_amr_monitor",
         "rack_sync_schedule_enabled",
         "verify_tls",
+        "simulator_enabled",
         mode="before",
     )
     @classmethod
@@ -336,6 +356,7 @@ class RcsConfigIn(BaseModel):
             "enable_amr_monitor": 1,
             "rack_sync_schedule_enabled": 0,
             "verify_tls": 0,
+            "simulator_enabled": 0,
         }
         if isinstance(v, bool):
             return 1 if v else 0
@@ -371,6 +392,7 @@ class RcsConfigOut(RcsConfigIn):
     resolved_token_code: str = ""
     resolved_auth_header: str = ""
     rack_sync_schedule_last_run_date: str = ""
+    simulator_base_url: str = "sim://local-rcs"
 
 
 class CleanupCloseOrdersOut(BaseModel):
@@ -385,6 +407,14 @@ class CleanupCloseOrdersOut(BaseModel):
 class CleanupSelectionIn(BaseModel):
     order_ids: List[int] = Field(default_factory=list)
     rack_ids: List[int] = Field(default_factory=list)
+    confirm_local_only: bool = False
+    reason: Optional[str] = Field(default=None, max_length=256)
+
+
+class RepairInconsistentLocationsIn(BaseModel):
+    location_ids: List[int] = Field(default_factory=list)
+    repair_mode: str = Field(default="safe", pattern="^safe$")
+    reason: str = Field(min_length=1, max_length=256)
 
 
 class TestCreateOldActiveOrderIn(BaseModel):
@@ -672,6 +702,7 @@ class AreaIn(BaseModel):
 class AreaOut(AreaIn):
     id: int
     updated_at: datetime
+    state: str
 
 
 class MovementOrderUndoIn(BaseModel):
@@ -691,6 +722,7 @@ class MaterialGroupIn(BaseModel):
 class MaterialGroupOut(MaterialGroupIn):
     id: int
     updated_at: datetime
+    state: str
 
 
 class RackIn(BaseModel):
@@ -843,6 +875,7 @@ class ScanPreviewOut(BaseModel):
     route_points: list[dict] = []
     fifo_chain_steps: list[dict] = []
     fifo_chain_projection: dict = {}
+    fifo_chain_preflight_checklist: dict = {}
     fifo_chain_total_steps: Optional[int] = None
     fifo_chain_step1_source_mode: Optional[str] = None
     fifo_chain_step2_source_mode: Optional[str] = None
@@ -1098,10 +1131,37 @@ def _clear_fifo_chain_step5_if_unused(row) -> None:
         return
     row.fifo_chain_step5_source_mode = "configured_area"
     row.fifo_chain_step5_material_group_id = None
+    row.fifo_chain_step5_task_typ = None
     row.fifo_chain_step5_source_area_id = None
     row.fifo_chain_step5_source_cell_id = None
     row.fifo_chain_step5_destination_area_id = None
     row.fifo_chain_step5_destination_cell_id = None
+
+
+def _clean_task_typ_value(value) -> Optional[str]:
+    text = str(value or "").strip()
+    return text[:64] or None
+
+
+def _apply_fifo_chain_task_types(row, body) -> None:
+    route_mode = _normalize_route_mode(getattr(row, "route_mode", None))
+    total_steps = _normalize_fifo_chain_total_steps(getattr(row, "fifo_chain_total_steps", None))
+    for step in range(1, 6):
+        applies = route_mode == "fifo_chain" and step <= total_steps
+        value = _clean_task_typ_value(getattr(body, f"fifo_chain_step{step}_task_typ", None))
+        setattr(row, f"fifo_chain_step{step}_task_typ", value if applies else None)
+
+
+VALID_CANCEL_RETURN_MODES = {"configured_area", "current_step_source"}
+
+
+def _normalize_cancel_return_mode(value) -> str:
+    mode = str(value or "").strip().lower()
+    if not mode:
+        return "configured_area"
+    if mode not in VALID_CANCEL_RETURN_MODES:
+        raise ValueError("cancel_return_mode debe ser configured_area o current_step_source")
+    return mode
 
 
 class ScannerStationIn(BaseModel):
@@ -1119,16 +1179,19 @@ class ScannerStationIn(BaseModel):
     fifo_chain_total_steps: Optional[Union[int, str]] = Field(default=2)
     fifo_chain_step1_source_mode: str = Field(default="configured_area", min_length=1, max_length=32)
     fifo_chain_step1_material_group_id: Optional[int] = None
+    fifo_chain_step1_task_typ: Optional[str] = Field(default=None, max_length=64)
     fifo_chain_step1_source_area_ids_json: Optional[Union[str, list[int]]] = None
     fifo_chain_step1_destination_mode: str = Field(default="configured_area", min_length=1, max_length=32)
     fifo_chain_step1_destination_area_ids_json: Optional[Union[str, list[int]]] = None
     fifo_chain_step2_source_mode: str = Field(default="configured_area", min_length=1, max_length=32)
     fifo_chain_step2_material_group_id: Optional[int] = None
+    fifo_chain_step2_task_typ: Optional[str] = Field(default=None, max_length=64)
     fifo_chain_step2_source_area_ids_json: Optional[Union[str, list[int]]] = None
     fifo_chain_step2_destination_mode: str = Field(default="configured_area", min_length=1, max_length=32)
     fifo_chain_step2_destination_area_ids_json: Optional[Union[str, list[int]]] = None
     fifo_chain_step3_source_mode: str = Field(default="configured_area", min_length=1, max_length=32)
     fifo_chain_step3_material_group_id: Optional[int] = None
+    fifo_chain_step3_task_typ: Optional[str] = Field(default=None, max_length=64)
     fifo_chain_step3_source_area_id: Optional[int] = None
     fifo_chain_step3_source_cell_id: Optional[int] = None
     fifo_chain_step3_destination_area_id: Optional[int] = None
@@ -1140,6 +1203,8 @@ class ScannerStationIn(BaseModel):
     fifo_chain_step5_source_mode: str = Field(default="configured_area", min_length=1, max_length=32)
     fifo_chain_step4_material_group_id: Optional[int] = None
     fifo_chain_step5_material_group_id: Optional[int] = None
+    fifo_chain_step4_task_typ: Optional[str] = Field(default=None, max_length=64)
+    fifo_chain_step5_task_typ: Optional[str] = Field(default=None, max_length=64)
     fifo_chain_step4_source_area_id: Optional[int] = None
     fifo_chain_step5_source_area_id: Optional[int] = None
     fifo_chain_step4_source_cell_id: Optional[int] = None
@@ -1161,13 +1226,20 @@ class ScannerStationIn(BaseModel):
     storage_area_id: Optional[int] = None
     empty_rack_area_id: Optional[int] = None
     cancel_return_area_id: Optional[int] = None
+    cancel_return_mode: str = Field(default="configured_area", max_length=32)
     default_material_group_id: Optional[int] = None
     agv_code: Optional[str] = Field(default=None, max_length=128)
     task_typ: Optional[str] = Field(default=None, max_length=64)
     priority: int = Field(default=0, ge=0, le=9999)
     require_preview: int = Field(default=0, ge=0, le=1)
     allow_execute: int = Field(default=1, ge=0, le=1)
+    allow_same_cell_move: int = Field(default=0, ge=0, le=1)
     is_active: int = Field(default=1, ge=0, le=1)
+
+    @field_validator("cancel_return_mode")
+    @classmethod
+    def validate_cancel_return_mode(cls, value: str):
+        return _normalize_cancel_return_mode(value)
 
 
 class ScannerStationOut(ScannerStationIn):
@@ -1228,16 +1300,19 @@ class QrActionRuleIn(BaseModel):
     fifo_chain_total_steps: Optional[Union[int, str]] = Field(default=2)
     fifo_chain_step1_source_mode: str = Field(default="configured_area", min_length=1, max_length=32)
     fifo_chain_step1_material_group_id: Optional[int] = None
+    fifo_chain_step1_task_typ: Optional[str] = Field(default=None, max_length=64)
     fifo_chain_step1_source_area_ids_json: Optional[Union[str, list[int]]] = None
     fifo_chain_step1_destination_mode: str = Field(default="configured_area", min_length=1, max_length=32)
     fifo_chain_step1_destination_area_ids_json: Optional[Union[str, list[int]]] = None
     fifo_chain_step2_source_mode: str = Field(default="configured_area", min_length=1, max_length=32)
     fifo_chain_step2_material_group_id: Optional[int] = None
+    fifo_chain_step2_task_typ: Optional[str] = Field(default=None, max_length=64)
     fifo_chain_step2_source_area_ids_json: Optional[Union[str, list[int]]] = None
     fifo_chain_step2_destination_mode: str = Field(default="configured_area", min_length=1, max_length=32)
     fifo_chain_step2_destination_area_ids_json: Optional[Union[str, list[int]]] = None
     fifo_chain_step3_source_mode: str = Field(default="configured_area", min_length=1, max_length=32)
     fifo_chain_step3_material_group_id: Optional[int] = None
+    fifo_chain_step3_task_typ: Optional[str] = Field(default=None, max_length=64)
     fifo_chain_step3_source_area_id: Optional[int] = None
     fifo_chain_step3_source_cell_id: Optional[int] = None
     fifo_chain_step3_destination_area_id: Optional[int] = None
@@ -1249,6 +1324,8 @@ class QrActionRuleIn(BaseModel):
     fifo_chain_step5_source_mode: str = Field(default="configured_area", min_length=1, max_length=32)
     fifo_chain_step4_material_group_id: Optional[int] = None
     fifo_chain_step5_material_group_id: Optional[int] = None
+    fifo_chain_step4_task_typ: Optional[str] = Field(default=None, max_length=64)
+    fifo_chain_step5_task_typ: Optional[str] = Field(default=None, max_length=64)
     fifo_chain_step4_source_area_id: Optional[int] = None
     fifo_chain_step5_source_area_id: Optional[int] = None
     fifo_chain_step4_source_cell_id: Optional[int] = None
@@ -1271,6 +1348,7 @@ class QrActionRuleIn(BaseModel):
     task_typ: Optional[str] = Field(default=None, max_length=64)
     agv_code: Optional[str] = Field(default=None, max_length=128)
     requires_scanner_station: int = Field(default=1, ge=0, le=1)
+    allow_same_cell_move: int = Field(default=0, ge=0, le=1)
     is_active: int = Field(default=1, ge=0, le=1)
 
 
@@ -1335,6 +1413,10 @@ class QrTransitionRuleIn(BaseModel):
     is_active: int = Field(default=1, ge=0, le=1)
 
 
+class QrTransitionRuleValidateIn(QrTransitionRuleIn):
+    rule_id: Optional[int] = None
+
+
 class QrTransitionRuleOut(QrTransitionRuleIn):
     id: int
     qr_action_rule_value: Optional[str] = None
@@ -1363,7 +1445,30 @@ class QrTransitionLogOut(BaseModel):
     transition_rule_name: Optional[str] = None
     movement_order_id: Optional[int] = None
     order_code: Optional[str] = None
+    movement_order_code: Optional[str] = None
+    remote_task_code: Optional[str] = None
     scan_event_id: Optional[int] = None
+    qr_value: Optional[str] = None
+    qr_action_rule_id: Optional[int] = None
+    qr_alias: Optional[str] = None
+    qr_action_rule_name: Optional[str] = None
+    scanner_station_id: Optional[int] = None
+    scanner_code: Optional[str] = None
+    scanner_name: Optional[str] = None
+    origin_scanner_code: Optional[str] = None
+    origin_scanner_name: Optional[str] = None
+    rule_scanner_station_id: Optional[int] = None
+    rule_scanner_code: Optional[str] = None
+    rule_scanner_name: Optional[str] = None
+    terminal_code: Optional[str] = None
+    execution_id: Optional[str] = None
+    selected_match_tier: Optional[int] = None
+    selection_reason: Optional[str] = None
+    priority: Optional[int] = None
+    specificity: Optional[int] = None
+    specificity_source: str = "unavailable"
+    direct_qr_match: Optional[bool] = None
+    direct_scanner_match: Optional[bool] = None
     rack_id: Optional[int] = None
     rack_code: Optional[str] = None
     previous_material_group_id: Optional[int] = None
@@ -1374,6 +1479,8 @@ class QrTransitionLogOut(BaseModel):
     next_rack_status: Optional[str] = None
     previous_quantity: Optional[int] = None
     next_quantity: Optional[int] = None
+    previous_comment: Optional[str] = None
+    next_comment: Optional[str] = None
     status: str
     message: Optional[str] = None
     created_at: datetime
@@ -1430,6 +1537,7 @@ class PdaScanHistoryItemOut(BaseModel):
     can_undo: bool = False
     action_available: bool = False
     action_unavailable_reason: Optional[str] = None
+    cancel_return_mode: Optional[str] = None
     cancel_return_area_id: Optional[int] = None
     cancel_return_area_code: Optional[str] = None
     cancel_return_area_name: Optional[str] = None
@@ -1458,6 +1566,11 @@ class PdaMovementOrderCancelOut(BaseModel):
     rcs_status: Optional[str] = None
     message: Optional[str] = None
     can_undo: bool = False
+    cancel_return_mode: Optional[str] = None
+    return_area_id: Optional[int] = None
+    return_area_name: Optional[str] = None
+    return_source_cell_code: Optional[str] = None
+    matter_area: Optional[str] = None
 
 
 class ScanTerminalIn(BaseModel):
@@ -1537,6 +1650,7 @@ class MovementOrderOut(BaseModel):
     dispatched_at: Optional[datetime] = None
     rcs_last_update: Optional[datetime] = None
     status_query_checked_at: Optional[datetime] = None
+    rcs_status_changed_at: Optional[datetime] = None
     status_query_request_payload: Optional[dict] = None
     status_query_response_payload: Optional[dict] = None
     status_query_log_entries: List[dict] = []
@@ -1617,6 +1731,23 @@ class RuntimeSnapshotOut(BaseModel):
     robot_monitor: Optional["RobotMonitorResponse"] = None
 
 
+class ConfigAuditLogOut(BaseModel):
+    id: int
+    created_at: datetime
+    table_name: str
+    record_key: str
+    field_name: str
+    old_value: Optional[str] = None
+    new_value: Optional[str] = None
+    source: str
+    endpoint: Optional[str] = None
+    client_ip: Optional[str] = None
+    request_id: Optional[str] = None
+    related_order_id: Optional[int] = None
+    related_qr_rule_id: Optional[int] = None
+    note: Optional[str] = None
+
+
 def _sha256(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
@@ -1628,16 +1759,119 @@ def get_setting(db, key: str, default: str) -> str:
 
 
 
-def set_setting(db, key: str, value: str):
+def _audit_config_change(
+    db,
+    *,
+    table_name: str,
+    record_key: str,
+    field_name: str,
+    old_value,
+    new_value,
+    source: Optional[str] = None,
+    endpoint: Optional[str] = None,
+    client_ip: Optional[str] = None,
+    request_id: Optional[str] = None,
+    related_order_id: Optional[int] = None,
+    related_qr_rule_id: Optional[int] = None,
+    note: Optional[str] = None,
+):
+    context = _config_audit_context()
+    source = source or context.get("source") or "unknown"
+    endpoint = endpoint if endpoint is not None else context.get("endpoint")
+    client_ip = client_ip if client_ip is not None else context.get("client_ip")
+    request_id = request_id if request_id is not None else context.get("request_id")
+    related_order_id = related_order_id if related_order_id is not None else context.get("related_order_id")
+    related_qr_rule_id = related_qr_rule_id if related_qr_rule_id is not None else context.get("related_qr_rule_id")
+    note = note if note is not None else context.get("note")
+    logger.info(
+        "CONFIG_CHANGE table=%s key=%s field=%s old=%r new=%r source=%s endpoint=%s client_ip=%s request_id=%s related_order_id=%s related_qr_rule_id=%s note=%s",
+        table_name,
+        record_key,
+        field_name,
+        old_value,
+        new_value,
+        source,
+        endpoint or "-",
+        client_ip or "-",
+        request_id or "-",
+        related_order_id if related_order_id is not None else "-",
+        related_qr_rule_id if related_qr_rule_id is not None else "-",
+        note or "-",
+    )
+    db.add(ConfigAuditLog(
+        table_name=table_name,
+        record_key=str(record_key),
+        field_name=str(field_name),
+        old_value=None if old_value is None else str(old_value),
+        new_value=None if new_value is None else str(new_value),
+        source=str(source or ""),
+        endpoint=endpoint,
+        client_ip=client_ip,
+        request_id=request_id,
+        related_order_id=related_order_id,
+        related_qr_rule_id=related_qr_rule_id,
+        note=note,
+        created_at=datetime.utcnow(),
+    ))
+
+
+def set_setting(db, key: str, value: str, *, source: Optional[str] = None, note: Optional[str] = None):
     row = db.execute(select(Setting).where(Setting.key == key)).scalar_one_or_none()
+    new_value = "" if value is None else str(value)
+    old_value = row.value if row else None
+    changed = old_value != new_value
     if not row:
-        row = Setting(key=key, value=value, updated_at=datetime.utcnow())
+        row = Setting(key=key, value=new_value, updated_at=datetime.utcnow())
         db.add(row)
     else:
-        row.value = value
+        row.value = new_value
         row.updated_at = datetime.utcnow()
         db.add(row)
+    if changed:
+        _audit_config_change(
+            db,
+            table_name="settings",
+            record_key=key,
+            field_name="value",
+            old_value=old_value,
+            new_value=new_value,
+            source=source,
+            note=note,
+        )
     db.commit()
+
+
+def _snapshot_fields(row, field_names: List[str]) -> dict:
+    return {name: getattr(row, name, None) for name in field_names}
+
+
+def _audit_model_field_changes(
+    db,
+    *,
+    table_name: str,
+    record_key: str,
+    old_values: dict,
+    row,
+    field_names: List[str],
+    source: str,
+    note: Optional[str] = None,
+    related_qr_rule_id: Optional[int] = None,
+):
+    for field_name in field_names:
+        old_value = old_values.get(field_name)
+        new_value = getattr(row, field_name, None)
+        if old_value != new_value:
+            _audit_config_change(
+                db,
+                table_name=table_name,
+                record_key=record_key,
+                field_name=field_name,
+                old_value=old_value,
+                new_value=new_value,
+                source=source,
+                note=note,
+                related_qr_rule_id=related_qr_rule_id,
+            )
 
 
 
@@ -1728,6 +1962,9 @@ def cleanup_legacy_schema():
                     logger.info("SQLite migration added scanner_stations.cancel_return_area_id")
                 else:
                     logger.info("SQLite migration scanner_stations.cancel_return_area_id already exists")
+                if "cancel_return_mode" not in scanner_station_cols:
+                    conn.exec_driver_sql("ALTER TABLE scanner_stations ADD COLUMN cancel_return_mode VARCHAR(32) NOT NULL DEFAULT 'configured_area';")
+                    logger.info("SQLite migration added scanner_stations.cancel_return_mode")
                 scanner_route_missing_sql = {
                     "route_mode": "ALTER TABLE scanner_stations ADD COLUMN route_mode VARCHAR(32) NOT NULL DEFAULT 'simple_area';",
                     "fifo_material_policy": "ALTER TABLE scanner_stations ADD COLUMN fifo_material_policy VARCHAR(32) NOT NULL DEFAULT 'specific_material';",
@@ -1754,6 +1991,7 @@ def cleanup_legacy_schema():
                     "fifo_chain_step5_destination_area_id": "ALTER TABLE scanner_stations ADD COLUMN fifo_chain_step5_destination_area_id INTEGER;",
                     "fifo_chain_step4_destination_cell_id": "ALTER TABLE scanner_stations ADD COLUMN fifo_chain_step4_destination_cell_id INTEGER;",
                     "fifo_chain_step5_destination_cell_id": "ALTER TABLE scanner_stations ADD COLUMN fifo_chain_step5_destination_cell_id INTEGER;",
+                    "allow_same_cell_move": "ALTER TABLE scanner_stations ADD COLUMN allow_same_cell_move INTEGER NOT NULL DEFAULT 0;",
                     "second_source_area_id": "ALTER TABLE scanner_stations ADD COLUMN second_source_area_id INTEGER;",
                     "second_destination_area_id": "ALTER TABLE scanner_stations ADD COLUMN second_destination_area_id INTEGER;",
                     "second_source_cell_id": "ALTER TABLE scanner_stations ADD COLUMN second_source_cell_id INTEGER;",
@@ -1761,6 +1999,7 @@ def cleanup_legacy_schema():
                 }
                 for step in range(1, 6):
                     scanner_route_missing_sql.update({
+                        f"fifo_chain_step{step}_task_typ": f"ALTER TABLE scanner_stations ADD COLUMN fifo_chain_step{step}_task_typ VARCHAR(64);",
                         f"fifo_chain_step{step}_source_area_ids_json": f"ALTER TABLE scanner_stations ADD COLUMN fifo_chain_step{step}_source_area_ids_json TEXT;",
                         f"fifo_chain_step{step}_destination_mode": f"ALTER TABLE scanner_stations ADD COLUMN fifo_chain_step{step}_destination_mode VARCHAR(32) NOT NULL DEFAULT 'configured_area';",
                         f"fifo_chain_step{step}_destination_area_ids_json": f"ALTER TABLE scanner_stations ADD COLUMN fifo_chain_step{step}_destination_area_ids_json TEXT;",
@@ -1818,6 +2057,7 @@ def cleanup_legacy_schema():
                     "fifo_chain_step5_destination_area_id": "ALTER TABLE qr_action_rules ADD COLUMN fifo_chain_step5_destination_area_id INTEGER;",
                     "fifo_chain_step4_destination_cell_id": "ALTER TABLE qr_action_rules ADD COLUMN fifo_chain_step4_destination_cell_id INTEGER;",
                     "fifo_chain_step5_destination_cell_id": "ALTER TABLE qr_action_rules ADD COLUMN fifo_chain_step5_destination_cell_id INTEGER;",
+                    "allow_same_cell_move": "ALTER TABLE qr_action_rules ADD COLUMN allow_same_cell_move INTEGER NOT NULL DEFAULT 0;",
                     "second_source_area_id": "ALTER TABLE qr_action_rules ADD COLUMN second_source_area_id INTEGER;",
                     "second_destination_area_id": "ALTER TABLE qr_action_rules ADD COLUMN second_destination_area_id INTEGER;",
                     "second_source_cell_id": "ALTER TABLE qr_action_rules ADD COLUMN second_source_cell_id INTEGER;",
@@ -1825,6 +2065,7 @@ def cleanup_legacy_schema():
                 }
                 for step in range(1, 6):
                     qr_route_missing_sql.update({
+                        f"fifo_chain_step{step}_task_typ": f"ALTER TABLE qr_action_rules ADD COLUMN fifo_chain_step{step}_task_typ VARCHAR(64);",
                         f"fifo_chain_step{step}_source_area_ids_json": f"ALTER TABLE qr_action_rules ADD COLUMN fifo_chain_step{step}_source_area_ids_json TEXT;",
                         f"fifo_chain_step{step}_destination_mode": f"ALTER TABLE qr_action_rules ADD COLUMN fifo_chain_step{step}_destination_mode VARCHAR(32) NOT NULL DEFAULT 'configured_area';",
                         f"fifo_chain_step{step}_destination_area_ids_json": f"ALTER TABLE qr_action_rules ADD COLUMN fifo_chain_step{step}_destination_area_ids_json TEXT;",
@@ -1997,6 +2238,7 @@ def cleanup_legacy_schema():
                 "status_query_request_json": "ALTER TABLE movement_orders ADD COLUMN status_query_request_json TEXT;",
                 "status_query_response_json": "ALTER TABLE movement_orders ADD COLUMN status_query_response_json TEXT;",
                 "status_query_checked_at": "ALTER TABLE movement_orders ADD COLUMN status_query_checked_at DATETIME;",
+                "rcs_status_changed_at": "ALTER TABLE movement_orders ADD COLUMN rcs_status_changed_at DATETIME;",
                 "status_query_log_json": "ALTER TABLE movement_orders ADD COLUMN status_query_log_json TEXT;",
                 "agv_code": "ALTER TABLE movement_orders ADD COLUMN agv_code VARCHAR(128);",
                 "task_typ": "ALTER TABLE movement_orders ADD COLUMN task_typ VARCHAR(64);",
@@ -2105,6 +2347,33 @@ def init_db():
                 db.commit()
 
 
+def ensure_config_audit_schema():
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            """
+            CREATE TABLE IF NOT EXISTS config_audit_log (
+                id INTEGER NOT NULL PRIMARY KEY,
+                created_at DATETIME NOT NULL,
+                table_name VARCHAR(64) NOT NULL,
+                record_key VARCHAR(128) NOT NULL,
+                field_name VARCHAR(128) NOT NULL,
+                old_value TEXT,
+                new_value TEXT,
+                source VARCHAR(128) NOT NULL DEFAULT '',
+                endpoint VARCHAR(256),
+                client_ip VARCHAR(64),
+                request_id VARCHAR(64),
+                related_order_id INTEGER,
+                related_qr_rule_id INTEGER,
+                note VARCHAR(512)
+            )
+            """
+        )
+        conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_config_audit_created_at ON config_audit_log (created_at)")
+        conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_config_audit_record_key ON config_audit_log (record_key)")
+        conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_config_audit_request_id ON config_audit_log (request_id)")
+
+
 
 def ensure_default_settings():
     with SessionLocal() as db:
@@ -2119,6 +2388,7 @@ def ensure_default_settings():
             "bg_offset_x": "0.0",
             "bg_offset_y": "0.0",
             "client_ip": "",
+            "rcs_simulator_enabled": "0",
             "rcs_base_url": "",
             "rcs_create_task_endpoint": "/rcs/task/create",
             "rcs_query_task_status_endpoint": "/rcms/services/rest/hikRpcService/queryTaskStatus",
@@ -2163,7 +2433,7 @@ def ensure_default_settings():
         }
         for k, v in defaults.items():
             if not get_setting(db, k, ""):
-                set_setting(db, k, v)
+                set_setting(db, k, v, source="startup_defaults", note="ensure_default_settings_missing_or_empty")
 
 
 ADMIN_TOKENS = {}
@@ -2175,7 +2445,7 @@ def _admin_token_secret() -> str:
         secret = get_setting(db, "admin_token_secret", "").strip()
         if not re.fullmatch(r"[0-9a-fA-F]{64}", secret):
             secret = secrets.token_hex(32)
-            set_setting(db, "admin_token_secret", secret)
+            set_setting(db, "admin_token_secret", secret, source="admin_token_secret_init")
         return secret
 
 
@@ -2228,6 +2498,7 @@ def _to_area_out(r: Area) -> AreaOut:
         is_active=r.is_active,
         priority=r.priority,
         updated_at=r.updated_at,
+        state="active" if int(r.is_active or 0) == 1 else "inactive",
     )
 
 
@@ -2318,6 +2589,7 @@ def _to_material_out(r: MaterialGroup) -> MaterialGroupOut:
         color=_normalize_hex_color(getattr(r, "color", None), "#7c3aed"),
         is_active=r.is_active,
         updated_at=r.updated_at,
+        state="active" if int(r.is_active or 0) == 1 else "inactive",
     )
 
 
@@ -2544,6 +2816,8 @@ def _validate_foreign_keys(db, area_id: Optional[int], rack_id: Optional[int], i
         area = db.execute(select(Area).where(Area.id == area_id)).scalar_one_or_none()
         if not area:
             raise HTTPException(status_code=400, detail="Área no encontrada")
+        if int(area.is_active or 0) != 1:
+            raise HTTPException(status_code=409, detail="El área está inactiva; restáurala antes de asignarla")
     if rack_id:
         rack = db.execute(select(Rack).where(Rack.id == rack_id)).scalar_one_or_none()
         if not rack:
@@ -2566,6 +2840,25 @@ def _sync_location_status(row: Location) -> Location:
         row.status = 0
     row.updated_at = datetime.utcnow()
     return row
+
+
+def _validate_location_can_mark_free(db, row: Location) -> None:
+    if row.rack_id is not None:
+        rack = db.execute(select(Rack).where(Rack.id == row.rack_id)).scalar_one_or_none()
+        rack_label = rack.code if rack and rack.code else row.rack_id
+        raise HTTPException(status_code=409, detail=f"No se puede marcar la celda como libre porque tiene asociado el rack {rack_label}.")
+    active_order = db.execute(
+        select(MovementOrder).where(
+            MovementOrder.status.in_(RACK_RESERVATION_ACTIVE_STATUSES),
+            or_(MovementOrder.source_cell_id == row.id, MovementOrder.destination_cell_id == row.id),
+        ).order_by(MovementOrder.id.asc())
+    ).scalars().first()
+    if active_order:
+        order_label = active_order.order_code or active_order.id
+        raise HTTPException(
+            status_code=409,
+            detail=f"No se puede marcar la celda como libre porque participa en la orden activa {order_label}. Cierra o recupera primero la orden desde Diagnóstico y limpieza.",
+        )
 
 
 def _sync_all_location_statuses(db):
@@ -2665,6 +2958,7 @@ def _movement_order_out(
         dispatched_at=row.dispatched_at,
         rcs_last_update=row.rcs_last_update,
         status_query_checked_at=row.status_query_checked_at,
+        rcs_status_changed_at=getattr(row, "rcs_status_changed_at", None),
         status_query_request_payload=_safe_json_loads(row.status_query_request_json),
         status_query_response_payload=_safe_json_loads(row.status_query_response_json),
         status_query_log_entries=_safe_json_loads_any(row.status_query_log_json) or [],
@@ -3027,6 +3321,7 @@ def _pda_scan_history_item_out(
         can_undo=bool(order_out.can_undo) if order_out else False,
         action_available=bool(order_out and not unavailable_reason),
         action_unavailable_reason=unavailable_reason,
+        cancel_return_mode=_normalize_cancel_return_mode(getattr(station, "cancel_return_mode", None)) if station else "configured_area",
         cancel_return_area_id=cancel_return_area.id if cancel_return_area else cancel_return_area_id,
         cancel_return_area_code=cancel_return_area.code if cancel_return_area else None,
         cancel_return_area_name=cancel_return_area.name if cancel_return_area else None,
@@ -3035,8 +3330,9 @@ def _pda_scan_history_item_out(
     )
 
 
-def _pda_cancel_response(db, action: str, row: MovementOrder) -> PdaMovementOrderCancelOut:
+def _pda_cancel_response(db, action: str, row: MovementOrder, cancel_return_target: Optional[dict] = None) -> PdaMovementOrderCancelOut:
     order_out = _movement_order_out(db, row)
+    target = cancel_return_target or {}
     return PdaMovementOrderCancelOut(
         success=True,
         action=action,
@@ -3046,6 +3342,11 @@ def _pda_cancel_response(db, action: str, row: MovementOrder) -> PdaMovementOrde
         rcs_status=order_out.rcs_status,
         message=order_out.rcs_message or order_out.comment or "Cancelacion procesada.",
         can_undo=bool(order_out.can_undo),
+        cancel_return_mode=target.get("mode") if action == "cancel_return" else None,
+        return_area_id=target.get("return_area_id") if action == "cancel_return" else None,
+        return_area_name=target.get("return_area_name") if action == "cancel_return" else None,
+        return_source_cell_code=target.get("source_cell_code") if action == "cancel_return" else None,
+        matter_area=target.get("matter_area") if action == "cancel_return" else None,
     )
 
 
@@ -3081,6 +3382,8 @@ def _require_area(db, area_id: Optional[int], label: str) -> Optional[Area]:
     row = db.execute(select(Area).where(Area.id == area_id)).scalar_one_or_none()
     if not row:
         raise HTTPException(status_code=400, detail=f"{label} no encontrada")
+    if int(row.is_active or 0) != 1:
+        raise HTTPException(status_code=409, detail=f"{label} está inactiva; restáurala antes de utilizarla")
     return row
 
 
@@ -3090,6 +3393,8 @@ def _require_scanner_cancel_return_area(db, area_id: Optional[int]) -> Optional[
     row = db.execute(select(Area).where(Area.id == area_id)).scalar_one_or_none()
     if not row:
         raise HTTPException(status_code=400, detail="El área configurada para regresar material al cancelar no existe.")
+    if int(row.is_active or 0) != 1:
+        raise HTTPException(status_code=409, detail="El área configurada para regresar material al cancelar está inactiva.")
     return row
 
 
@@ -3108,6 +3413,8 @@ def _require_material_group(db, material_group_id: Optional[int], label: str = "
     row = db.execute(select(MaterialGroup).where(MaterialGroup.id == material_group_id)).scalar_one_or_none()
     if not row:
         raise HTTPException(status_code=400, detail=f"{label} no encontrado")
+    if int(row.is_active or 0) != 1:
+        raise HTTPException(status_code=409, detail=f"{label} está inactivo; restáuralo antes de utilizarlo")
     return row
 
 
@@ -3184,12 +3491,15 @@ def _scanner_station_out(db, row: ScannerStation, area_by_id: Optional[dict] = N
         fifo_chain_total_steps=_normalize_fifo_chain_total_steps(getattr(row, "fifo_chain_total_steps", None)),
         fifo_chain_step1_source_mode=_normalize_fifo_chain_step1_source_mode(getattr(row, "fifo_chain_step1_source_mode", None)),
         fifo_chain_step1_material_group_id=getattr(row, "fifo_chain_step1_material_group_id", None),
+        fifo_chain_step1_task_typ=getattr(row, "fifo_chain_step1_task_typ", None),
         fifo_chain_step1_material_group_name=step1_material.name if step1_material else None,
         fifo_chain_step2_source_mode=_normalize_fifo_chain_step2_source_mode(getattr(row, "fifo_chain_step2_source_mode", None)),
         fifo_chain_step2_material_group_id=getattr(row, "fifo_chain_step2_material_group_id", None),
+        fifo_chain_step2_task_typ=getattr(row, "fifo_chain_step2_task_typ", None),
         fifo_chain_step2_material_group_name=step2_material.name if step2_material else None,
         fifo_chain_step3_source_mode=_normalize_fifo_chain_step3_source_mode(getattr(row, "fifo_chain_step3_source_mode", None)),
         fifo_chain_step3_material_group_id=getattr(row, "fifo_chain_step3_material_group_id", None),
+        fifo_chain_step3_task_typ=getattr(row, "fifo_chain_step3_task_typ", None),
         fifo_chain_step3_material_group_name=step3_material.name if step3_material else None,
         fifo_chain_step3_source_area_id=getattr(row, "fifo_chain_step3_source_area_id", None),
         fifo_chain_step3_source_area_name=step3_source_area.name if step3_source_area else None,
@@ -3203,6 +3513,8 @@ def _scanner_station_out(db, row: ScannerStation, area_by_id: Optional[dict] = N
         fifo_chain_step5_source_mode=_normalize_fifo_chain_step5_source_mode(getattr(row, "fifo_chain_step5_source_mode", None)),
         fifo_chain_step4_material_group_id=getattr(row, "fifo_chain_step4_material_group_id", None),
         fifo_chain_step5_material_group_id=getattr(row, "fifo_chain_step5_material_group_id", None),
+        fifo_chain_step4_task_typ=getattr(row, "fifo_chain_step4_task_typ", None),
+        fifo_chain_step5_task_typ=getattr(row, "fifo_chain_step5_task_typ", None),
         fifo_chain_step4_material_group_name=step4_material.name if step4_material else None,
         fifo_chain_step5_material_group_name=step5_material.name if step5_material else None,
         fifo_chain_step4_source_area_id=getattr(row, "fifo_chain_step4_source_area_id", None),
@@ -3236,6 +3548,7 @@ def _scanner_station_out(db, row: ScannerStation, area_by_id: Optional[dict] = N
         empty_rack_area_id=row.empty_rack_area_id,
         empty_rack_area_name=empty_rack_area.name if empty_rack_area else None,
         cancel_return_area_id=cancel_return_area_id,
+        cancel_return_mode=_normalize_cancel_return_mode(getattr(row, "cancel_return_mode", None)),
         cancel_return_area_code=cancel_return_area.code if cancel_return_area else None,
         cancel_return_area_name=cancel_return_area.name if cancel_return_area else None,
         cancel_return_area_matter_area=cancel_return_area.matter_area if cancel_return_area else None,
@@ -3247,6 +3560,7 @@ def _scanner_station_out(db, row: ScannerStation, area_by_id: Optional[dict] = N
         priority=int(row.priority or 0),
         require_preview=int(row.require_preview or 0),
         allow_execute=int(row.allow_execute or 0),
+        allow_same_cell_move=int(bool(getattr(row, "allow_same_cell_move", False))),
         is_active=int(row.is_active or 0),
         **_fifo_chain_area_modes_out(row),
         created_at=row.created_at,
@@ -3331,12 +3645,15 @@ def _qr_action_rule_out(db, row: QrActionRule) -> QrActionRuleOut:
         fifo_chain_total_steps=_normalize_fifo_chain_total_steps(getattr(row, "fifo_chain_total_steps", None)),
         fifo_chain_step1_source_mode=_normalize_fifo_chain_step1_source_mode(getattr(row, "fifo_chain_step1_source_mode", None)),
         fifo_chain_step1_material_group_id=getattr(row, "fifo_chain_step1_material_group_id", None),
+        fifo_chain_step1_task_typ=getattr(row, "fifo_chain_step1_task_typ", None),
         fifo_chain_step1_material_group_name=step1_material.name if step1_material else None,
         fifo_chain_step2_source_mode=_normalize_fifo_chain_step2_source_mode(getattr(row, "fifo_chain_step2_source_mode", None)),
         fifo_chain_step2_material_group_id=getattr(row, "fifo_chain_step2_material_group_id", None),
+        fifo_chain_step2_task_typ=getattr(row, "fifo_chain_step2_task_typ", None),
         fifo_chain_step2_material_group_name=step2_material.name if step2_material else None,
         fifo_chain_step3_source_mode=_normalize_fifo_chain_step3_source_mode(getattr(row, "fifo_chain_step3_source_mode", None)),
         fifo_chain_step3_material_group_id=getattr(row, "fifo_chain_step3_material_group_id", None),
+        fifo_chain_step3_task_typ=getattr(row, "fifo_chain_step3_task_typ", None),
         fifo_chain_step3_material_group_name=step3_material.name if step3_material else None,
         fifo_chain_step3_source_area_id=getattr(row, "fifo_chain_step3_source_area_id", None),
         fifo_chain_step3_source_area_name=step3_source_area.name if step3_source_area else None,
@@ -3350,6 +3667,8 @@ def _qr_action_rule_out(db, row: QrActionRule) -> QrActionRuleOut:
         fifo_chain_step5_source_mode=_normalize_fifo_chain_step5_source_mode(getattr(row, "fifo_chain_step5_source_mode", None)),
         fifo_chain_step4_material_group_id=getattr(row, "fifo_chain_step4_material_group_id", None),
         fifo_chain_step5_material_group_id=getattr(row, "fifo_chain_step5_material_group_id", None),
+        fifo_chain_step4_task_typ=getattr(row, "fifo_chain_step4_task_typ", None),
+        fifo_chain_step5_task_typ=getattr(row, "fifo_chain_step5_task_typ", None),
         fifo_chain_step4_material_group_name=step4_material.name if step4_material else None,
         fifo_chain_step5_material_group_name=step5_material.name if step5_material else None,
         fifo_chain_step4_source_area_id=getattr(row, "fifo_chain_step4_source_area_id", None),
@@ -3382,6 +3701,7 @@ def _qr_action_rule_out(db, row: QrActionRule) -> QrActionRuleOut:
         task_typ=row.task_typ,
         agv_code=row.agv_code,
         requires_scanner_station=int(row.requires_scanner_station or 0),
+        allow_same_cell_move=int(bool(getattr(row, "allow_same_cell_move", False))),
         is_active=int(row.is_active or 0),
         **_fifo_chain_area_modes_out(row),
         created_at=row.created_at,
@@ -3444,19 +3764,121 @@ def _qr_transition_rule_out(db, row: QrTransitionRule) -> QrTransitionRuleOut:
     )
 
 
-def _qr_transition_log_out(db, row: QrTransitionLog) -> QrTransitionLogOut:
-    rule = db.execute(select(QrTransitionRule).where(QrTransitionRule.id == row.transition_rule_id)).scalar_one_or_none() if row.transition_rule_id else None
-    order = db.execute(select(MovementOrder).where(MovementOrder.id == row.movement_order_id)).scalar_one_or_none() if row.movement_order_id else None
-    rack = db.execute(select(Rack).where(Rack.id == row.rack_id)).scalar_one_or_none() if row.rack_id else None
-    previous_material = db.execute(select(MaterialGroup).where(MaterialGroup.id == row.previous_material_group_id)).scalar_one_or_none() if row.previous_material_group_id else None
-    next_material = db.execute(select(MaterialGroup).where(MaterialGroup.id == row.next_material_group_id)).scalar_one_or_none() if row.next_material_group_id else None
-    return QrTransitionLogOut(
+def _transition_history_json(raw) -> dict:
+    try:
+        value = json.loads(raw or "{}")
+        return value if isinstance(value, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+def _transition_history_json_value(payloads, key):
+    def find(value, depth=0):
+        if depth > 5:
+            return None
+        if isinstance(value, dict):
+            if value.get(key) is not None:
+                return value.get(key)
+            for nested in value.values():
+                found = find(nested, depth + 1)
+                if found is not None:
+                    return found
+        elif isinstance(value, list):
+            for nested in value[:20]:
+                found = find(nested, depth + 1)
+                if found is not None:
+                    return found
+        return None
+    for payload in payloads:
+        found = find(payload)
+        if found is not None:
+            return found
+    return None
+
+
+def _qr_transition_logs_out(db, rows) -> List[QrTransitionLogOut]:
+    def ids(field):
+        return {getattr(row, field, None) for row in rows if getattr(row, field, None) is not None}
+    rule_ids, order_ids, rack_ids = ids("transition_rule_id"), ids("movement_order_id"), ids("rack_id")
+    material_ids = ids("previous_material_group_id") | ids("next_material_group_id")
+    scan_event_ids = ids("scan_event_id")
+    rules = {row.id: row for row in db.execute(select(QrTransitionRule).where(QrTransitionRule.id.in_(rule_ids))).scalars().all()} if rule_ids else {}
+    orders = {row.id: row for row in db.execute(select(MovementOrder).where(MovementOrder.id.in_(order_ids))).scalars().all()} if order_ids else {}
+    racks = {row.id: row for row in db.execute(select(Rack).where(Rack.id.in_(rack_ids))).scalars().all()} if rack_ids else {}
+    materials = {row.id: row for row in db.execute(select(MaterialGroup).where(MaterialGroup.id.in_(material_ids))).scalars().all()} if material_ids else {}
+    event_conditions = []
+    if scan_event_ids:
+        event_conditions.append(ScanEvent.id.in_(scan_event_ids))
+    if order_ids:
+        event_conditions.append(ScanEvent.movement_order_id.in_(order_ids))
+    events = db.execute(select(ScanEvent).where(or_(*event_conditions)).order_by(ScanEvent.created_at.desc(), ScanEvent.id.desc())).scalars().all() if event_conditions else []
+    events_by_id = {row.id: row for row in events}
+    events_by_order = {}
+    for event in events:
+        if event.movement_order_id is not None and event.movement_order_id not in events_by_order:
+            events_by_order[event.movement_order_id] = event
+    selected_events = [events_by_id.get(row.scan_event_id) or events_by_order.get(row.movement_order_id) for row in rows]
+    qr_ids = {event.qr_action_rule_id for event in selected_events if event and event.qr_action_rule_id}
+    scanner_ids = {event.scanner_station_id for event in selected_events if event and event.scanner_station_id} | {rule.scanner_station_id for rule in rules.values() if rule.scanner_station_id}
+    terminal_ids = {event.terminal_id for event in selected_events if event and event.terminal_id}
+    qr_rules = {row.id: row for row in db.execute(select(QrActionRule).where(QrActionRule.id.in_(qr_ids))).scalars().all()} if qr_ids else {}
+    scanners = {row.id: row for row in db.execute(select(ScannerStation).where(ScannerStation.id.in_(scanner_ids))).scalars().all()} if scanner_ids else {}
+    terminals = {row.id: row for row in db.execute(select(ScanTerminal).where(ScanTerminal.id.in_(terminal_ids))).scalars().all()} if terminal_ids else {}
+    output = []
+    for row, scan_event in zip(rows, selected_events):
+        rule, order, rack = rules.get(row.transition_rule_id), orders.get(row.movement_order_id), racks.get(row.rack_id)
+        previous_material, next_material = materials.get(row.previous_material_group_id), materials.get(row.next_material_group_id)
+        request_json = _transition_history_json(getattr(scan_event, "request_json", None)) if scan_event else {}
+        result_json = _transition_history_json(getattr(scan_event, "result_json", None)) if scan_event else {}
+        persisted = (request_json, result_json)
+        execution_id = _transition_history_json_value(persisted, "execution_id")
+        persisted_tier = _transition_history_json_value(persisted, "selected_match_tier")
+        persisted_reason = _transition_history_json_value(persisted, "selection_reason")
+        persisted_priority = _transition_history_json_value(persisted, "selected_priority")
+        persisted_specificity = _transition_history_json_value(persisted, "selected_specificity")
+        origin_scanner = scanners.get(scan_event.scanner_station_id) if scan_event else None
+        rule_scanner = scanners.get(rule.scanner_station_id) if rule and rule.scanner_station_id else None
+        qr_rule = qr_rules.get(scan_event.qr_action_rule_id) if scan_event else None
+        context = {"qr_action_rule_id": getattr(scan_event, "qr_action_rule_id", None), "scanner_station_id": getattr(scan_event, "scanner_station_id", None)}
+        can_derive_tier = bool(rule and (scan_event or (getattr(rule, "match_mode", None) == "route_simple" or (not rule.qr_action_rule_id and not rule.scanner_station_id))))
+        derived_tier = transition_match_tier(rule, context) if can_derive_tier else None
+        selected_tier = int(persisted_tier) if persisted_tier is not None else derived_tier
+        derived_meta = transition_match_metadata(rule, context) if rule and selected_tier is not None else {}
+        specificity = int(persisted_specificity) if persisted_specificity is not None else (transition_specificity(rule) if rule else None)
+        specificity_source = "persisted" if persisted_specificity is not None else ("derived" if rule else "unavailable")
+        selection_reason = str(persisted_reason) if persisted_reason is not None else (transition_selection_reason(rule, context) if selected_tier is not None else None)
+        terminal_code = getattr(terminals.get(scan_event.terminal_id), "terminal_code", None) if scan_event else None
+        terminal_code = terminal_code or _transition_history_json_value(persisted, "terminal_code")
+        output.append(QrTransitionLogOut(
         id=row.id,
         transition_rule_id=row.transition_rule_id,
         transition_rule_name=rule.name if rule else None,
         movement_order_id=row.movement_order_id,
         order_code=order.order_code if order else None,
+        movement_order_code=order.order_code if order else None,
+        remote_task_code=order.remote_task_code if order else None,
         scan_event_id=row.scan_event_id,
+        qr_value=scan_event.qr_value if scan_event else None,
+        qr_action_rule_id=scan_event.qr_action_rule_id if scan_event else None,
+        qr_alias=qr_rule.qr_alias if qr_rule else None,
+        qr_action_rule_name=(qr_rule.qr_alias or qr_rule.qr_value) if qr_rule else None,
+        scanner_station_id=scan_event.scanner_station_id if scan_event else None,
+        scanner_code=(scan_event.scanner_code or getattr(origin_scanner, "scanner_code", None)) if scan_event else None,
+        scanner_name=origin_scanner.name if origin_scanner else None,
+        origin_scanner_code=(scan_event.scanner_code or getattr(origin_scanner, "scanner_code", None)) if scan_event else None,
+        origin_scanner_name=origin_scanner.name if origin_scanner else None,
+        rule_scanner_station_id=rule.scanner_station_id if rule else None,
+        rule_scanner_code=rule_scanner.scanner_code if rule_scanner else None,
+        rule_scanner_name=rule_scanner.name if rule_scanner else None,
+        terminal_code=terminal_code,
+        execution_id=str(execution_id) if execution_id is not None else None,
+        selected_match_tier=selected_tier,
+        selection_reason=selection_reason,
+        priority=int(persisted_priority) if persisted_priority is not None else (int(rule.priority or 0) if rule else None),
+        specificity=specificity,
+        specificity_source=specificity_source,
+        direct_qr_match=bool(derived_meta.get("direct_qr_match")) if derived_meta else None,
+        direct_scanner_match=bool(derived_meta.get("direct_scanner_match")) if derived_meta else None,
         rack_id=row.rack_id,
         rack_code=rack.code if rack else None,
         previous_material_group_id=row.previous_material_group_id,
@@ -3467,10 +3889,17 @@ def _qr_transition_log_out(db, row: QrTransitionLog) -> QrTransitionLogOut:
         next_rack_status=row.next_rack_status,
         previous_quantity=row.previous_quantity,
         next_quantity=row.next_quantity,
+        previous_comment=row.previous_comment,
+        next_comment=row.next_comment,
         status=row.status,
         message=row.message,
         created_at=row.created_at,
-    )
+        ))
+    return output
+
+
+def _qr_transition_log_out(db, row: QrTransitionLog) -> QrTransitionLogOut:
+    return _qr_transition_logs_out(db, [row])[0]
 
 
 def _pda_qr_rule_out(db, row: QrActionRule) -> PdaQrRuleOut:
@@ -3568,6 +3997,7 @@ def _validate_scanner_station_body(db, body: ScannerStationIn) -> tuple[str, str
     _require_area(db, body.second_destination_area_id, "Area destino secundaria")
     _require_area(db, body.storage_area_id, "Area de almacenamiento")
     _require_area(db, body.empty_rack_area_id, "Area de rack vacio")
+    _validate_choice(_normalize_cancel_return_mode(body.cancel_return_mode), VALID_CANCEL_RETURN_MODES, "cancel_return_mode")
     _require_scanner_cancel_return_area(db, body.cancel_return_area_id)
     _require_location(db, body.source_cell_id, "Celda origen")
     _require_location(db, body.destination_cell_id, "Celda destino")
@@ -3676,6 +4106,8 @@ def _validate_scan_terminal_body(db, body: ScanTerminalIn) -> str:
     station = db.execute(select(ScannerStation).where(ScannerStation.id == body.scanner_station_id)).scalar_one_or_none()
     if not station:
         raise HTTPException(status_code=400, detail="Scanner / estacion asociada no encontrada")
+    if int(station.is_active or 0) != 1:
+        raise HTTPException(status_code=409, detail="Scanner / estación asociada inactiva")
     return mode
 
 
@@ -4099,6 +4531,14 @@ def _normalize_endpoint_for_base(base_url: str, endpoint: str) -> str:
     return endpoint
 
 def _resolve_rcs_target(db, *, base_url: Optional[str] = None, endpoint: Optional[str] = None, mode: str = "query") -> tuple[str, str]:
+    simulator_enabled_raw = (get_setting(db, "rcs_simulator_enabled", "0") or "0").strip().lower()
+    if simulator_enabled_raw in {"1", "true", "yes", "si", "sí", "sÃ­"}:
+        simulated_endpoints = {
+            "create": "/simulated/createTask",
+            "cancel": "/simulated/cancelTask",
+            "query": "/simulated/queryTaskStatus",
+        }
+        return "sim://local-rcs", simulated_endpoints.get(mode, "/simulated/queryTaskStatus")
     resolved_base = ((base_url or "").strip() or (get_setting(db, "rcs_base_url", "") or "").strip() or os.getenv("RCS_BASE_URL", "").strip()).rstrip("/")
     if mode == "create":
         default_endpoint = "/rcs/task/create"
@@ -4166,7 +4606,108 @@ def _mask_secret(value: str) -> str:
     return ("*" * max(0, len(value) - 4)) + value[-4:]
 
 
+SIMULATED_RCS_TASKS: dict[str, dict] = {}
+SIMULATED_RCS_RUNNING_SECONDS = 10.0
+
+
+class SimulatedRcsClient:
+    _token_code = ""
+
+    def __init__(self) -> None:
+        self.base_url = "sim://local-rcs"
+        self.endpoint_create_task = "/simulated/createTask"
+        self.endpoint_query_task_status = "/simulated/queryTaskStatus"
+        self.endpoint_cancel_task = "/simulated/cancelTask"
+
+    def create_task(self, task: RcsTaskRequest) -> RcsTaskResponse:
+        payload = task.to_payload()
+        task_typ = str(payload.get("taskTyp") or "TASK").strip() or "TASK"
+        remote_task_code = f"{task_typ}_{uuid.uuid4()}"
+        SIMULATED_RCS_TASKS[remote_task_code] = {
+            "taskCode": remote_task_code,
+            "taskTyp": task_typ,
+            "agvCode": str(payload.get("agvCode") or "SIM-AGV"),
+            "created_monotonic": time.monotonic(),
+            "payload": payload,
+        }
+        raw = {
+            "code": 0,
+            "data": remote_task_code,
+            "message": "Success",
+            "reqCode": str(payload.get("reqCode") or generate_req_code_ms()),
+            "simulated": True,
+        }
+        logger.info("RCS_SIM createTask remote_task_code=%s taskTyp=%s", remote_task_code, task_typ)
+        return RcsTaskResponse(code=0, data=remote_task_code, message="Success", reqCode=raw["reqCode"], raw=raw)
+
+    def query_task_status_with_payload(self, payload: dict) -> RcsTaskStatusResponse:
+        requested = payload.get("taskCodes") or []
+        if isinstance(requested, str):
+            requested = [requested]
+        if not requested and payload.get("taskCode"):
+            requested = [payload.get("taskCode")]
+        items = []
+        for raw_code in requested:
+            task_code = str(raw_code or "").strip()
+            task = SIMULATED_RCS_TASKS.get(task_code, {})
+            elapsed = time.monotonic() - float(task.get("created_monotonic") or 0.0) if task else SIMULATED_RCS_RUNNING_SECONDS
+            status = "2" if elapsed < SIMULATED_RCS_RUNNING_SECONDS else "9"
+            items.append({
+                "taskCode": task_code,
+                "taskStatus": status,
+                "taskTyp": str(task.get("taskTyp") or ""),
+                "agvCode": str(task.get("agvCode") or "SIM-AGV"),
+                "elapsedSeconds": round(elapsed, 2),
+            })
+        if not items:
+            items.append({"taskCode": "", "taskStatus": "9", "taskTyp": "", "agvCode": "SIM-AGV"})
+        req_code = str(payload.get("reqCode") or generate_req_code_ms())
+        raw = {"code": 0, "message": "Success", "reqCode": req_code, "data": items, "simulated": True}
+        selected = items[0]
+        logger.info("RCS_SIM queryTaskStatus tasks=%s", [item.get("taskCode") for item in items])
+        return RcsTaskStatusResponse(
+            code=0,
+            task_code=str(selected.get("taskCode") or ""),
+            task_status=str(selected.get("taskStatus") or "9"),
+            message="Success",
+            reqCode=req_code,
+            raw=raw,
+            task_statuses=items,
+        )
+
+    def query_task_status(self, task_code: str, req_code: str = "", token_code: str = "", client_code: str = "") -> RcsTaskStatusResponse:
+        return self.query_task_status_with_payload({"reqCode": req_code or generate_req_code_ms(), "taskCodes": [task_code]})
+
+    def query_agv_status_with_payload(self, payload: dict, endpoint_override: Optional[str] = None) -> dict:
+        req_code = str(payload.get("reqCode") or generate_req_code_ms())
+        return {
+            "code": 0,
+            "message": "Success",
+            "reqCode": req_code,
+            "data": [{
+                "agvCode": "SIM-AGV",
+                "robotCode": "SIM-AGV",
+                "status": "idle",
+                "battery": 100,
+                "mapShortName": str(payload.get("mapShortName") or "SIM"),
+            }],
+            "simulated": True,
+        }
+
+    def cancel_task_with_payload(self, payload: dict, endpoint_override: Optional[str] = None) -> RcsSimpleResponse:
+        task_code = str(payload.get("taskCode") or "").strip()
+        if task_code in SIMULATED_RCS_TASKS:
+            SIMULATED_RCS_TASKS[task_code]["created_monotonic"] = time.monotonic() - SIMULATED_RCS_RUNNING_SECONDS
+        raw = {"code": 0, "message": "Success", "reqCode": str(payload.get("reqCode") or generate_req_code_ms()), "simulated": True}
+        return RcsSimpleResponse(code=0, message="Success", reqCode=raw["reqCode"], raw=raw)
+
+    def cancel_task(self, task_code: str = "", agv_code: str = "", req_code: str = "", token_code: str = "", client_code: str = "", force_cancel: str = "0", matter_area: str = "") -> RcsSimpleResponse:
+        return self.cancel_task_with_payload({"reqCode": req_code or generate_req_code_ms(), "taskCode": task_code, "agvCode": agv_code})
+
+
 def _get_rcs_config(db) -> RcsConfigOut:
+    simulator_enabled_raw = (get_setting(db, "rcs_simulator_enabled", "0") or "0").strip().lower()
+    simulator_enabled = 1 if simulator_enabled_raw in {"1", "true", "yes", "si", "sí", "sÃ­"} else 0
     base_url = (get_setting(db, "rcs_base_url", "") or "").strip()
     endpoint = (get_setting(db, "rcs_create_task_endpoint", "/rcs/task/create") or "/rcs/task/create").strip() or "/rcs/task/create"
     query_endpoint = (get_setting(db, "rcs_query_task_status_endpoint", "/rcms/services/rest/hikRpcService/queryTaskStatus") or "/rcms/services/rest/hikRpcService/queryTaskStatus").strip() or "/rcms/services/rest/hikRpcService/queryTaskStatus"
@@ -4211,12 +4752,13 @@ def _get_rcs_config(db) -> RcsConfigOut:
     except Exception:
         cancel_undo_auto_recovery_min_age_minutes = 5
 
-    resolved_base_url = base_url or os.getenv("RCS_BASE_URL", "").strip()
+    resolved_base_url = "sim://local-rcs" if simulator_enabled else (base_url or os.getenv("RCS_BASE_URL", "").strip())
     resolved_token_code = token_code or os.getenv("RCS_TOKEN_CODE", "").strip()
     resolved_auth_header = auth_header or os.getenv("RCS_AUTH_HEADER", "").strip()
 
     return RcsConfigOut(
         base_url=base_url,
+        simulator_enabled=simulator_enabled,
         create_task_endpoint=endpoint,
         query_task_status_endpoint=query_endpoint,
         cancel_task_endpoint=cancel_endpoint,
@@ -4246,10 +4788,12 @@ def _get_rcs_config(db) -> RcsConfigOut:
         resolved_token_code=_mask_secret(resolved_token_code),
         resolved_auth_header=_mask_secret(resolved_auth_header),
         rack_sync_schedule_last_run_date=rack_sync_schedule_last_run_date,
+        simulator_base_url="sim://local-rcs",
     )
 
 
 def _save_rcs_config(db, payload: RcsConfigIn) -> RcsConfigOut:
+    simulator_enabled = 1 if int(payload.simulator_enabled or 0) else 0
     endpoint = (payload.create_task_endpoint or "/rcs/task/create").strip() or "/rcs/task/create"
     query_endpoint = (payload.query_task_status_endpoint or "/rcms/services/rest/hikRpcService/queryTaskStatus").strip() or "/rcms/services/rest/hikRpcService/queryTaskStatus"
     cancel_endpoint = (payload.cancel_task_endpoint or "/rcms/services/rest/hikRpcService/cancelTask").strip() or "/rcms/services/rest/hikRpcService/cancelTask"
@@ -4290,32 +4834,34 @@ def _save_rcs_config(db, payload: RcsConfigIn) -> RcsConfigOut:
         rack_sync_query_endpoint = "/" + rack_sync_query_endpoint
     if not rack_sync_bind_endpoint.startswith("/"):
         rack_sync_bind_endpoint = "/" + rack_sync_bind_endpoint
-    set_setting(db, "rcs_base_url", (payload.base_url or "").strip())
-    set_setting(db, "rcs_create_task_endpoint", endpoint)
-    set_setting(db, "rcs_query_task_status_endpoint", query_endpoint)
-    set_setting(db, "rcs_cancel_task_endpoint", cancel_endpoint)
-    set_setting(db, "rcs_stop_robot_endpoint", stop_robot_endpoint)
-    set_setting(db, "rcs_resume_robot_endpoint", resume_robot_endpoint)
-    set_setting(db, "rcs_agv_status_endpoint", agv_status_endpoint)
-    set_setting(db, "rcs_pod_position_endpoint", pod_position_endpoint)
-    set_setting(db, "rcs_rack_sync_query_endpoint", rack_sync_query_endpoint)
-    set_setting(db, "rcs_rack_sync_bind_endpoint", rack_sync_bind_endpoint)
-    set_setting(db, "rcs_rack_sync_schedule_enabled", "1" if rack_sync_schedule_enabled else "0")
-    set_setting(db, "rcs_rack_sync_schedule_time", rack_sync_schedule_time)
-    set_setting(db, "rcs_task_monitor_interval_seconds", str(task_monitor_interval_seconds))
-    set_setting(db, "rcs_agv_monitor_interval_seconds", str(agv_monitor_interval_seconds))
-    set_setting(db, "rcs_enable_map_short_name", "1" if enable_map_short_name else "0")
-    set_setting(db, "rcs_map_short_name", map_short_name)
-    set_setting(db, "rcs_enable_map_code", "1" if enable_map_code else "0")
-    set_setting(db, "rcs_map_code", map_code)
-    set_setting(db, "rcs_enable_amr_monitor", "1" if enable_amr_monitor else "0")
-    set_setting(db, "rcs_verify_tls", "1" if int(payload.verify_tls or 0) else "0")
-    set_setting(db, "rcs_token_code", payload.token_code or "")
-    set_setting(db, "rcs_auth_header", payload.auth_header or "")
-    set_setting(db, "cleanup_min_age_minutes", str(cleanup_min_age_minutes))
-    set_setting(db, "force_release_min_age_minutes", str(force_release_min_age_minutes))
-    set_setting(db, "cancel_undo_auto_recovery_enabled", str(cancel_undo_auto_recovery_enabled))
-    set_setting(db, "cancel_undo_auto_recovery_min_age_minutes", str(cancel_undo_auto_recovery_min_age_minutes))
+    source = "admin_rcs_config"
+    set_setting(db, "rcs_simulator_enabled", "1" if simulator_enabled else "0", source=source)
+    set_setting(db, "rcs_base_url", (payload.base_url or "").strip(), source=source)
+    set_setting(db, "rcs_create_task_endpoint", endpoint, source=source)
+    set_setting(db, "rcs_query_task_status_endpoint", query_endpoint, source=source)
+    set_setting(db, "rcs_cancel_task_endpoint", cancel_endpoint, source=source)
+    set_setting(db, "rcs_stop_robot_endpoint", stop_robot_endpoint, source=source)
+    set_setting(db, "rcs_resume_robot_endpoint", resume_robot_endpoint, source=source)
+    set_setting(db, "rcs_agv_status_endpoint", agv_status_endpoint, source=source)
+    set_setting(db, "rcs_pod_position_endpoint", pod_position_endpoint, source=source)
+    set_setting(db, "rcs_rack_sync_query_endpoint", rack_sync_query_endpoint, source=source)
+    set_setting(db, "rcs_rack_sync_bind_endpoint", rack_sync_bind_endpoint, source=source)
+    set_setting(db, "rcs_rack_sync_schedule_enabled", "1" if rack_sync_schedule_enabled else "0", source=source)
+    set_setting(db, "rcs_rack_sync_schedule_time", rack_sync_schedule_time, source=source)
+    set_setting(db, "rcs_task_monitor_interval_seconds", str(task_monitor_interval_seconds), source=source)
+    set_setting(db, "rcs_agv_monitor_interval_seconds", str(agv_monitor_interval_seconds), source=source)
+    set_setting(db, "rcs_enable_map_short_name", "1" if enable_map_short_name else "0", source=source)
+    set_setting(db, "rcs_map_short_name", map_short_name, source=source)
+    set_setting(db, "rcs_enable_map_code", "1" if enable_map_code else "0", source=source)
+    set_setting(db, "rcs_map_code", map_code, source=source)
+    set_setting(db, "rcs_enable_amr_monitor", "1" if enable_amr_monitor else "0", source=source)
+    set_setting(db, "rcs_verify_tls", "1" if int(payload.verify_tls or 0) else "0", source=source)
+    set_setting(db, "rcs_token_code", payload.token_code or "", source=source)
+    set_setting(db, "rcs_auth_header", payload.auth_header or "", source=source)
+    set_setting(db, "cleanup_min_age_minutes", str(cleanup_min_age_minutes), source=source)
+    set_setting(db, "force_release_min_age_minutes", str(force_release_min_age_minutes), source=source)
+    set_setting(db, "cancel_undo_auto_recovery_enabled", str(cancel_undo_auto_recovery_enabled), source=source)
+    set_setting(db, "cancel_undo_auto_recovery_min_age_minutes", str(cancel_undo_auto_recovery_min_age_minutes), source=source)
     try:
         app.state.task_monitor.interval_seconds = task_monitor_interval_seconds
     except Exception:
@@ -4324,6 +4870,9 @@ def _save_rcs_config(db, payload: RcsConfigIn) -> RcsConfigOut:
 
 
 def _get_rcs_client_from_settings(db) -> RcsClient:
+    simulator_enabled_raw = (get_setting(db, "rcs_simulator_enabled", "0") or "0").strip().lower()
+    if simulator_enabled_raw in {"1", "true", "yes", "si", "sí", "sÃ­"}:
+        return SimulatedRcsClient()
     base_url = (get_setting(db, "rcs_base_url", "") or "").strip() or os.getenv("RCS_BASE_URL", "").strip()
     endpoint = (get_setting(db, "rcs_create_task_endpoint", "/rcs/task/create") or "/rcs/task/create").strip()
     query_endpoint = (get_setting(db, "rcs_query_task_status_endpoint", "/rcms/services/rest/hikRpcService/queryTaskStatus") or "/rcms/services/rest/hikRpcService/queryTaskStatus").strip()
@@ -4934,7 +5483,7 @@ def _run_scheduled_rack_sync_once() -> bool:
                 result.message = f"Sincronizacion programada omitida: {result.message}"
             else:
                 result.message = f"Sincronizacion programada: {result.message}"
-            set_setting(db, "rcs_rack_sync_schedule_last_run_date", today_text)
+            set_setting(db, "rcs_rack_sync_schedule_last_run_date", today_text, source="scheduled_rack_sync")
             _append_rack_sync_event(db, action="scheduled_bind", result=result, duration_ms=int((time.monotonic() - started) * 1000))
             return True
     except Exception as exc:
@@ -5278,8 +5827,18 @@ app.state.task_monitor = TaskMonitor(interval_seconds=3)
 
 @app.middleware("http")
 async def log_unhandled_http_errors(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+    client_ip = request.client.host if request.client else ""
+    token = _set_config_audit_context(
+        request_id=request_id,
+        endpoint=str(request.url.path),
+        client_ip=client_ip,
+        source=f"http:{request.method}",
+    )
     try:
-        return await call_next(request)
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
     except Exception as exc:
         logger.error(
             "%s %s - %s\n%s",
@@ -5289,6 +5848,8 @@ async def log_unhandled_http_errors(request: Request, call_next):
             traceback.format_exc(),
         )
         raise
+    finally:
+        _reset_config_audit_context(token)
 
 
 @app.on_event("startup")
@@ -5297,6 +5858,7 @@ def on_startup():
     logger.info("Application startup initiated")
     cleanup_legacy_schema()
     init_db()
+    ensure_config_audit_schema()
     ensure_default_settings()
     ensure_special_materials()
     with SessionLocal() as db:
@@ -5415,7 +5977,8 @@ def pda_terminal(terminal_code: str):
 def download_logs():
     log_path = ensure_log_file()
     log_dir = os.path.dirname(str(log_path))
-    log_names = ("app.log", "error.log", "rcs.log", "programming.log", "io.log")
+    base_log_names = ("app.log", "error.log", "rcs.log", "programming.log", "io.log", "qr.log")
+    log_names = tuple(name for base_name in base_log_names for name in (base_name, *(f"{base_name}.{index}" for index in range(1, 6))))
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
     tmp_path = tmp.name
     tmp.close()
@@ -5443,6 +6006,46 @@ def download_logs():
 
     headers = {"Content-Disposition": 'attachment; filename="logs.zip"'}
     return StreamingResponse(_iter_zip_file(), media_type="application/zip", headers=headers)
+
+
+@app.get("/api/admin/config-audit", response_model=List[ConfigAuditLogOut])
+def admin_config_audit(
+    table_name: Optional[str] = None,
+    record_key: Optional[str] = None,
+    field_name: Optional[str] = None,
+    limit: int = 200,
+    x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
+):
+    require_admin(x_admin_token)
+    limit = max(1, min(1000, int(limit or 200)))
+    with SessionLocal() as db:
+        stmt = select(ConfigAuditLog)
+        if table_name:
+            stmt = stmt.where(ConfigAuditLog.table_name == table_name.strip())
+        if record_key:
+            stmt = stmt.where(ConfigAuditLog.record_key == record_key.strip())
+        if field_name:
+            stmt = stmt.where(ConfigAuditLog.field_name == field_name.strip())
+        rows = db.execute(stmt.order_by(ConfigAuditLog.created_at.desc(), ConfigAuditLog.id.desc()).limit(limit)).scalars().all()
+        return [
+            ConfigAuditLogOut(
+                id=row.id,
+                created_at=row.created_at,
+                table_name=row.table_name,
+                record_key=row.record_key,
+                field_name=row.field_name,
+                old_value=row.old_value,
+                new_value=row.new_value,
+                source=row.source,
+                endpoint=row.endpoint,
+                client_ip=row.client_ip,
+                request_id=row.request_id,
+                related_order_id=row.related_order_id,
+                related_qr_rule_id=row.related_qr_rule_id,
+                note=row.note,
+            )
+            for row in rows
+        ]
 
 
 @app.get("/api/grid-config", response_model=GridDisplayConfig)
@@ -5483,22 +6086,33 @@ def get_grid_config():
 @app.post("/api/admin/grid-config", response_model=GridDisplayConfig)
 def set_grid_config(payload: GridDisplayConfig, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
     require_admin(x_admin_token)
-    logger.info("Admin updating grid config rows=%s cols=%s map_layout_mode=%s", payload.display_rows, payload.display_cols, payload.map_layout_mode)
+    logger.info(
+        "Admin updating grid config rows=%s cols=%s map_layout_mode=%s agv_offset=(%s,%s) agv_scale=(%s,%s) rotation=%s",
+        payload.display_rows,
+        payload.display_cols,
+        payload.map_layout_mode,
+        payload.agv_overlay_offset_x,
+        payload.agv_overlay_offset_y,
+        payload.agv_overlay_scale_x,
+        payload.agv_overlay_scale_y,
+        payload.agv_overlay_rotation_deg,
+    )
     with SessionLocal() as db:
-        set_setting(db, "display_rows", str(payload.display_rows))
-        set_setting(db, "display_cols", str(payload.display_cols))
-        set_setting(db, "map_layout_mode", payload.map_layout_mode)
-        set_setting(db, "agv_overlay_scale_x", str(payload.agv_overlay_scale_x))
-        set_setting(db, "agv_overlay_scale_y", str(payload.agv_overlay_scale_y))
-        set_setting(db, "agv_overlay_offset_x", str(payload.agv_overlay_offset_x))
-        set_setting(db, "agv_overlay_offset_y", str(payload.agv_overlay_offset_y))
-        set_setting(db, "agv_overlay_rotation_deg", str(payload.agv_overlay_rotation_deg))
-        set_setting(db, "agv_orientation_offset_deg", str(payload.agv_orientation_offset_deg))
-        set_setting(db, "agv_overlay_mirror_x", str(int(payload.agv_overlay_mirror_x or 0)))
-        set_setting(db, "agv_overlay_mirror_y", str(int(payload.agv_overlay_mirror_y or 0)))
-        set_setting(db, "agv_icon_angle_mirror", str(int(payload.agv_icon_angle_mirror or 0)))
-        set_setting(db, "runtime_refresh_seconds", str(payload.runtime_refresh_seconds))
-        set_setting(db, "runtime_reconnect_seconds", str(payload.runtime_reconnect_seconds))
+        source = "admin_grid_config"
+        set_setting(db, "display_rows", str(payload.display_rows), source=source)
+        set_setting(db, "display_cols", str(payload.display_cols), source=source)
+        set_setting(db, "map_layout_mode", payload.map_layout_mode, source=source)
+        set_setting(db, "agv_overlay_scale_x", str(payload.agv_overlay_scale_x), source=source)
+        set_setting(db, "agv_overlay_scale_y", str(payload.agv_overlay_scale_y), source=source)
+        set_setting(db, "agv_overlay_offset_x", str(payload.agv_overlay_offset_x), source=source)
+        set_setting(db, "agv_overlay_offset_y", str(payload.agv_overlay_offset_y), source=source)
+        set_setting(db, "agv_overlay_rotation_deg", str(payload.agv_overlay_rotation_deg), source=source)
+        set_setting(db, "agv_orientation_offset_deg", str(payload.agv_orientation_offset_deg), source=source)
+        set_setting(db, "agv_overlay_mirror_x", str(int(payload.agv_overlay_mirror_x or 0)), source=source)
+        set_setting(db, "agv_overlay_mirror_y", str(int(payload.agv_overlay_mirror_y or 0)), source=source)
+        set_setting(db, "agv_icon_angle_mirror", str(int(payload.agv_icon_angle_mirror or 0)), source=source)
+        set_setting(db, "runtime_refresh_seconds", str(payload.runtime_refresh_seconds), source=source)
+        set_setting(db, "runtime_reconnect_seconds", str(payload.runtime_reconnect_seconds), source=source)
     return payload
 
 
@@ -5534,7 +6148,7 @@ async def admin_upload_background(file: UploadFile = File(...), x_admin_token: O
     with open(out_path, "wb") as f:
         f.write(data)
     with SessionLocal() as db:
-        set_setting(db, "bg_filename", safe_name)
+        set_setting(db, "bg_filename", safe_name, source="admin_background_upload")
         scale_x = float(get_setting(db, "bg_scale_x", "1.0") or 1.0)
         scale_y = float(get_setting(db, "bg_scale_y", "1.0") or 1.0)
         offset_x = float(get_setting(db, "bg_offset_x", "0.0") or 0.0)
@@ -5545,13 +6159,14 @@ async def admin_upload_background(file: UploadFile = File(...), x_admin_token: O
 @app.post("/api/admin/background/transform", response_model=BackgroundOut)
 def admin_set_background_transform(payload: BackgroundTransformIn, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
     require_admin(x_admin_token)
-    logger.info("Admin updating background transform")
+    logger.info("Admin updating background transform scale=(%s,%s) offset=(%s,%s)", payload.scale_x, payload.scale_y, payload.offset_x, payload.offset_y)
     with SessionLocal() as db:
-        set_setting(db, "bg_scale_x", str(payload.scale_x))
-        set_setting(db, "bg_scale_y", str(payload.scale_y))
-        set_setting(db, "bg_scale", str((payload.scale_x + payload.scale_y) / 2.0))
-        set_setting(db, "bg_offset_x", str(payload.offset_x))
-        set_setting(db, "bg_offset_y", str(payload.offset_y))
+        source = "admin_background_transform"
+        set_setting(db, "bg_scale_x", str(payload.scale_x), source=source)
+        set_setting(db, "bg_scale_y", str(payload.scale_y), source=source)
+        set_setting(db, "bg_scale", str((payload.scale_x + payload.scale_y) / 2.0), source=source)
+        set_setting(db, "bg_offset_x", str(payload.offset_x), source=source)
+        set_setting(db, "bg_offset_y", str(payload.offset_y), source=source)
         filename = get_setting(db, "bg_filename", "")
     return BackgroundOut(filename=filename, url=f"/static/uploads/{filename}" if filename else None, scale_x=payload.scale_x, scale_y=payload.scale_y, offset_x=payload.offset_x, offset_y=payload.offset_y, scale=(payload.scale_x + payload.scale_y) / 2.0)
 
@@ -6496,7 +7111,7 @@ def admin_set_client_ip(payload: ClientIPIn, x_admin_token: Optional[str] = Head
     require_admin(x_admin_token)
     logger.info("Admin updating client IP")
     with SessionLocal() as db:
-        set_setting(db, "client_ip", payload.client_ip.strip())
+        set_setting(db, "client_ip", payload.client_ip.strip(), source="admin_client_ip")
         return ClientIPOut(client_ip=get_setting(db, "client_ip", ""))
 
 
@@ -7261,7 +7876,7 @@ def admin_change_password(body: AdminChangePassword, x_admin_token: Optional[str
         stored = get_setting(db, "admin_password_hash", "")
         if _sha256(body.old_password) != stored:
             raise HTTPException(status_code=400, detail="Contraseña anterior incorrecta")
-        set_setting(db, "admin_password_hash", _sha256(body.new_password))
+        set_setting(db, "admin_password_hash", _sha256(body.new_password), source="admin_change_password")
     logger.info("Admin changed password")
     return {"ok": True}
 
@@ -7516,9 +8131,9 @@ def cleanup_pre_restore_backups() -> None:
 
 def _set_restore_pending_restart(value: bool) -> None:
     with SessionLocal() as db:
-        set_setting(db, "restore_pending_restart", "1" if value else "0")
+        set_setting(db, "restore_pending_restart", "1" if value else "0", source="backup_restore")
         if value:
-            set_setting(db, "last_restore_at", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+            set_setting(db, "last_restore_at", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), source="backup_restore")
 
 
 def _restore_pending_restart_status() -> dict:
@@ -7911,8 +8526,8 @@ def admin_download_pre_restore_backup(filename: str, x_admin_token: Optional[str
 def get_catalog():
     with SessionLocal() as db:
         _auto_release_stuck_cancel_return_orders(db, now=datetime.utcnow())
-        areas = [_to_area_out(r) for r in db.execute(select(Area).order_by(Area.priority.asc(), Area.name.asc())).scalars().all()]
-        materials = [_to_material_out(r) for r in db.execute(select(MaterialGroup).order_by(MaterialGroup.name.asc())).scalars().all()]
+        areas = [_to_area_out(r) for r in db.execute(select(Area).where(Area.is_active == 1).order_by(Area.priority.asc(), Area.name.asc())).scalars().all()]
+        materials = [_to_material_out(r) for r in db.execute(select(MaterialGroup).where(MaterialGroup.is_active == 1).order_by(MaterialGroup.name.asc())).scalars().all()]
         racks = [_rack_out(db, r) for r in db.execute(select(Rack).order_by(Rack.code.asc())).scalars().all()]
         return CatalogOut(areas=areas, materials=materials, racks=racks)
 
@@ -8147,6 +8762,7 @@ def scan_terminal_cancel_movement_order(
         station = None
         scan_event = None
         return_area_id = None
+        cancel_return_target = None
         matter_area = ""
         try:
             try:
@@ -8171,9 +8787,23 @@ def scan_terminal_cancel_movement_order(
 
             action = body.action
             if action == "cancel_return":
-                resolved_return_area = resolve_scanner_cancel_return_area(db, station)
-                return_area_id = resolved_return_area["return_area_id"]
-                matter_area = resolved_return_area["matter_area"]
+                cancel_return_target = resolve_cancel_return_target(db, station, row)
+                return_area_id = cancel_return_target["return_area_id"]
+                matter_area = cancel_return_target["matter_area"]
+                logger.info(
+                    "PDA_CANCEL_RETURN_TARGET movement_order_id=%s order_code=%s fifo_chain_step=%s/%s cancel_return_mode=%s scanner_code=%s source_cell_id=%s source_cell_code=%s source_area_id=%s source_area_name=%s matter_area=%s",
+                    row.id,
+                    row.order_code,
+                    getattr(row, "fifo_chain_step", None) or "-",
+                    getattr(row, "fifo_chain_total_steps", None) or "-",
+                    cancel_return_target.get("mode"),
+                    station.scanner_code,
+                    cancel_return_target.get("source_cell_id") or getattr(row, "source_cell_id", None) or "-",
+                    cancel_return_target.get("source_cell_code") or "-",
+                    cancel_return_target.get("source_area_id") or cancel_return_target.get("return_area_id") or "-",
+                    cancel_return_target.get("source_area_name") or cancel_return_target.get("return_area_name") or "-",
+                    matter_area or "",
+                )
                 row = _execute_cancel_for_order(
                     db,
                     row,
@@ -8193,7 +8823,7 @@ def scan_terminal_cancel_movement_order(
                     source="pda",
                     actor=f"pda:{terminal.terminal_code}",
                 )
-            response = _pda_cancel_response(db, action, row)
+            response = _pda_cancel_response(db, action, row, cancel_return_target)
             logger.info(
                 "PDA_CANCEL_REQUEST terminal_code=%s scanner_code=%s scan_event_id=%s movement_order_id=%s action=%s return_area_id=%s matter_area=%s result_status=%s rcs_status=%s error=-",
                 terminal.terminal_code,
@@ -8285,11 +8915,59 @@ def list_scan_events(
         return [_scan_event_out(db, row) for row in rows]
 
 
+def _admin_soft_delete_actor(token: Optional[str]) -> str:
+    return f"admin:{(token or '')[-6:]}" if token else "admin"
+
+
+def _qr_admin_dependencies(db, entity_type: str, entity_id: int) -> dict:
+    if entity_type == "scanner_station":
+        active_terminals = db.execute(select(ScanTerminal).where(ScanTerminal.scanner_station_id == entity_id, ScanTerminal.is_active == 1).order_by(ScanTerminal.terminal_code.asc())).scalars().all()
+        active_transitions = db.execute(select(QrTransitionRule).where(QrTransitionRule.scanner_station_id == entity_id, QrTransitionRule.is_active == 1).order_by(QrTransitionRule.id.asc())).scalars().all()
+        return {
+            "active_terminals": [{"id": row.id, "code": row.terminal_code} for row in active_terminals],
+            "active_transitions": [{"id": row.id, "name": row.name} for row in active_transitions],
+            "scan_events": int(db.execute(select(func.count()).select_from(ScanEvent).where(ScanEvent.scanner_station_id == entity_id)).scalar_one() or 0),
+        }
+    if entity_type == "qr_action_rule":
+        active_transitions = db.execute(select(QrTransitionRule).where(QrTransitionRule.qr_action_rule_id == entity_id, QrTransitionRule.is_active == 1).order_by(QrTransitionRule.id.asc())).scalars().all()
+        event_count = int(db.execute(select(func.count()).select_from(ScanEvent).where(ScanEvent.qr_action_rule_id == entity_id)).scalar_one() or 0)
+        order_count = int(db.execute(select(func.count(func.distinct(ScanEvent.movement_order_id))).where(ScanEvent.qr_action_rule_id == entity_id, ScanEvent.movement_order_id.is_not(None))).scalar_one() or 0)
+        return {
+            "active_transitions": [{"id": row.id, "name": row.name} for row in active_transitions],
+            "scan_events": event_count,
+            "movement_orders": order_count,
+        }
+    if entity_type == "scan_terminal":
+        return {"scan_events": int(db.execute(select(func.count()).select_from(ScanEvent).where(ScanEvent.terminal_id == entity_id)).scalar_one() or 0)}
+    if entity_type == "qr_transition_rule":
+        return {"transition_logs": int(db.execute(select(func.count()).select_from(QrTransitionLog).where(QrTransitionLog.transition_rule_id == entity_id)).scalar_one() or 0)}
+    raise ValueError(f"Tipo de dependencia no soportado: {entity_type}")
+
+
+def _audit_qr_admin_state(db, *, event: str, entity_type: str, entity_id: int, label: str, actor: str, dependencies: dict, at: datetime) -> None:
+    payload = {"event": event, "entity_type": entity_type, "id": entity_id, "label": label, "actor": actor, "dependencies": dependencies, "timestamp": at.isoformat()}
+    _append_debug_console_event(db, direction="received", module="qr_admin", endpoint=event, payload=payload, message=f"{event} id={entity_id} label={label}", created_at=at, auto_commit=False)
+    logger.info("%s entity_type=%s id=%s label=%s actor=%s dependencies=%s timestamp=%s", event, entity_type, entity_id, label, actor, json.dumps(dependencies, ensure_ascii=False), at.isoformat())
+
+
+def _require_existing_refs(db, row, refs: list[tuple[str, object, str]]) -> None:
+    missing = []
+    for attr, model, label in refs:
+        value = getattr(row, attr, None)
+        if value is not None and db.execute(select(model.id).where(model.id == value)).scalar_one_or_none() is None:
+            missing.append(f"{label} {value}")
+    if missing:
+        raise HTTPException(status_code=409, detail=f"No se puede restaurar porque faltan dependencias: {', '.join(missing)}.")
+
+
 @app.get("/api/admin/scanner-stations", response_model=List[ScannerStationOut])
-def admin_list_scanner_stations(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+def admin_list_scanner_stations(include_inactive: bool = False, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
     require_admin(x_admin_token)
     with SessionLocal() as db:
-        rows = db.execute(select(ScannerStation).order_by(ScannerStation.scanner_code.asc())).scalars().all()
+        stmt = select(ScannerStation)
+        if not include_inactive:
+            stmt = stmt.where(ScannerStation.is_active == 1)
+        rows = db.execute(stmt.order_by(ScannerStation.scanner_code.asc())).scalars().all()
         return _scanner_stations_out(db, rows)
 
 
@@ -8348,17 +9026,20 @@ def admin_create_scanner_station(body: ScannerStationIn, x_admin_token: Optional
             storage_area_id=body.storage_area_id,
             empty_rack_area_id=body.empty_rack_area_id,
             cancel_return_area_id=body.cancel_return_area_id,
+            cancel_return_mode=_normalize_cancel_return_mode(body.cancel_return_mode),
             default_material_group_id=None if route_mode == "fifo_chain" else body.default_material_group_id,
             agv_code=(body.agv_code or "").strip() or None,
             task_typ=(body.task_typ or "").strip() or None,
             priority=int(body.priority or 0),
             require_preview=int(body.require_preview or 0),
             allow_execute=int(body.allow_execute or 0),
+            allow_same_cell_move=bool(int(body.allow_same_cell_move or 0)),
             is_active=int(body.is_active),
             created_at=now,
             updated_at=now,
         )
         _apply_fifo_chain_area_modes(row, body)
+        _apply_fifo_chain_task_types(row, body)
         _clear_fifo_chain_step5_if_unused(row)
         db.add(row)
         db.commit()
@@ -8374,6 +9055,8 @@ def admin_update_scanner_station(scanner_station_id: int, body: ScannerStationIn
         row = db.execute(select(ScannerStation).where(ScannerStation.id == scanner_station_id)).scalar_one_or_none()
         if not row:
             raise HTTPException(status_code=404, detail="Scanner no encontrado")
+        if int(row.is_active or 0) != 1:
+            raise HTTPException(status_code=409, detail="No se puede editar un Scanner eliminado. Restáuralo primero.")
         scanner_code = body.scanner_code.strip()
         dup = db.execute(select(ScannerStation).where(ScannerStation.scanner_code == scanner_code, ScannerStation.id != scanner_station_id)).scalar_one_or_none()
         if dup:
@@ -8424,15 +9107,18 @@ def admin_update_scanner_station(scanner_station_id: int, body: ScannerStationIn
         row.storage_area_id = body.storage_area_id
         row.empty_rack_area_id = body.empty_rack_area_id
         row.cancel_return_area_id = body.cancel_return_area_id
+        row.cancel_return_mode = _normalize_cancel_return_mode(body.cancel_return_mode)
         row.default_material_group_id = None if route_mode == "fifo_chain" else body.default_material_group_id
         row.agv_code = (body.agv_code or "").strip() or None
         row.task_typ = (body.task_typ or "").strip() or None
         row.priority = int(body.priority or 0)
         row.require_preview = int(body.require_preview or 0)
         row.allow_execute = int(body.allow_execute or 0)
+        row.allow_same_cell_move = bool(int(body.allow_same_cell_move or 0))
         row.is_active = int(body.is_active or 0)
         row.updated_at = datetime.utcnow()
         _apply_fifo_chain_area_modes(row, body)
+        _apply_fifo_chain_task_types(row, body)
         _clear_fifo_chain_step5_if_unused(row)
         db.add(row)
         db.commit()
@@ -8448,8 +9134,21 @@ def admin_delete_scanner_station(scanner_station_id: int, x_admin_token: Optiona
         row = db.execute(select(ScannerStation).where(ScannerStation.id == scanner_station_id)).scalar_one_or_none()
         if not row:
             raise HTTPException(status_code=404, detail="Scanner no encontrado")
+        dependencies = _qr_admin_dependencies(db, "scanner_station", row.id)
+        terminals = dependencies["active_terminals"]
+        transitions = dependencies["active_transitions"]
+        if terminals:
+            labels = ", ".join(item["code"] for item in terminals)
+            raise HTTPException(status_code=409, detail=f"No se puede eliminar el Scanner porque tiene {len(terminals)} Terminales activas: {labels}.")
+        if transitions:
+            labels = ", ".join(item["name"] for item in transitions)
+            raise HTTPException(status_code=409, detail=f"No se puede eliminar el Scanner porque tiene {len(transitions)} Transiciones activas: {labels}.")
+        if int(row.is_active or 0) == 0:
+            return _scanner_station_out(db, row)
+        now = datetime.utcnow()
         row.is_active = 0
-        row.updated_at = datetime.utcnow()
+        row.updated_at = now
+        _audit_qr_admin_state(db, event="SCANNER_STATION_DEACTIVATED", entity_type="scanner_station", entity_id=row.id, label=row.scanner_code, actor=_admin_soft_delete_actor(x_admin_token), dependencies=dependencies, at=now)
         db.add(row)
         db.commit()
         db.refresh(row)
@@ -8457,11 +9156,44 @@ def admin_delete_scanner_station(scanner_station_id: int, x_admin_token: Optiona
         return _scanner_station_out(db, row)
 
 
-@app.get("/api/admin/qr-action-rules", response_model=List[QrActionRuleOut])
-def admin_list_qr_action_rules(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+@app.get("/api/admin/scanner-stations/{scanner_station_id}/dependencies")
+def admin_scanner_station_dependencies(scanner_station_id: int, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
     require_admin(x_admin_token)
     with SessionLocal() as db:
-        rows = db.execute(select(QrActionRule).order_by(QrActionRule.qr_value.asc(), QrActionRule.id.asc())).scalars().all()
+        row = db.execute(select(ScannerStation).where(ScannerStation.id == scanner_station_id)).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scanner no encontrado")
+        return _qr_admin_dependencies(db, "scanner_station", row.id)
+
+
+@app.post("/api/admin/scanner-stations/{scanner_station_id}/restore", response_model=ScannerStationOut)
+def admin_restore_scanner_station(scanner_station_id: int, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        row = db.execute(select(ScannerStation).where(ScannerStation.id == scanner_station_id)).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scanner no encontrado")
+        if int(row.is_active or 0) == 1:
+            return _scanner_station_out(db, row)
+        if not (row.scanner_code or "").strip() or not (row.name or "").strip():
+            raise HTTPException(status_code=409, detail="No se puede restaurar el Scanner porque faltan scanner_code o name.")
+        now = datetime.utcnow()
+        dependencies = _qr_admin_dependencies(db, "scanner_station", row.id)
+        row.is_active = 1
+        row.updated_at = now
+        _audit_qr_admin_state(db, event="SCANNER_STATION_RESTORED", entity_type="scanner_station", entity_id=row.id, label=row.scanner_code, actor=_admin_soft_delete_actor(x_admin_token), dependencies=dependencies, at=now)
+        db.add(row); db.commit(); db.refresh(row)
+        return _scanner_station_out(db, row)
+
+
+@app.get("/api/admin/qr-action-rules", response_model=List[QrActionRuleOut])
+def admin_list_qr_action_rules(include_inactive: bool = False, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        stmt = select(QrActionRule)
+        if not include_inactive:
+            stmt = stmt.where(QrActionRule.is_active == 1)
+        rows = db.execute(stmt.order_by(QrActionRule.qr_value.asc(), QrActionRule.id.asc())).scalars().all()
         return [_qr_action_rule_out(db, row) for row in rows]
 
 
@@ -8541,11 +9273,13 @@ def admin_create_qr_action_rule(body: QrActionRuleIn, x_admin_token: Optional[st
             task_typ=(body.task_typ or "").strip() or None,
             agv_code=(body.agv_code or "").strip() or None,
             requires_scanner_station=int(body.requires_scanner_station or 0),
+            allow_same_cell_move=bool(int(body.allow_same_cell_move or 0)),
             is_active=int(body.is_active),
             created_at=now,
             updated_at=now,
         )
         _apply_fifo_chain_area_modes(row, body)
+        _apply_fifo_chain_task_types(row, body)
         _clear_fifo_chain_step5_if_unused(row)
         db.add(row)
         db.commit()
@@ -8561,6 +9295,10 @@ def admin_update_qr_action_rule(qr_action_rule_id: int, body: QrActionRuleIn, x_
         row = db.execute(select(QrActionRule).where(QrActionRule.id == qr_action_rule_id)).scalar_one_or_none()
         if not row:
             raise HTTPException(status_code=404, detail="Regla QR no encontrada")
+        if int(row.is_active or 0) != 1:
+            raise HTTPException(status_code=409, detail="No se puede editar una Regla QR eliminada. Restáurala primero.")
+        audit_fields = [name for name in QrActionRuleIn.model_fields.keys() if hasattr(row, name)]
+        old_values = _snapshot_fields(row, audit_fields)
         qr_type, match_type, action_type = _validate_qr_action_rule_body(db, body)
         step3_source_mode = _normalize_fifo_chain_step3_source_mode(body.fifo_chain_step3_source_mode)
         step4_source_mode = _normalize_fifo_chain_step4_source_mode(body.fifo_chain_step4_source_mode)
@@ -8611,10 +9349,22 @@ def admin_update_qr_action_rule(qr_action_rule_id: int, body: QrActionRuleIn, x_
         row.task_typ = (body.task_typ or "").strip() or None
         row.agv_code = (body.agv_code or "").strip() or None
         row.requires_scanner_station = int(body.requires_scanner_station or 0)
+        row.allow_same_cell_move = bool(int(body.allow_same_cell_move or 0))
         row.is_active = int(body.is_active or 0)
         row.updated_at = datetime.utcnow()
         _apply_fifo_chain_area_modes(row, body)
+        _apply_fifo_chain_task_types(row, body)
         _clear_fifo_chain_step5_if_unused(row)
+        _audit_model_field_changes(
+            db,
+            table_name="qr_action_rules",
+            record_key=str(row.id),
+            old_values=old_values,
+            row=row,
+            field_names=audit_fields,
+            source="admin_qr_action_rule_update",
+            related_qr_rule_id=row.id,
+        )
         db.add(row)
         db.commit()
         db.refresh(row)
@@ -8629,8 +9379,17 @@ def admin_delete_qr_action_rule(qr_action_rule_id: int, x_admin_token: Optional[
         row = db.execute(select(QrActionRule).where(QrActionRule.id == qr_action_rule_id)).scalar_one_or_none()
         if not row:
             raise HTTPException(status_code=404, detail="Regla QR no encontrada")
+        dependencies = _qr_admin_dependencies(db, "qr_action_rule", row.id)
+        transitions = dependencies["active_transitions"]
+        if transitions:
+            labels = ", ".join(item["name"] for item in transitions)
+            raise HTTPException(status_code=409, detail=f"No se puede eliminar la Regla QR porque tiene {len(transitions)} Transiciones activas: {labels}.")
+        if int(row.is_active or 0) == 0:
+            return _qr_action_rule_out(db, row)
+        now = datetime.utcnow()
         row.is_active = 0
-        row.updated_at = datetime.utcnow()
+        row.updated_at = now
+        _audit_qr_admin_state(db, event="QR_ACTION_RULE_DEACTIVATED", entity_type="qr_action_rule", entity_id=row.id, label=row.qr_value, actor=_admin_soft_delete_actor(x_admin_token), dependencies=dependencies, at=now)
         db.add(row)
         db.commit()
         db.refresh(row)
@@ -8638,13 +9397,47 @@ def admin_delete_qr_action_rule(qr_action_rule_id: int, x_admin_token: Optional[
         return _qr_action_rule_out(db, row)
 
 
-@app.get("/api/admin/qr-transition-rules", response_model=List[QrTransitionRuleOut])
-def admin_list_qr_transition_rules(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+@app.get("/api/admin/qr-action-rules/{qr_action_rule_id}/dependencies")
+def admin_qr_action_rule_dependencies(qr_action_rule_id: int, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
     require_admin(x_admin_token)
     with SessionLocal() as db:
-        rows = db.execute(
-            select(QrTransitionRule).order_by(QrTransitionRule.priority.desc(), QrTransitionRule.id.asc())
-        ).scalars().all()
+        row = db.execute(select(QrActionRule).where(QrActionRule.id == qr_action_rule_id)).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Regla QR no encontrada")
+        return _qr_admin_dependencies(db, "qr_action_rule", row.id)
+
+
+@app.post("/api/admin/qr-action-rules/{qr_action_rule_id}/restore", response_model=QrActionRuleOut)
+def admin_restore_qr_action_rule(qr_action_rule_id: int, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        row = db.execute(select(QrActionRule).where(QrActionRule.id == qr_action_rule_id)).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Regla QR no encontrada")
+        if int(row.is_active or 0) == 1:
+            return _qr_action_rule_out(db, row)
+        if not (row.qr_value or "").strip():
+            raise HTTPException(status_code=409, detail="No se puede restaurar la Regla QR porque qr_value está vacío.")
+        _require_existing_refs(db, row, [
+            ("material_group_id", MaterialGroup, "material"), ("rack_id", Rack, "rack"),
+            ("source_area_id", Area, "área origen"), ("destination_area_id", Area, "área destino"),
+            ("source_cell_id", Location, "celda origen"), ("destination_cell_id", Location, "celda destino"),
+        ])
+        now = datetime.utcnow(); dependencies = _qr_admin_dependencies(db, "qr_action_rule", row.id)
+        row.is_active = 1; row.updated_at = now
+        _audit_qr_admin_state(db, event="QR_ACTION_RULE_RESTORED", entity_type="qr_action_rule", entity_id=row.id, label=row.qr_value, actor=_admin_soft_delete_actor(x_admin_token), dependencies=dependencies, at=now)
+        db.add(row); db.commit(); db.refresh(row)
+        return _qr_action_rule_out(db, row)
+
+
+@app.get("/api/admin/qr-transition-rules", response_model=List[QrTransitionRuleOut])
+def admin_list_qr_transition_rules(include_inactive: bool = False, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        stmt = select(QrTransitionRule)
+        if not include_inactive:
+            stmt = stmt.where(QrTransitionRule.is_active == 1)
+        rows = db.execute(stmt.order_by(QrTransitionRule.priority.desc(), QrTransitionRule.id.asc())).scalars().all()
         return [_qr_transition_rule_out(db, row) for row in rows]
 
 
@@ -8653,6 +9446,7 @@ def admin_create_qr_transition_rule(body: QrTransitionRuleIn, x_admin_token: Opt
     require_admin(x_admin_token)
     with SessionLocal() as db:
         apply_on = validate_transition_rule_payload(db, body)
+        enforce_transition_rule_diagnostics(db, body)
         source_match_mode = (body.source_match_mode or "configured_source").strip() or "configured_source"
         source_area_id = None if source_match_mode == "any_source" else body.source_area_id
         source_cell_id = None if source_match_mode == "any_source" else body.source_cell_id
@@ -8692,6 +9486,14 @@ def admin_create_qr_transition_rule(body: QrTransitionRuleIn, x_admin_token: Opt
         return _qr_transition_rule_out(db, row)
 
 
+@app.post("/api/admin/qr-transition-rules/validate")
+def admin_validate_qr_transition_rule(body: QrTransitionRuleValidateIn, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        validate_transition_rule_payload(db, body)
+        return diagnose_transition_rule_payload(db, body, body.rule_id)
+
+
 @app.get("/api/admin/qr-transition-rules/preview/{movement_order_id}")
 def admin_preview_qr_transition_rule(movement_order_id: int, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
     require_admin(x_admin_token)
@@ -8729,7 +9531,7 @@ def admin_list_qr_transition_logs(
         if clean_status:
             stmt = stmt.where(QrTransitionLog.status == clean_status)
         rows = db.execute(stmt.order_by(QrTransitionLog.created_at.desc(), QrTransitionLog.id.desc()).limit(200)).scalars().all()
-        return [_qr_transition_log_out(db, row) for row in rows]
+        return _qr_transition_logs_out(db, rows)
 
 
 @app.put("/api/admin/qr-transition-rules/{transition_rule_id}", response_model=QrTransitionRuleOut)
@@ -8739,7 +9541,10 @@ def admin_update_qr_transition_rule(transition_rule_id: int, body: QrTransitionR
         row = db.execute(select(QrTransitionRule).where(QrTransitionRule.id == transition_rule_id)).scalar_one_or_none()
         if not row:
             raise HTTPException(status_code=404, detail="Regla de transici?n no encontrada")
+        if int(row.is_active or 0) != 1:
+            raise HTTPException(status_code=409, detail="No se puede editar una Transición eliminada. Restáurala primero.")
         apply_on = validate_transition_rule_payload(db, body)
+        enforce_transition_rule_diagnostics(db, body, transition_rule_id)
         source_match_mode = (body.source_match_mode or "configured_source").strip() or "configured_source"
         row.name = body.name.strip()
         row.description = (body.description or "").strip() or None
@@ -8779,8 +9584,13 @@ def admin_delete_qr_transition_rule(transition_rule_id: int, x_admin_token: Opti
         row = db.execute(select(QrTransitionRule).where(QrTransitionRule.id == transition_rule_id)).scalar_one_or_none()
         if not row:
             raise HTTPException(status_code=404, detail="Regla de transici?n no encontrada")
+        if int(row.is_active or 0) == 0:
+            return _qr_transition_rule_out(db, row)
+        dependencies = _qr_admin_dependencies(db, "qr_transition_rule", row.id)
+        now = datetime.utcnow()
         row.is_active = 0
-        row.updated_at = datetime.utcnow()
+        row.updated_at = now
+        _audit_qr_admin_state(db, event="QR_TRANSITION_RULE_DEACTIVATED", entity_type="qr_transition_rule", entity_id=row.id, label=row.name, actor=_admin_soft_delete_actor(x_admin_token), dependencies=dependencies, at=now)
         db.add(row)
         db.commit()
         db.refresh(row)
@@ -8788,11 +9598,56 @@ def admin_delete_qr_transition_rule(transition_rule_id: int, x_admin_token: Opti
         return _qr_transition_rule_out(db, row)
 
 
-@app.get("/api/admin/scan-terminals", response_model=List[ScanTerminalOut])
-def admin_list_scan_terminals(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+@app.get("/api/admin/qr-transition-rules/{transition_rule_id}/dependencies")
+def admin_qr_transition_rule_dependencies(transition_rule_id: int, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
     require_admin(x_admin_token)
     with SessionLocal() as db:
-        rows = db.execute(select(ScanTerminal).order_by(ScanTerminal.terminal_code.asc(), ScanTerminal.id.asc())).scalars().all()
+        row = db.execute(select(QrTransitionRule).where(QrTransitionRule.id == transition_rule_id)).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Regla de transición no encontrada")
+        return _qr_admin_dependencies(db, "qr_transition_rule", row.id)
+
+
+@app.post("/api/admin/qr-transition-rules/{transition_rule_id}/restore", response_model=QrTransitionRuleOut)
+def admin_restore_qr_transition_rule(transition_rule_id: int, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        row = db.execute(select(QrTransitionRule).where(QrTransitionRule.id == transition_rule_id)).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Regla de transición no encontrada")
+        if int(row.is_active or 0) == 1:
+            return _qr_transition_rule_out(db, row)
+        inactive_dependencies = []
+        if row.qr_action_rule_id:
+            qr = db.execute(select(QrActionRule).where(QrActionRule.id == row.qr_action_rule_id)).scalar_one_or_none()
+            if not qr or int(qr.is_active or 0) != 1:
+                inactive_dependencies.append(f"QR {qr.qr_value if qr else row.qr_action_rule_id}")
+        if row.scanner_station_id:
+            scanner = db.execute(select(ScannerStation).where(ScannerStation.id == row.scanner_station_id)).scalar_one_or_none()
+            if not scanner or int(scanner.is_active or 0) != 1:
+                inactive_dependencies.append(f"Scanner {scanner.scanner_code if scanner else row.scanner_station_id}")
+        if inactive_dependencies:
+            raise HTTPException(status_code=409, detail=f"No se puede restaurar la Transición porque depende de configuraciones eliminadas: {', '.join(inactive_dependencies)}.")
+        _require_existing_refs(db, row, [
+            ("source_area_id", Area, "área origen"), ("destination_area_id", Area, "área destino"),
+            ("source_cell_id", Location, "celda origen"), ("destination_cell_id", Location, "celda destino"),
+            ("current_material_group_id", MaterialGroup, "material actual"), ("next_material_group_id", MaterialGroup, "material siguiente"),
+        ])
+        now = datetime.utcnow(); dependencies = _qr_admin_dependencies(db, "qr_transition_rule", row.id)
+        row.is_active = 1; row.updated_at = now
+        _audit_qr_admin_state(db, event="QR_TRANSITION_RULE_RESTORED", entity_type="qr_transition_rule", entity_id=row.id, label=row.name, actor=_admin_soft_delete_actor(x_admin_token), dependencies=dependencies, at=now)
+        db.add(row); db.commit(); db.refresh(row)
+        return _qr_transition_rule_out(db, row)
+
+
+@app.get("/api/admin/scan-terminals", response_model=List[ScanTerminalOut])
+def admin_list_scan_terminals(include_inactive: bool = False, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        stmt = select(ScanTerminal)
+        if not include_inactive:
+            stmt = stmt.where(ScanTerminal.is_active == 1)
+        rows = db.execute(stmt.order_by(ScanTerminal.terminal_code.asc(), ScanTerminal.id.asc())).scalars().all()
         return [_scan_terminal_out(db, row) for row in rows]
 
 
@@ -8832,6 +9687,8 @@ def admin_update_scan_terminal(terminal_id: int, body: ScanTerminalIn, x_admin_t
         row = db.execute(select(ScanTerminal).where(ScanTerminal.id == terminal_id)).scalar_one_or_none()
         if not row:
             raise HTTPException(status_code=404, detail="Terminal no encontrado")
+        if int(row.is_active or 0) != 1:
+            raise HTTPException(status_code=409, detail="No se puede editar una Terminal eliminada. Restáurala primero.")
         terminal_code = body.terminal_code.strip()
         dup = db.execute(select(ScanTerminal).where(ScanTerminal.terminal_code == terminal_code, ScanTerminal.id != terminal_id)).scalar_one_or_none()
         if dup:
@@ -8861,12 +9718,48 @@ def admin_delete_scan_terminal(terminal_id: int, x_admin_token: Optional[str] = 
         row = db.execute(select(ScanTerminal).where(ScanTerminal.id == terminal_id)).scalar_one_or_none()
         if not row:
             raise HTTPException(status_code=404, detail="Terminal no encontrado")
+        if int(row.is_active or 0) == 0:
+            return _scan_terminal_out(db, row)
+        dependencies = _qr_admin_dependencies(db, "scan_terminal", row.id)
+        now = datetime.utcnow()
         row.is_active = 0
-        row.updated_at = datetime.utcnow()
+        row.updated_at = now
+        _audit_qr_admin_state(db, event="SCAN_TERMINAL_DEACTIVATED", entity_type="scan_terminal", entity_id=row.id, label=row.terminal_code, actor=_admin_soft_delete_actor(x_admin_token), dependencies=dependencies, at=now)
         db.add(row)
         db.commit()
         db.refresh(row)
         logger.info("Scan terminal deactivated terminal_id=%s terminal_code=%s", row.id, row.terminal_code)
+        return _scan_terminal_out(db, row)
+
+
+@app.get("/api/admin/scan-terminals/{terminal_id}/dependencies")
+def admin_scan_terminal_dependencies(terminal_id: int, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        row = db.execute(select(ScanTerminal).where(ScanTerminal.id == terminal_id)).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Terminal no encontrado")
+        return _qr_admin_dependencies(db, "scan_terminal", row.id)
+
+
+@app.post("/api/admin/scan-terminals/{terminal_id}/restore", response_model=ScanTerminalOut)
+def admin_restore_scan_terminal(terminal_id: int, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        row = db.execute(select(ScanTerminal).where(ScanTerminal.id == terminal_id)).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Terminal no encontrado")
+        if int(row.is_active or 0) == 1:
+            return _scan_terminal_out(db, row)
+        scanner = db.execute(select(ScannerStation).where(ScannerStation.id == row.scanner_station_id)).scalar_one_or_none()
+        if not scanner or int(scanner.is_active or 0) != 1:
+            raise HTTPException(status_code=409, detail="No se puede restaurar la Terminal porque su Scanner no existe o está inactivo.")
+        if not (row.terminal_code or "").strip() or not (row.name or "").strip():
+            raise HTTPException(status_code=409, detail="No se puede restaurar la Terminal porque faltan terminal_code o name.")
+        now = datetime.utcnow(); dependencies = _qr_admin_dependencies(db, "scan_terminal", row.id)
+        row.is_active = 1; row.updated_at = now
+        _audit_qr_admin_state(db, event="SCAN_TERMINAL_RESTORED", entity_type="scan_terminal", entity_id=row.id, label=row.terminal_code, actor=_admin_soft_delete_actor(x_admin_token), dependencies=dependencies, at=now)
+        db.add(row); db.commit(); db.refresh(row)
         return _scan_terminal_out(db, row)
 
 
@@ -9329,6 +10222,8 @@ def admin_patch_location(x: int, y: int, patch: LocationPatchAdmin, x_admin_toke
         r = db.execute(select(Location).where(Location.x == x, Location.y == y)).scalar_one_or_none()
         if not r:
             raise HTTPException(status_code=404, detail="Ubicación no encontrada")
+        if patch.status is not None and int(patch.status) == 0:
+            _validate_location_can_mark_free(db, r)
         area_id = patch.area_id if patch.area_id is not None else r.area_id
         rack_id = patch.rack_id if patch.rack_id is not None else r.rack_id
         _validate_foreign_keys(db, area_id, rack_id, ignore_xy=(x, y))
@@ -9362,8 +10257,11 @@ def admin_save_location(x: int, y: int, body: CellDetailSave, x_admin_token: Opt
         r = db.execute(select(Location).where(Location.x == x, Location.y == y)).scalar_one_or_none()
         if not r:
             raise HTTPException(status_code=404, detail="Ubicación no encontrada")
+        if int(body.status) == 0:
+            _validate_location_can_mark_free(db, r)
         _validate_foreign_keys(db, body.area_id, body.rack_id, ignore_xy=(x, y))
         r.code = (body.code or "").strip() or None
+        r.status = body.status
         r.enabled = body.enabled
         r.is_visible = body.is_visible
         r.note = (body.note or "").strip() or None
@@ -9377,11 +10275,98 @@ def admin_save_location(x: int, y: int, body: CellDetailSave, x_admin_token: Opt
         return _location_out(db, r)
 
 
+def _catalog_ids_from_json(value) -> set[int]:
+    try:
+        parsed = json.loads(value or "[]")
+    except (TypeError, ValueError):
+        return set()
+    if not isinstance(parsed, list):
+        return set()
+    result = set()
+    for item in parsed:
+        try:
+            result.add(int(item))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _catalog_ref(row, label_attr: str = "name") -> dict:
+    return {"id": row.id, "code": getattr(row, "code", None), "name": getattr(row, label_attr, None)}
+
+
+def _material_dependencies(db, material_id: int) -> dict:
+    racks = db.execute(select(Rack).where(Rack.material_group_id == material_id).order_by(Rack.code.asc())).scalars().all()
+    qr_rows = db.execute(select(QrActionRule).where(QrActionRule.is_active == 1)).scalars().all()
+    qr_material_fields = ("material_group_id", "fifo_chain_step1_material_group_id", "fifo_chain_step2_material_group_id", "fifo_chain_step3_material_group_id", "fifo_chain_step4_material_group_id", "fifo_chain_step5_material_group_id")
+    qr_rules = [row for row in qr_rows if any(getattr(row, field, None) == material_id for field in qr_material_fields)]
+    scanner_rows = db.execute(select(ScannerStation).where(ScannerStation.is_active == 1)).scalars().all()
+    scanner_material_fields = ("default_material_group_id", "fifo_chain_step1_material_group_id", "fifo_chain_step2_material_group_id", "fifo_chain_step3_material_group_id", "fifo_chain_step4_material_group_id", "fifo_chain_step5_material_group_id")
+    scanners = [row for row in scanner_rows if any(getattr(row, field, None) == material_id for field in scanner_material_fields)]
+    transitions = db.execute(select(QrTransitionRule).where(QrTransitionRule.is_active == 1, or_(QrTransitionRule.current_material_group_id == material_id, QrTransitionRule.next_material_group_id == material_id))).scalars().all()
+    active_orders = db.execute(select(MovementOrder).where(MovementOrder.material_group_id == material_id, MovementOrder.status.in_(RACK_RESERVATION_ACTIVE_STATUSES))).scalars().all()
+    window_buttons = db.execute(select(OperatorWindowButton).where(OperatorWindowButton.is_active == 1, OperatorWindowButton.material_group_id == material_id)).scalars().all()
+    active = {
+        "racks": [_catalog_ref(row) for row in racks],
+        "qr_rules": [{"id": row.id, "code": row.qr_value, "name": row.qr_alias} for row in qr_rules],
+        "scanners": [{"id": row.id, "code": row.scanner_code, "name": row.name} for row in scanners],
+        "transitions": [{"id": row.id, "name": row.name} for row in transitions],
+        "active_orders": [{"id": row.id, "code": row.order_code, "status": row.status} for row in active_orders],
+        "operator_buttons": [{"id": row.id, "name": row.label} for row in window_buttons],
+    }
+    historical = {
+        "movement_orders": int(db.execute(select(func.count()).select_from(MovementOrder).where(MovementOrder.material_group_id == material_id, MovementOrder.status.notin_(RACK_RESERVATION_ACTIVE_STATUSES))).scalar_one() or 0),
+        "scan_events": int(db.execute(select(func.count()).select_from(ScanEvent).where(ScanEvent.material_group_id == material_id)).scalar_one() or 0),
+        "transition_logs": int(db.execute(select(func.count()).select_from(QrTransitionLog).where(or_(QrTransitionLog.previous_material_group_id == material_id, QrTransitionLog.next_material_group_id == material_id))).scalar_one() or 0),
+    }
+    return {"active_dependencies": active, "historical_references": historical, "can_delete": not any(active.values())}
+
+
+def _area_dependencies(db, area_id: int) -> dict:
+    locations = db.execute(select(Location).where(Location.area_id == area_id, or_(Location.enabled == 1, Location.is_visible == 1))).scalars().all()
+    rack_locations = [row for row in locations if row.rack_id is not None]
+    active_orders = db.execute(select(MovementOrder).where(or_(MovementOrder.source_area_id == area_id, MovementOrder.destination_area_id == area_id), MovementOrder.status.in_(RACK_RESERVATION_ACTIVE_STATUSES))).scalars().all()
+    scanner_rows = db.execute(select(ScannerStation).where(ScannerStation.is_active == 1)).scalars().all()
+    qr_rows = db.execute(select(QrActionRule).where(QrActionRule.is_active == 1)).scalars().all()
+    direct_area_fields = ("source_area_id", "destination_area_id", "second_source_area_id", "second_destination_area_id", "storage_area_id", "empty_rack_area_id", "cancel_return_area_id", "fifo_chain_step3_source_area_id", "fifo_chain_step3_destination_area_id", "fifo_chain_step4_source_area_id", "fifo_chain_step4_destination_area_id", "fifo_chain_step5_source_area_id", "fifo_chain_step5_destination_area_id")
+    json_area_fields = tuple(f"fifo_chain_step{step}_{kind}_area_ids_json" for step in range(1, 6) for kind in ("source", "destination"))
+    def uses_area(row):
+        return any(getattr(row, field, None) == area_id for field in direct_area_fields) or any(area_id in _catalog_ids_from_json(getattr(row, field, None)) for field in json_area_fields)
+    scanners = [row for row in scanner_rows if uses_area(row)]
+    qr_rules = [row for row in qr_rows if uses_area(row)]
+    transitions = db.execute(select(QrTransitionRule).where(QrTransitionRule.is_active == 1, or_(QrTransitionRule.source_area_id == area_id, QrTransitionRule.destination_area_id == area_id))).scalars().all()
+    window_buttons = db.execute(select(OperatorWindowButton).where(OperatorWindowButton.is_active == 1, or_(OperatorWindowButton.source_area_id == area_id, OperatorWindowButton.destination_area_id == area_id))).scalars().all()
+    active = {
+        "locations": [{"id": row.id, "code": _cell_code(row), "enabled": row.enabled, "is_visible": row.is_visible} for row in locations],
+        "racks": [{"location_id": row.id, "rack_id": row.rack_id, "location": _cell_code(row)} for row in rack_locations],
+        "active_orders": [{"id": row.id, "code": row.order_code, "status": row.status} for row in active_orders],
+        "scanners": [{"id": row.id, "code": row.scanner_code, "name": row.name} for row in scanners],
+        "qr_rules": [{"id": row.id, "code": row.qr_value, "name": row.qr_alias} for row in qr_rules],
+        "transitions": [{"id": row.id, "name": row.name} for row in transitions],
+        "cancel_return_configs": [{"id": row.id, "code": row.scanner_code, "name": row.name} for row in scanner_rows if row.cancel_return_area_id == area_id],
+        "operator_buttons": [{"id": row.id, "name": row.label} for row in window_buttons],
+    }
+    historical = {
+        "movement_orders": int(db.execute(select(func.count()).select_from(MovementOrder).where(or_(MovementOrder.source_area_id == area_id, MovementOrder.destination_area_id == area_id), MovementOrder.status.notin_(RACK_RESERVATION_ACTIVE_STATUSES))).scalar_one() or 0),
+        "scan_events": int(db.execute(select(func.count()).select_from(ScanEvent).where(or_(ScanEvent.source_area_id == area_id, ScanEvent.destination_area_id == area_id))).scalar_one() or 0),
+    }
+    return {"active_dependencies": active, "historical_references": historical, "can_delete": not any(active.values())}
+
+
+def _audit_catalog_state(db, event: str, row, actor: str, dependencies: dict, now: datetime) -> None:
+    payload = {"event": event, "id": row.id, "code": row.code, "name": row.name, "actor": actor, **dependencies, "timestamp": now.isoformat()}
+    _append_debug_console_event(db, direction="received", module="catalog_admin", endpoint=event, payload=payload, message=f"{event} id={row.id} code={row.code}", created_at=now, auto_commit=False)
+    logger.info("%s id=%s code=%s actor=%s dependencies=%s timestamp=%s", event, row.id, row.code, actor, json.dumps(dependencies, ensure_ascii=False), now.isoformat())
+
+
 @app.get("/api/admin/areas", response_model=List[AreaOut])
-def list_areas(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+def list_areas(include_inactive: bool = False, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
     require_admin(x_admin_token)
     with SessionLocal() as db:
-        return [_to_area_out(r) for r in db.execute(select(Area).order_by(Area.priority.asc(), Area.name.asc())).scalars().all()]
+        stmt = select(Area)
+        if not include_inactive:
+            stmt = stmt.where(Area.is_active == 1)
+        return [_to_area_out(r) for r in db.execute(stmt.order_by(Area.priority.asc(), Area.name.asc())).scalars().all()]
 
 
 @app.post("/api/admin/areas", response_model=AreaOut)
@@ -9406,6 +10391,8 @@ def update_area(area_id: int, body: AreaIn, x_admin_token: Optional[str] = Heade
         row = db.execute(select(Area).where(Area.id == area_id)).scalar_one_or_none()
         if not row:
             raise HTTPException(status_code=404, detail="Área no encontrada")
+        if int(row.is_active or 0) != 1:
+            raise HTTPException(status_code=409, detail="El área está inactiva; restáurala antes de editarla")
         dup = db.execute(select(Area).where(Area.code == body.code.strip(), Area.id != area_id)).scalar_one_or_none()
         if dup:
             raise HTTPException(status_code=400, detail="Ya existe un área con ese código")
@@ -9432,18 +10419,57 @@ def delete_area(area_id: int, x_admin_token: Optional[str] = Header(default=None
         row = db.execute(select(Area).where(Area.id == area_id)).scalar_one_or_none()
         if not row:
             raise HTTPException(status_code=404, detail="Área no encontrada")
-        _ensure_area_not_in_use(db, area_id)
-        db.delete(row)
+        dependencies = _area_dependencies(db, area_id)
+        if int(row.is_active or 0) == 0:
+            return {"ok": True, "already_inactive": True, **dependencies}
+        if not dependencies["can_delete"]:
+            raise HTTPException(status_code=409, detail={"message": "El área tiene dependencias operativas activas", **dependencies})
+        now = datetime.utcnow()
+        row.is_active = 0
+        row.updated_at = now
+        _audit_catalog_state(db, "AREA_DEACTIVATED", row, _admin_soft_delete_actor(x_admin_token), dependencies, now)
         db.commit()
-        logger.info("Area deleted area_id=%s code=%s", area_id, row.code)
-        return {"ok": True}
+        return {"ok": True, "is_active": 0, **dependencies}
+
+
+@app.get("/api/admin/areas/{area_id}/dependencies")
+def get_area_dependencies(area_id: int, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        row = db.execute(select(Area).where(Area.id == area_id)).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Área no encontrada")
+        return {"entity": "area", "id": row.id, "code": row.code, "name": row.name, **_area_dependencies(db, area_id)}
+
+
+@app.post("/api/admin/areas/{area_id}/restore", response_model=AreaOut)
+def restore_area(area_id: int, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        row = db.execute(select(Area).where(Area.id == area_id)).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Área no encontrada")
+        if int(row.is_active or 0) == 1:
+            return _to_area_out(row)
+        conflict = db.execute(select(Area).where(Area.id != area_id, Area.is_active == 1, or_(Area.code == row.code, Area.name == row.name))).scalar_one_or_none()
+        if conflict:
+            raise HTTPException(status_code=409, detail="Existe otra área activa con el mismo código o nombre")
+        dependencies = _area_dependencies(db, area_id)
+        now = datetime.utcnow(); row.is_active = 1; row.updated_at = now
+        _audit_catalog_state(db, "AREA_RESTORED", row, _admin_soft_delete_actor(x_admin_token), dependencies, now)
+        db.commit(); db.refresh(row)
+        return _to_area_out(row)
 
 
 @app.get("/api/admin/materials", response_model=List[MaterialGroupOut])
-def list_materials(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+@app.get("/api/admin/material-groups", response_model=List[MaterialGroupOut])
+def list_materials(include_inactive: bool = False, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
     require_admin(x_admin_token)
     with SessionLocal() as db:
-        return [_to_material_out(r) for r in db.execute(select(MaterialGroup).order_by(MaterialGroup.name.asc())).scalars().all()]
+        stmt = select(MaterialGroup)
+        if not include_inactive:
+            stmt = stmt.where(MaterialGroup.is_active == 1)
+        return [_to_material_out(r) for r in db.execute(stmt.order_by(MaterialGroup.name.asc())).scalars().all()]
 
 
 @app.post("/api/admin/materials", response_model=MaterialGroupOut)
@@ -9468,6 +10494,8 @@ def update_material(material_id: int, body: MaterialGroupIn, x_admin_token: Opti
         row = db.execute(select(MaterialGroup).where(MaterialGroup.id == material_id)).scalar_one_or_none()
         if not row:
             raise HTTPException(status_code=404, detail="Material no encontrado")
+        if int(row.is_active or 0) != 1:
+            raise HTTPException(status_code=409, detail="El material está inactivo; restáuralo antes de editarlo")
         dup = db.execute(select(MaterialGroup).where(MaterialGroup.code == body.code.strip(), MaterialGroup.id != material_id)).scalar_one_or_none()
         if dup:
             raise HTTPException(status_code=400, detail="Ya existe un material con ese código")
@@ -9485,17 +10513,53 @@ def update_material(material_id: int, body: MaterialGroupIn, x_admin_token: Opti
 
 
 @app.delete("/api/admin/materials/{material_id}")
+@app.delete("/api/admin/material-groups/{material_id}")
 def delete_material(material_id: int, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
     require_admin(x_admin_token)
     with SessionLocal() as db:
         row = db.execute(select(MaterialGroup).where(MaterialGroup.id == material_id)).scalar_one_or_none()
         if not row:
             raise HTTPException(status_code=404, detail="Material no encontrado")
-        _ensure_material_not_in_use(db, material_id)
-        db.delete(row)
+        dependencies = _material_dependencies(db, material_id)
+        if int(row.is_active or 0) == 0:
+            return {"ok": True, "already_inactive": True, **dependencies}
+        if not dependencies["can_delete"]:
+            raise HTTPException(status_code=409, detail={"message": "El material tiene dependencias operativas activas", **dependencies})
+        now = datetime.utcnow(); row.is_active = 0; row.updated_at = now
+        _audit_catalog_state(db, "MATERIAL_GROUP_DEACTIVATED", row, _admin_soft_delete_actor(x_admin_token), dependencies, now)
         db.commit()
-        logger.info("Material deleted material_id=%s code=%s", material_id, row.code)
-        return {"ok": True}
+        return {"ok": True, "is_active": 0, **dependencies}
+
+
+@app.get("/api/admin/materials/{material_id}/dependencies")
+@app.get("/api/admin/material-groups/{material_id}/dependencies")
+def get_material_dependencies(material_id: int, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        row = db.execute(select(MaterialGroup).where(MaterialGroup.id == material_id)).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Material no encontrado")
+        return {"entity": "material", "id": row.id, "code": row.code, "name": row.name, **_material_dependencies(db, material_id)}
+
+
+@app.post("/api/admin/materials/{material_id}/restore", response_model=MaterialGroupOut)
+@app.post("/api/admin/material-groups/{material_id}/restore", response_model=MaterialGroupOut)
+def restore_material(material_id: int, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        row = db.execute(select(MaterialGroup).where(MaterialGroup.id == material_id)).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Material no encontrado")
+        if int(row.is_active or 0) == 1:
+            return _to_material_out(row)
+        conflict = db.execute(select(MaterialGroup).where(MaterialGroup.id != material_id, MaterialGroup.is_active == 1, or_(MaterialGroup.code == row.code, MaterialGroup.name == row.name))).scalar_one_or_none()
+        if conflict:
+            raise HTTPException(status_code=409, detail="Existe otro material activo con el mismo código o nombre")
+        dependencies = _material_dependencies(db, material_id)
+        now = datetime.utcnow(); row.is_active = 1; row.updated_at = now
+        _audit_catalog_state(db, "MATERIAL_GROUP_RESTORED", row, _admin_soft_delete_actor(x_admin_token), dependencies, now)
+        db.commit(); db.refresh(row)
+        return _to_material_out(row)
 
 
 def _diagnosis_rows(db, sql: str, params: Optional[dict] = None) -> List[dict]:
@@ -9808,14 +10872,31 @@ def _close_cleanup_order(db, order: MovementOrder, *, now: datetime, reason: str
     return {"order_id": order.id, "order_code": order.order_code, "old_status": old_status, "new_status": new_status}
 
 
-def _recent_order_activity_at(order: MovementOrder) -> Optional[datetime]:
-    dates = [
-        order.updated_at,
-        order.rcs_last_update,
-        order.status_query_checked_at,
-        order.dispatched_at,
-    ]
-    return max([dt for dt in dates if dt is not None], default=None)
+FORCE_RELEASE_ACTIVE_LOCAL_STATUSES = {
+    "pending_dispatch", "dispatched", "in_progress",
+    "cancel_requested_total", "cancel_requested_undo", "cancel_error",
+}
+FORCE_RELEASE_ACTIVE_RCS_STATUSES = {
+    "2", "dispatched", "in_progress", "executing", "running", "moving", "working", "canceling",
+}
+FORCE_RELEASE_RCS_ACTIVE_WARNING = (
+    "El RCS todavía reporta la tarea activa. Este cierre solo libera la orden y el rack "
+    "dentro de la aplicación; no detiene físicamente al robot ni cancela la tarea en RCS."
+)
+
+
+def _order_age_anchor(order: MovementOrder) -> datetime:
+    return order.dispatched_at or order.created_at or datetime.utcnow()
+
+
+def _age_minutes(now: datetime, value: Optional[datetime]) -> Optional[int]:
+    if value is None:
+        return None
+    return max(0, int((now - value).total_seconds() // 60))
+
+
+def _rcs_status_still_active(order: MovementOrder) -> bool:
+    return str(order.rcs_status or "").strip().lower() in FORCE_RELEASE_ACTIVE_RCS_STATUSES
 
 
 def _cancel_return_recovery_eligible(order: MovementOrder, *, now: datetime, min_age_minutes: int) -> tuple[bool, str]:
@@ -9836,33 +10917,24 @@ def _normalized_cleanup_rcs_terminal_status(value) -> str:
 
 
 def _validate_force_release_order(order: MovementOrder, *, now: datetime, min_age_minutes: int) -> tuple[bool, str]:
-    cutoff = now - timedelta(minutes=min_age_minutes)
-    if (order.status or "") not in RACK_RESERVATION_ACTIVE_STATUSES:
+    if (order.status or "") not in FORCE_RELEASE_ACTIVE_LOCAL_STATUSES:
         return False, f"orden no activa ID {order.id}"
-    if _normalized_cleanup_rcs_terminal_status(order.rcs_status):
-        return True, "SAFE_RCS_TERMINAL"
-    created_at = order.created_at or order.updated_at or now
-    if created_at > cutoff:
-        return False, f"No se puede liberar: orden activa reciente ID {order.id}."
-    if (order.status or "") == "cancel_requested_undo":
-        eligible, reason = _cancel_undo_recovery_candidate(None, order, now=now, min_age_minutes=min_age_minutes)
-        return eligible, reason
-    if (order.status or "") in CANCEL_REQUEST_STATUSES:
-        if str(order.rcs_status or "").strip().lower() != "cancelled":
-            return False, f"No se puede liberar: cancelacion sin confirmacion RCS ID {order.id}."
-        cancel_requested_at = order.closed_at or order.updated_at or order.created_at or now
-        if cancel_requested_at > cutoff:
-            return False, f"No se puede liberar: cancelacion reciente ID {order.id}."
-        if _robot_monitor_indicates_order_running(order):
-            return False, f"No se puede liberar: AGV ejecutando cancelacion ID {order.id}."
-        return True, ""
-    recent_at = _recent_order_activity_at(order)
-    if recent_at and recent_at > cutoff:
-        return False, f"No se puede liberar: orden con actualización reciente ID {order.id}."
-    return True, ""
+    age = _age_minutes(now, _order_age_anchor(order)) or 0
+    if age < min_age_minutes:
+        return False, (
+            f"La orden tiene {age} minutos. Podrá revisarse para cierre local después de "
+            f"{min_age_minutes} minutos."
+        )
+    rcs_status = str(order.rcs_status or "desconocido").strip().lower()
+    if _rcs_status_still_active(order):
+        return True, (
+            f"Orden activa desde hace {age} minutos. RCS todavía reporta {rcs_status}. "
+            "Se permite únicamente cierre local manual con confirmación."
+        )
+    return True, f"Orden activa desde hace {age} minutos; elegible para cierre local manual."
 
 
-def _force_close_old_active_order(db, order: MovementOrder, *, now: datetime, admin_user: str) -> dict:
+def _force_close_old_active_order(db, order: MovementOrder, *, now: datetime, admin_user: str, reason: str = "") -> dict:
     old_status = order.status or ""
     rcs_status = str(order.rcs_status or "").strip().lower()
     normalized_rcs_terminal = _normalized_cleanup_rcs_terminal_status(rcs_status)
@@ -9902,7 +10974,7 @@ def _force_close_old_active_order(db, order: MovementOrder, *, now: datetime, ad
         order.status = "forced_local_closed"
         order.rcs_status = "unknown_or_not_found"
         order.dispatch_status = "forced_closed"
-        order.forced_local_close_reason = "admin_force_release_old_active_order"
+        order.forced_local_close_reason = (reason or "admin_force_release_old_active_order")[:128]
         order.rcs_message = "Cierre local forzado por admin: orden vieja no confirmada en RCS"
     order.forced_local_close = 1
     order.forced_local_close_at = now
@@ -9919,8 +10991,8 @@ def _force_close_old_active_order(db, order: MovementOrder, *, now: datetime, ad
         auto_commit=False,
     )
     db.add(order)
+    rack = db.execute(select(Rack).where(Rack.id == order.rack_id)).scalar_one_or_none() if order.rack_id else None
     if old_status == "cancel_requested_undo":
-        rack = db.execute(select(Rack).where(Rack.id == order.rack_id)).scalar_one_or_none() if order.rack_id else None
         logger.info(
             "CANCEL_UNDO_TERMINAL_CLOSE order_id=%s rack_id=%s rack_code=%s robot_code=%s previous_dispatch_status=%s new_dispatch_status=%s rcs_status=%s source=%s reason=%s cells_modified=false",
             order.id,
@@ -9933,13 +11005,20 @@ def _force_close_old_active_order(db, order: MovementOrder, *, now: datetime, ad
             "cleanup_force_release",
             order.forced_local_close_reason,
         )
+    age_minutes = _age_minutes(now, _order_age_anchor(order))
     logger.info(
-        "[FORCE RELEASE] order_id=%s rack_id=%s previous_status=%s new_status=%s source=cleanup_force_release reason=%s",
+        "FORCE_RELEASE_OLD_ACTIVE_ORDER order_id=%s rack_id=%s rack_code=%s remote_task_code=%s robot_code=%s "
+        "order_age_minutes=%s last_rcs_status=%s actor=%s reason=%s rcs_still_active=%s",
         order.id,
         order.rack_id,
-        old_status,
-        order.status,
+        rack.code if rack else None,
+        order.remote_task_code,
+        order.agv_code,
+        age_minutes,
+        rcs_status,
+        admin_user,
         order.forced_local_close_reason,
+        rcs_status in FORCE_RELEASE_ACTIVE_RCS_STATUSES,
     )
     logger.info("[FORCE RELEASE] Orden %s %s user=%s old_status=%s", order.id, order.status, admin_user, old_status)
     _append_debug_console_event(
@@ -9951,16 +11030,24 @@ def _force_close_old_active_order(db, order: MovementOrder, *, now: datetime, ad
             "action": "force_release_close_order",
             "order_id": order.id,
             "rack_id": order.rack_id,
+            "rack_code": rack.code if rack else None,
             "old_status": old_status,
             "new_status": order.status,
             "reason": order.forced_local_close_reason,
+            "event": "FORCE_RELEASE_OLD_ACTIVE_ORDER",
+            "remote_task_code": order.remote_task_code,
+            "robot_code": order.agv_code,
+            "order_age_minutes": age_minutes,
+            "last_rcs_status": rcs_status,
+            "actor": admin_user,
+            "rcs_still_active": rcs_status in FORCE_RELEASE_ACTIVE_RCS_STATUSES,
             "at": now.isoformat(),
         },
         message=f"[FORCE RELEASE] Orden {order.id} forced_local_closed",
         created_at=now,
         auto_commit=False,
     )
-    return {"order_id": order.id, "order_code": order.order_code, "rack_id": order.rack_id, "old_status": old_status, "new_status": order.status}
+    return {"order_id": order.id, "order_code": order.order_code, "rack_id": order.rack_id, "old_status": old_status, "new_status": order.status, "order_age_minutes": age_minutes}
 
 
 def _auto_release_stuck_cancel_return_orders(db, *, now: datetime) -> int:
@@ -10047,6 +11134,93 @@ def _annotate_cleanup_safety(db, diagnosis: dict) -> dict:
     return diagnosis
 
 
+def _diagnose_inconsistent_locations(db, *, location_ids: Optional[set[int]] = None) -> List[dict]:
+    """Classify functional Location inconsistencies without changing physical assignments."""
+    locations = db.execute(select(Location).order_by(Location.id.asc())).scalars().all()
+    if location_ids is not None:
+        locations = [row for row in locations if row.id in location_ids]
+    rack_ids = {int(row.rack_id) for row in locations if row.rack_id is not None and int(row.rack_id) > 0}
+    racks = db.execute(select(Rack).where(Rack.id.in_(rack_ids))).scalars().all() if rack_ids else []
+    rack_by_id = {row.id: row for row in racks}
+    area_ids = {row.area_id for row in locations if row.area_id}
+    areas = db.execute(select(Area).where(Area.id.in_(area_ids))).scalars().all() if area_ids else []
+    area_by_id = {row.id: row for row in areas}
+    duplicate_rack_ids = {
+        int(rack_id) for rack_id, count in db.execute(
+            select(Location.rack_id, func.count(Location.id))
+            .where(Location.rack_id.is_not(None))
+            .group_by(Location.rack_id)
+            .having(func.count(Location.id) > 1)
+        ).all() if rack_id is not None
+    }
+    active_orders = db.execute(
+        select(MovementOrder).where(MovementOrder.status.in_(RACK_RESERVATION_ACTIVE_STATUSES))
+    ).scalars().all()
+    active_by_location: dict[int, list[MovementOrder]] = {}
+    for order in active_orders:
+        for location_id in {order.source_cell_id, order.destination_cell_id}:
+            if location_id:
+                active_by_location.setdefault(int(location_id), []).append(order)
+
+    results: List[dict] = []
+    for row in locations:
+        status = int(row.status or 0)
+        rack = rack_by_id.get(row.rack_id) if row.rack_id else None
+        issue_code = ""
+        reason = ""
+        suggested_repair = "manual_review"
+        if row.rack_id is not None and (int(row.rack_id) <= 0 or rack is None):
+            issue_code = "rack_reference_missing"
+            reason = "La celda apunta a un rack inexistente."
+        elif row.rack_id in duplicate_rack_ids:
+            issue_code = "multiple_locations_same_rack"
+            reason = "Más de una Location apunta al mismo rack."
+        elif row.rack_id is None and status != 0:
+            issue_code = "occupied_without_rack"
+            reason = "La celda está marcada como ocupada, pero no tiene rack."
+            suggested_repair = "mark_free"
+        elif row.rack_id is not None and status != 1:
+            issue_code = "free_with_rack"
+            reason = "La celda está marcada como libre, pero contiene un rack."
+            suggested_repair = "mark_occupied_after_review"
+        if not issue_code:
+            continue
+
+        blocking_reasons: List[str] = []
+        operational_warnings: List[str] = []
+        orders = active_by_location.get(row.id, [])
+        if orders:
+            labels = ", ".join(str(order.order_code or order.id) for order in orders)
+            blocking_reasons.append(f"La celda participa en la orden activa {labels}. Cierra o recupera primero la orden desde Recuperación avanzada en Diagnóstico y limpieza.")
+        if int(row.enabled or 0) != 1:
+            operational_warnings.append("La celda está deshabilitada: se corregirá únicamente su estado de ocupación.")
+        if int(row.is_visible or 0) != 1:
+            operational_warnings.append("La celda está oculta: se corregirá únicamente su estado de ocupación.")
+        if issue_code != "occupied_without_rack":
+            blocking_reasons.append("Esta clase requiere revisión manual de la relación física con el rack.")
+        safe_to_repair = issue_code == "occupied_without_rack" and not blocking_reasons
+        area = area_by_id.get(row.area_id) if row.area_id else None
+        results.append({
+            "location_id": row.id,
+            "code": row.code,
+            "x": row.x,
+            "y": row.y,
+            "area_id": row.area_id,
+            "area_name": area.name if area else None,
+            "status": status,
+            "rack_id": row.rack_id,
+            "rack_code": rack.code if rack else None,
+            "issue_code": issue_code,
+            "reason": reason,
+            "safe_to_repair": safe_to_repair,
+            "blocking_reasons": blocking_reasons,
+            "operational_warnings": operational_warnings,
+            "suggested_repair": suggested_repair,
+            "location_in_active_order": bool(orders),
+        })
+    return results
+
+
 def _run_cleanup_diagnosis(db) -> dict:
     active_statuses = tuple(RACK_RESERVATION_ACTIVE_STATUSES)
     active_status_list = ", ".join(f":active_status_{idx}" for idx, _ in enumerate(active_statuses))
@@ -10118,31 +11292,7 @@ def _run_cleanup_diagnosis(db) -> dict:
         """,
         params,
     )
-    inconsistent_locations = _diagnosis_rows(
-        db,
-        """
-        SELECT
-            l.id AS location_id,
-            l.x,
-            l.y,
-            l.status,
-            l.rack_id,
-            r.code AS rack_code,
-            CASE
-                WHEN l.rack_id IS NOT NULL AND l.rack_id <= 0 THEN 'rack_id invalido'
-                WHEN l.rack_id IS NOT NULL AND r.id IS NULL THEN 'rack inexistente'
-                WHEN l.rack_id IS NULL AND coalesce(l.status, 0) <> 0 THEN 'status ocupado sin rack'
-                WHEN l.rack_id IS NOT NULL AND coalesce(l.status, 0) <> 1 THEN 'status libre con rack'
-                ELSE 'inconsistente'
-            END AS reason
-        FROM locations l
-        LEFT JOIN racks r ON r.id = l.rack_id
-        WHERE (l.rack_id IS NOT NULL AND (l.rack_id <= 0 OR r.id IS NULL))
-           OR (l.rack_id IS NULL AND coalesce(l.status, 0) <> 0)
-           OR (l.rack_id IS NOT NULL AND coalesce(l.status, 0) <> 1)
-        ORDER BY l.id
-        """,
-    )
+    inconsistent_locations = _diagnose_inconsistent_locations(db)
     old_active_racks = []
     active_order_rows = db.execute(
         select(MovementOrder, Rack)
@@ -10151,21 +11301,17 @@ def _run_cleanup_diagnosis(db) -> dict:
         .order_by(Rack.id.asc(), MovementOrder.created_at.asc(), MovementOrder.id.asc())
     ).all()
     for order, rack in active_order_rows:
-        created_at = order.created_at or order.updated_at or now
-        age_minutes = max(0, int((now - created_at).total_seconds() // 60))
+        age_minutes = _age_minutes(now, _order_age_anchor(order)) or 0
+        last_query_age_minutes = _age_minutes(now, order.status_query_checked_at)
+        meaningful_at = getattr(order, "rcs_status_changed_at", None) or order.dispatched_at or order.created_at
+        last_meaningful_rcs_change_age_minutes = _age_minutes(now, meaningful_at)
         terminal_rcs_status = _normalized_cleanup_rcs_terminal_status(order.rcs_status)
         safe, safe_reason = _validate_force_release_order(order, now=now, min_age_minutes=force_min_age_minutes)
-        if safe and not terminal_rcs_status and (order.status or "") in CANCEL_REQUEST_STATUSES:
-            if (order.status or "") != "cancel_requested_undo" and not rack_status_is_reserved(rack.status or ""):
-                safe = False
-                safe_reason = "rack no esta reservado"
-            active_other = _active_orders_for_rack(db, rack.id, exclude_order_id=order.id)
-            if safe and active_other:
-                safe = False
-                safe_reason = "otra orden activa asociada al mismo rack"
-        if safe and not terminal_rcs_status and (order.status or "") not in CANCEL_REQUEST_STATUSES and rack.last_moved_at and rack.last_moved_at > (now - timedelta(minutes=force_min_age_minutes)):
+        active_other = _active_orders_for_rack(db, rack.id, exclude_order_id=order.id)
+        if safe and active_other:
             safe = False
-            safe_reason = "rack con movimiento reciente"
+            safe_reason = "No se puede liberar: existe otra orden activa asociada al mismo rack."
+        rcs_still_active = _rcs_status_still_active(order)
         old_active_racks.append({
             "rack_id": rack.id,
             "rack_code": rack.code,
@@ -10173,8 +11319,16 @@ def _run_cleanup_diagnosis(db) -> dict:
             "order_status": order.status,
             "rcs_status": order.rcs_status,
             "age_minutes": age_minutes,
+            "order_age_minutes": age_minutes,
+            "last_query_age_minutes": last_query_age_minutes,
+            "last_meaningful_rcs_change_age_minutes": last_meaningful_rcs_change_age_minutes,
             "recovery_case": "cancel_return_stuck" if (order.status or "") == "cancel_requested_undo" and str(order.rcs_status or "").strip().lower() in CANCEL_RETURN_RCS_TERMINAL_STATUSES else "old_active_order",
             "safe": bool(safe),
+            "safe_to_release": bool(safe),
+            "requires_force_confirmation": bool(safe),
+            "confirmation_required": bool(safe),
+            "rcs_still_active_warning": rcs_still_active,
+            "warning": FORCE_RELEASE_RCS_ACTIVE_WARNING if rcs_still_active else "",
             "safe_reason": safe_reason,
             "motivo": "RCS terminal confirmado" if safe_reason == "SAFE_RCS_TERMINAL" else safe_reason,
         })
@@ -10244,6 +11398,55 @@ def cleanup_diagnosis(x_admin_token: Optional[str] = Header(default=None, alias=
         int((time.monotonic() - started) * 1000),
     )
     return diagnosis
+
+
+@app.post("/api/admin/repair-inconsistent-locations")
+def repair_inconsistent_locations(body: RepairInconsistentLocationsIn, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    now = datetime.utcnow()
+    actor = f"admin:{(x_admin_token or '')[-6:]}" if x_admin_token else "admin"
+    requested_ids = sorted({int(value) for value in body.location_ids if int(value or 0) > 0})
+    repaired: List[dict] = []
+    skipped: List[dict] = []
+    with SessionLocal() as db:
+        for location_id in requested_ids:
+            row = db.execute(select(Location).where(Location.id == location_id)).scalar_one_or_none()
+            if not row:
+                skipped.append({"location_id": location_id, "reason": "Location no encontrada."})
+                continue
+            findings = _diagnose_inconsistent_locations(db, location_ids={location_id})
+            finding = findings[0] if findings else None
+            if not finding:
+                skipped.append({"location_id": location_id, "reason": "La Location ya no presenta una inconsistencia."})
+                continue
+            if not finding["safe_to_repair"] or finding["suggested_repair"] != "mark_free":
+                reasons = finding["blocking_reasons"] or ["No se pudo determinar una reparación segura."]
+                skipped.append({"location_id": location_id, "issue_code": finding["issue_code"], "reason": " ".join(reasons)})
+                continue
+            before_status = int(row.status or 0)
+            row.status = 0
+            row.updated_at = now
+            db.add(row)
+            audit_payload = {
+                "event": "REPAIR_INCONSISTENT_LOCATION",
+                "location_id": row.id,
+                "location_code": row.code,
+                "area_id": row.area_id,
+                "area_name": finding.get("area_name"),
+                "issue_code": finding["issue_code"],
+                "before_status": before_status,
+                "after_status": 0,
+                "rack_id": row.rack_id,
+                "actor": actor,
+                "reason": body.reason.strip(),
+                "at": now.isoformat(),
+            }
+            _append_debug_console_event(db, direction="received", module="cleanup", payload=audit_payload, message=f"REPAIR_INCONSISTENT_LOCATION location_id={row.id} {before_status} -> 0", created_at=now, auto_commit=False)
+            repaired.append({"location_id": row.id, "issue_code": finding["issue_code"], "before_status": before_status, "after_status": 0})
+        db.commit()
+        diagnosis = _run_cleanup_diagnosis(db)
+    logger.info("REPAIR_INCONSISTENT_LOCATION completed selected=%s repaired=%s skipped=%s actor=%s", len(requested_ids), len(repaired), len(skipped), actor)
+    return {"ok": True, "repaired": repaired, "skipped": skipped, "diagnosis": diagnosis}
 
 
 @app.get("/api/admin/cleanup-health", response_model=CleanupHealthOut)
@@ -10414,6 +11617,8 @@ def force_release_old_active_racks(body: CleanupSelectionIn, x_admin_token: Opti
             if len(active_orders) > 1:
                 skipped.append({"rack_id": rack_id, "rack_code": rack.code, "reason": "No se puede liberar: existe otra orden activa asociada al mismo rack."})
                 continue
+            if any(_rcs_status_still_active(order) for order in active_orders) and not body.confirm_local_only:
+                raise HTTPException(status_code=409, detail=FORCE_RELEASE_RCS_ACTIVE_WARNING)
 
             confirmed_cancel_requests = [
                 order for order in active_orders
@@ -10426,17 +11631,6 @@ def force_release_old_active_racks(body: CleanupSelectionIn, x_admin_token: Opti
                 skipped.append({"rack_id": rack_id, "rack_code": rack.code, "reason": "No se puede liberar: existe otra orden activa asociada al mismo rack."})
                 continue
 
-            only_cancel_requests = all((order.status or "") in CANCEL_REQUEST_STATUSES for order in active_orders)
-            all_rcs_terminal = all(_normalized_cleanup_rcs_terminal_status(order.rcs_status) for order in active_orders)
-            rack_recent_move = rack.last_moved_at and rack.last_moved_at > (now - timedelta(minutes=min_age_minutes))
-            if rack_recent_move and not all_rcs_terminal:
-                if not only_cancel_requests:
-                    skipped.append({"rack_id": rack_id, "rack_code": rack.code, "reason": "No se puede liberar: rack con movimiento reciente."})
-                    continue
-                if any((order.closed_at or order.updated_at or order.created_at or now) > (now - timedelta(minutes=min_age_minutes)) for order in active_orders):
-                    skipped.append({"rack_id": rack_id, "rack_code": rack.code, "reason": "No se puede liberar: cancelacion reciente."})
-                    continue
-
             validation_errors = []
             for order in active_orders:
                 ok, reason = _validate_force_release_order(order, now=now, min_age_minutes=min_age_minutes)
@@ -10447,7 +11641,7 @@ def force_release_old_active_racks(body: CleanupSelectionIn, x_admin_token: Opti
                 continue
 
             for order in active_orders:
-                closed_orders.append(_force_close_old_active_order(db, order, now=now, admin_user=admin_user))
+                closed_orders.append(_force_close_old_active_order(db, order, now=now, admin_user=admin_user, reason=(body.reason or "").strip()))
 
             old_status = rack.status or ""
             related_order_id = active_orders[0].id if active_orders else None
@@ -10614,6 +11808,8 @@ def create_rack(body: RackIn, x_admin_token: Optional[str] = Header(default=None
         mat = db.execute(select(MaterialGroup).where(MaterialGroup.id == normalized_material_group_id)).scalar_one_or_none()
         if not mat:
             raise HTTPException(status_code=400, detail="Material no encontrado")
+        if int(mat.is_active or 0) != 1:
+            raise HTTPException(status_code=409, detail="El material está inactivo; restáuralo antes de asignarlo al rack")
         requested_status = (body.status or "").strip()
         if rack_status_is_reserved(requested_status):
             requested_status = rack_status_from_reservation(True)
@@ -10643,6 +11839,8 @@ def update_rack(rack_id: int, body: RackIn, x_admin_token: Optional[str] = Heade
         mat = db.execute(select(MaterialGroup).where(MaterialGroup.id == normalized_material_group_id)).scalar_one_or_none()
         if not mat:
             raise HTTPException(status_code=400, detail="Material no encontrado")
+        if int(mat.is_active or 0) != 1:
+            raise HTTPException(status_code=409, detail="El material está inactivo; restáuralo antes de asignarlo al rack")
         requested_status = (body.status or "").strip()
         if rack_status_is_reserved(requested_status):
             requested_status = rack_status_from_reservation(True)
@@ -10761,24 +11959,6 @@ def delete_rack(rack_id: int, x_admin_token: Optional[str] = Header(default=None
 
 def _exists_row(db, stmt) -> bool:
     return db.execute(stmt.limit(1)).first() is not None
-
-
-def _ensure_area_not_in_use(db, area_id: int):
-    if _exists_row(db, select(Location.id).where(Location.area_id == area_id)):
-        raise HTTPException(status_code=409, detail='No se puede borrar el área porque está asignada a una o más celdas.')
-    if _exists_row(db, select(MovementOrder.id).where((MovementOrder.source_area_id == area_id) | (MovementOrder.destination_area_id == area_id))):
-        raise HTTPException(status_code=409, detail='No se puede borrar el área porque está referenciada en el historial.')
-    if _exists_row(db, select(OperatorWindowButton.id).where((OperatorWindowButton.source_area_id == area_id) | (OperatorWindowButton.destination_area_id == area_id))):
-        raise HTTPException(status_code=409, detail='No se puede borrar el área porque está usada en una pantalla configurable.')
-
-
-def _ensure_material_not_in_use(db, material_id: int):
-    if _exists_row(db, select(Rack.id).where(Rack.material_group_id == material_id)):
-        raise HTTPException(status_code=409, detail='No se puede borrar el material porque está asignado a uno o más racks.')
-    if _exists_row(db, select(MovementOrder.id).where(MovementOrder.material_group_id == material_id)):
-        raise HTTPException(status_code=409, detail='No se puede borrar el material porque está referenciado en el historial.')
-    if _exists_row(db, select(OperatorWindowButton.id).where(OperatorWindowButton.material_group_id == material_id)):
-        raise HTTPException(status_code=409, detail='No se puede borrar el material porque está usado en una pantalla configurable.')
 
 
 def _ensure_rack_not_in_use(db, rack_id: int):
@@ -10941,17 +12121,26 @@ def _save_operator_window_button(db, window_id: int, button_index: int, body: Op
     if body.action_mode not in {'fifo', 'direct_move', 'direct_move_config', 'point_to_area', 'cancel_return'}:
         raise HTTPException(status_code=400, detail='Modo de botón inválido')
     if body.source_area_id:
-        if not db.execute(select(Area).where(Area.id == body.source_area_id)).scalar_one_or_none():
+        source_area = db.execute(select(Area).where(Area.id == body.source_area_id)).scalar_one_or_none()
+        if not source_area:
             raise HTTPException(status_code=400, detail='Área origen no encontrada')
+        if int(source_area.is_active or 0) != 1:
+            raise HTTPException(status_code=409, detail='Área origen inactiva')
     if body.destination_area_id:
-        if not db.execute(select(Area).where(Area.id == body.destination_area_id)).scalar_one_or_none():
+        destination_area = db.execute(select(Area).where(Area.id == body.destination_area_id)).scalar_one_or_none()
+        if not destination_area:
             raise HTTPException(status_code=400, detail='Área destino no encontrada')
+        if int(destination_area.is_active or 0) != 1:
+            raise HTTPException(status_code=409, detail='Área destino inactiva')
     normalized_material_group_id = body.material_group_id
     if body.action_mode == 'fifo' and not normalized_material_group_id:
         normalized_material_group_id = _ensure_no_material_group_in_db(db).id
     if normalized_material_group_id:
-        if not db.execute(select(MaterialGroup).where(MaterialGroup.id == normalized_material_group_id)).scalar_one_or_none():
+        material_row = db.execute(select(MaterialGroup).where(MaterialGroup.id == normalized_material_group_id)).scalar_one_or_none()
+        if not material_row:
             raise HTTPException(status_code=400, detail='Material no encontrado')
+        if int(material_row.is_active or 0) != 1:
+            raise HTTPException(status_code=409, detail='Material inactivo')
     if body.source_cell_id:
         if not db.execute(select(Location).where(Location.id == body.source_cell_id)).scalar_one_or_none():
             raise HTTPException(status_code=400, detail='Celda origen no encontrada')
@@ -10966,8 +12155,11 @@ def _save_operator_window_button(db, window_id: int, button_index: int, body: Op
             continue
         if material_id <= 0:
             continue
-        if not db.execute(select(MaterialGroup).where(MaterialGroup.id == material_id)).scalar_one_or_none():
+        visible_material = db.execute(select(MaterialGroup).where(MaterialGroup.id == material_id)).scalar_one_or_none()
+        if not visible_material:
             raise HTTPException(status_code=400, detail='Uno de los materiales visibles no existe')
+        if int(visible_material.is_active or 0) != 1:
+            raise HTTPException(status_code=409, detail='Uno de los materiales visibles está inactivo')
         if material_id not in normalized_point_material_ids:
             normalized_point_material_ids.append(material_id)
     normalized_point_custom_fields = _normalize_point_custom_fields(body.point_custom_fields)
@@ -11158,14 +12350,26 @@ def _execute_cancel_for_order(db, row: MovementOrder, force_cancel: str, matter_
     if should_call_remote_cancel:
         if not cancel_response.ok:
             row.rcs_status = 'cancel_error'
+            row.rcs_status_changed_at = datetime.utcnow()
             row.rcs_message = cancel_response.message or 'El RCS rechazó la cancelación'
             row.updated_at = datetime.utcnow()
             db.add(row)
             db.commit()
             db.refresh(row)
-            raise HTTPException(status_code=400, detail=f'El RCS rechazó la cancelación: {row.rcs_message}')
+            minimum_age = _force_release_min_age_minutes(db)
+            order_age = _age_minutes(datetime.utcnow(), _order_age_anchor(row)) or 0
+            raise HTTPException(status_code=400, detail={
+                "message": f"El RCS rechazó la cancelación: {row.rcs_message}",
+                "cancel_recovery": {
+                    "eligible": order_age >= minimum_age,
+                    "order_age_minutes": order_age,
+                    "minimum_age_minutes": minimum_age,
+                    "suggested_action": "Revisar en Diagnóstico y limpieza.",
+                },
+            })
         row.status = 'cancel_requested_undo' if should_undo_locally else 'cancel_requested_total'
         row.rcs_status = 'cancel_requested'
+        row.rcs_status_changed_at = datetime.utcnow()
         _audit_order_close(db, row, previous_status=previous_status, new_status=row.status, source=source, reason="cancelTask enviado al RCS", actor=actor, closed_at=datetime.utcnow(), auto_commit=False)
         rack = db.execute(select(Rack).where(Rack.id == row.rack_id)).scalar_one_or_none()
         if rack is not None:

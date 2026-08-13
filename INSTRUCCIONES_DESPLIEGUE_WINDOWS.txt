@@ -1,0 +1,54 @@
+DESPLIEGUE SISTEMA DE DESPACHO AMR - WINDOWS
+
+1. Detener el servicio actual
+   - Si corre como servicio, detenerlo desde Servicios de Windows o desde el script que usen.
+   - Si corre en consola, cerrar la consola o detener uvicorn.
+
+2. Hacer respaldo antes de copiar
+   - Respaldar especialmente agv.db.
+   - Este paquete NO incluye agv.db y no debe reemplazar la base de datos de produccion.
+
+3. Copiar archivos
+   - Extraer este ZIP sobre la carpeta del proyecto en produccion.
+   - Confirmar que agv.db existente permanezca en la carpeta del proyecto.
+
+4. Instalar dependencias
+   Desde PowerShell, dentro de la carpeta del proyecto:
+
+   .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+   Si no existe .venv:
+
+   python -m venv .venv
+   .\.venv\Scripts\python.exe -m pip install --upgrade pip
+   .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+5. Verificar dependencias
+
+   .\.venv\Scripts\python.exe -m pip check
+
+   Debe responder: No broken requirements found.
+
+6. Arrancar
+   Si usan el BAT:
+
+   .\restart_app.bat
+
+   O manualmente:
+
+   .\.venv\Scripts\python.exe -m uvicorn main:app --host 0.0.0.0 --port 8000
+
+7. Verificar
+   Abrir:
+
+   http://127.0.0.1:8000/api/health
+
+   Revisar que cwd, main_file y app_root apunten a la carpeta correcta de produccion.
+
+NOTAS IMPORTANTES
+
+- La tabla config_audit_log se crea sola al arrancar.
+- No copiar una base agv.db nueva sobre produccion.
+- Si se pierden configuraciones, revisar config_audit_log o el endpoint:
+  /api/admin/config-audit
+

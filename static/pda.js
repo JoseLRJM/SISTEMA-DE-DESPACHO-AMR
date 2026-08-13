@@ -1257,6 +1257,46 @@
     );
   }
 
+  function diagnosisSelectedAreasLabel(group) {
+    const areas = Array.isArray(group?.selected_areas) ? group.selected_areas : [];
+    return areas.map((area) => firstValue(area?.name, area?.code, area?.id)).filter(Boolean).join(", ");
+  }
+
+  function fifoChainChecklistFrom(data, diagnosis) {
+    return data?.fifo_chain_preflight_checklist
+      || data?.fifo_chain_projection?.fifo_chain_preflight_checklist
+      || diagnosis?.fifo_chain_preflight_checklist
+      || diagnosis?.fifo_chain_projection?.fifo_chain_preflight_checklist
+      || {};
+  }
+
+  function pdaFifoChainChecklistStepMessage(step) {
+    const stepNumber = Number(step?.step || 0) || "-";
+    if (step?.ok === false) {
+      return firstValue(step?.failure_summary, step?.summary, step?.message, `Falla en tramo ${stepNumber}`);
+    }
+    if (step?.ok === true && (step?.same_cell_move || step?.same_cell_move_message)) {
+      return firstValue(step?.same_cell_move_message, "Movimiento en la misma celda permitido.");
+    }
+    if (step?.ok === true && step?.source_filled_by_previous_step_message) {
+      return step.source_filled_by_previous_step_message;
+    }
+    const filled = step?.source_check?.filled_by_step;
+    if (step?.ok === true && filled) {
+      return `El origen será ocupado por ${filled.rack_code || "un rack"} desde el tramo ${filled.step || "-"}.`;
+    }
+    if (step?.ok === true) return "OK";
+    return firstValue(step?.summary, step?.message);
+  }
+
+  function pdaFifoChainChecklistRows(data, diagnosis) {
+    const checklist = fifoChainChecklistFrom(data, diagnosis);
+    const steps = Array.isArray(checklist?.steps) ? checklist.steps.slice(0, 5) : [];
+    return steps
+      .map((step) => [`Tramo ${Number(step?.step || 0) || "-"}`, pdaFifoChainChecklistStepMessage(step)])
+      .filter((row) => readableValue(row[1]));
+  }
+
   function appendConfirmRow(container, label, value) {
     if (!container) return false;
     const readable = readableValue(value);
@@ -1482,6 +1522,7 @@
     const checkedSourceLocations = Array.isArray(diagnosis?.checked_source_locations) ? diagnosis.checked_source_locations.slice(0, 20) : [];
     const sameMaterialElsewhere = Array.isArray(diagnosis?.same_material_elsewhere) ? diagnosis.same_material_elsewhere.slice(0, 10) : [];
     const projectionNotes = Array.isArray(diagnosis?.projection_notes) ? diagnosis.projection_notes : [];
+    const fifoChecklistRows = pdaFifoChainChecklistRows(data || {}, diagnosis);
     if (data?.error_code || checkedDestinationLocations.length) {
       const diagnosticSections = [];
       if (data?.step || data?.destination_area_name || data?.destination_label) {
@@ -1518,10 +1559,13 @@
         {
           title: "Operación",
           rows: [
+            ["Problema exacto", firstValue(diagnosis?.failure_summary, diagnosis?.blocking_reason, data?.failure_summary)],
             ["Material", firstValue(entityLabel(diagnosis?.material), data?.material_name, data?.material_code, material.name, material.code)],
             ["Rack seleccionado", firstValue(data?.rack_code, rack.rack_code, rack.code)],
-            ["Origen", firstValue(diagnosisLocationLabel(diagnosis?.source), data?.source_name, data?.source_area_name, areaCellLabel(source))],
-            ["Destino", firstValue(diagnosisLocationLabel(diagnosis?.destination), data?.destination_area_name, data?.destination_name, data?.destination_area?.name, areaCellLabel(destination))],
+            ["Origen revisado", firstValue(diagnosisSelectedAreasLabel(diagnosis?.source), diagnosisLocationLabel(diagnosis?.source), data?.source_name, data?.source_area_name, areaCellLabel(source))],
+            ["Modo origen", diagnosis?.source?.mode],
+            ["Destino revisado", firstValue(diagnosisSelectedAreasLabel(diagnosis?.destination), diagnosisLocationLabel(diagnosis?.destination), data?.destination_area_name, data?.destination_name, data?.destination_area?.name, areaCellLabel(destination))],
+            ["Modo destino", diagnosis?.destination?.mode],
             ["Tramo que falló", firstValue(diagnosis?.step, data?.step) ? `Tramo ${firstValue(diagnosis?.step, data?.step)} de ${firstValue(diagnosis?.total_steps, data?.fifo_chain_total_steps, "?")}` : ""],
           ],
         },
@@ -1547,12 +1591,26 @@
           ]),
         });
       }
-      if (data?.suggested_action) {
+      if (data?.suggested_action || diagnosis?.suggested_action) {
         view.sections.push({ title: "Qué hacer", rows: [["Acción recomendada", firstValue(diagnosis?.suggested_action, data.suggested_action)]] });
       }
       if (projectionNotes.length) {
         view.sections.push({ title: "Proyección de la cadena", rows: projectionNotes.map((note) => [`Tramo ${note?.step || ""}`, note?.message]) });
       }
+      if (fifoChecklistRows.length) {
+        view.sections.push({ title: "Checklist FIFO", rows: fifoChecklistRows });
+      }
+    }
+    if (!(pdaInterfaceMode === "operator" && category === "error") && fifoChecklistRows.length) {
+      view.sections.push({ title: "Checklist FIFO", rows: fifoChecklistRows });
+    }
+    const sameCellMoveMessage = firstValue(data?.same_cell_move_message, diagnosis?.same_cell_move_message);
+    if (data?.same_cell_move === true || diagnosis?.same_cell_move === true || sameCellMoveMessage) {
+      view.notices.push({
+        tone: "rcs-success",
+        title: "Movimiento en la misma celda permitido",
+        message: firstValue(sameCellMoveMessage, "Movimiento en la misma celda permitido por configuracion."),
+      });
     }
     const headline = operationalHeadline(data || {}, view);
     if (headline) {
@@ -1826,8 +1884,19 @@
     const block = document.createElement("div");
     block.className = "history-area-block return-area";
     const heading = document.createElement("span");
-    heading.textContent = "AREA DE DEVOLUCION";
+    const returnMode = readableValue(item?.cancel_return_mode) || "configured_area";
+    heading.textContent = returnMode === "current_step_source" ? "DEVOLUCION POR ORIGEN DEL TRAMO" : "AREA DE DEVOLUCION";
     block.appendChild(heading);
+    if (returnMode === "current_step_source") {
+      const name = document.createElement("b");
+      name.textContent = areaDisplay(item?.source_area_code, item?.source_area_name);
+      block.appendChild(name);
+      const matter = document.createElement("small");
+      matter.textContent = "Se usará automáticamente el Matter Area del origen del tramo actual.";
+      block.appendChild(matter);
+      container.appendChild(block);
+      return;
+    }
     if (!item?.cancel_return_area_id) {
       const empty = document.createElement("b");
       empty.textContent = "Sin configurar";
@@ -1847,6 +1916,9 @@
     const matterArea = readableValue(item.cancel_return_area_matter_area);
     matter.textContent = matterArea ? `Matter Area: ${matterArea}` : "Sin Matter Area";
     block.appendChild(matter);
+    const note = document.createElement("small");
+    note.textContent = "Se usará el área de devolución configurada en el Scanner.";
+    block.appendChild(note);
     container.appendChild(block);
   }
 
@@ -1986,11 +2058,13 @@
     let data = {};
     try { data = textBody ? JSON.parse(textBody) : {}; } catch (_) { data = { raw: textBody }; }
     if (!response.ok) {
-      const detail = typeof data?.detail === "string" ? data.detail : "";
-      const message = detail || data?.message || `HTTP ${response.status}`;
+      const rawDetail = data?.detail;
+      const detail = typeof rawDetail === "string" ? rawDetail : "";
+      const message = detail || rawDetail?.message || data?.message || `HTTP ${response.status}`;
       const error = new Error(message);
       error.status = response.status;
-      error.detail = detail;
+      error.detail = rawDetail;
+      error.data = data;
       throw error;
     }
     return data;
@@ -2223,7 +2297,23 @@
       await loadPdaHistory({ force: true });
       focusScanner();
     } catch (err) {
-      setPdaActionError(err?.message || String(err));
+      const recovery = err?.detail?.cancel_recovery || err?.data?.detail?.cancel_recovery || err?.data?.cancel_recovery;
+      if (recovery) {
+        const eligibleText = recovery.eligible === true
+          ? "La orden puede ser revisada por un administrador en Diagnóstico y limpieza."
+          : `Podrá revisarse después de ${recovery.minimum_age_minutes ?? "Sin dato"} minutos.`;
+        setPdaActionError([
+          "No fue posible cancelar la tarea en RCS.",
+          eligibleText,
+          `Orden: ${selectedHistoryItem?.order_code || numericOrderId}`,
+          `TaskCode: ${selectedHistoryItem?.remote_task_code || selectedHistoryItem?.task_code || "Sin dato"}`,
+          `Edad: ${recovery.order_age_minutes ?? "Sin dato"} min`,
+          `Estado RCS: ${selectedHistoryItem?.rcs_status || "Sin dato"}`,
+          `Motivo: ${err?.message || "Rechazo del RCS"}`,
+        ].join("\n"));
+      } else {
+        setPdaActionError(err?.message || String(err));
+      }
       await loadPdaHistory({ force: true });
     } finally {
       pendingCancelOrders.delete(numericOrderId);

@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Column, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine
+from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 from logging_config import configure_logging, configure_sqlalchemy_logging, get_logger
 
@@ -113,6 +113,30 @@ class Setting(Base):
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
+class ConfigAuditLog(Base):
+    __tablename__ = "config_audit_log"
+    id = Column(Integer, primary_key=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    table_name = Column(String(64), nullable=False)
+    record_key = Column(String(128), nullable=False)
+    field_name = Column(String(128), nullable=False)
+    old_value = Column(Text, nullable=True)
+    new_value = Column(Text, nullable=True)
+    source = Column(String(128), nullable=False, default="")
+    endpoint = Column(String(256), nullable=True)
+    client_ip = Column(String(64), nullable=True)
+    request_id = Column(String(64), nullable=True)
+    related_order_id = Column(Integer, nullable=True)
+    related_qr_rule_id = Column(Integer, nullable=True)
+    note = Column(String(512), nullable=True)
+
+    __table_args__ = (
+        Index("ix_config_audit_created_at", "created_at"),
+        Index("ix_config_audit_record_key", "record_key"),
+        Index("ix_config_audit_request_id", "request_id"),
+    )
+
+
 class Area(Base):
     __tablename__ = "areas"
     id = Column(Integer, primary_key=True)
@@ -219,6 +243,7 @@ class MovementOrder(Base):
     status_query_request_json = Column(Text, nullable=True)
     status_query_response_json = Column(Text, nullable=True)
     status_query_checked_at = Column(DateTime, nullable=True)
+    rcs_status_changed_at = Column(DateTime, nullable=True)
     status_query_log_json = Column(Text, nullable=True)
     forced_local_close = Column(Integer, nullable=False, default=0)
     forced_local_close_at = Column(DateTime, nullable=True)
@@ -332,16 +357,19 @@ class ScannerStation(Base):
     fifo_chain_total_steps = Column(Integer, nullable=False, default=2)
     fifo_chain_step1_source_mode = Column(String(32), nullable=False, default="configured_area")
     fifo_chain_step1_material_group_id = Column(Integer, ForeignKey("material_groups.id"), nullable=True)
+    fifo_chain_step1_task_typ = Column(String(64), nullable=True)
     fifo_chain_step1_source_area_ids_json = Column(Text, nullable=True)
     fifo_chain_step1_destination_mode = Column(String(32), nullable=False, default="configured_area")
     fifo_chain_step1_destination_area_ids_json = Column(Text, nullable=True)
     fifo_chain_step2_source_mode = Column(String(32), nullable=False, default="configured_area")
     fifo_chain_step2_material_group_id = Column(Integer, ForeignKey("material_groups.id"), nullable=True)
+    fifo_chain_step2_task_typ = Column(String(64), nullable=True)
     fifo_chain_step2_source_area_ids_json = Column(Text, nullable=True)
     fifo_chain_step2_destination_mode = Column(String(32), nullable=False, default="configured_area")
     fifo_chain_step2_destination_area_ids_json = Column(Text, nullable=True)
     fifo_chain_step3_source_mode = Column(String(32), nullable=False, default="configured_area")
     fifo_chain_step3_material_group_id = Column(Integer, ForeignKey("material_groups.id"), nullable=True)
+    fifo_chain_step3_task_typ = Column(String(64), nullable=True)
     fifo_chain_step3_source_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
     fifo_chain_step3_source_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
     fifo_chain_step3_destination_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
@@ -351,6 +379,7 @@ class ScannerStation(Base):
     fifo_chain_step3_destination_area_ids_json = Column(Text, nullable=True)
     fifo_chain_step4_source_mode = Column(String(32), nullable=False, default="configured_area")
     fifo_chain_step4_material_group_id = Column(Integer, ForeignKey("material_groups.id"), nullable=True)
+    fifo_chain_step4_task_typ = Column(String(64), nullable=True)
     fifo_chain_step4_source_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
     fifo_chain_step4_source_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
     fifo_chain_step4_destination_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
@@ -360,6 +389,7 @@ class ScannerStation(Base):
     fifo_chain_step4_destination_area_ids_json = Column(Text, nullable=True)
     fifo_chain_step5_source_mode = Column(String(32), nullable=False, default="configured_area")
     fifo_chain_step5_material_group_id = Column(Integer, ForeignKey("material_groups.id"), nullable=True)
+    fifo_chain_step5_task_typ = Column(String(64), nullable=True)
     fifo_chain_step5_source_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
     fifo_chain_step5_source_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
     fifo_chain_step5_destination_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
@@ -374,12 +404,14 @@ class ScannerStation(Base):
     storage_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
     empty_rack_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
     cancel_return_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
+    cancel_return_mode = Column(String(32), nullable=False, default="configured_area")
     default_material_group_id = Column(Integer, ForeignKey("material_groups.id"), nullable=True)
     agv_code = Column(String(128), nullable=True)
     task_typ = Column(String(64), nullable=True)
     priority = Column(Integer, nullable=False, default=0)
     require_preview = Column(Integer, nullable=False, default=0)
     allow_execute = Column(Integer, nullable=False, default=1)
+    allow_same_cell_move = Column(Boolean, nullable=False, default=False)
     is_active = Column(Integer, nullable=False, default=1)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
@@ -410,16 +442,19 @@ class QrActionRule(Base):
     fifo_chain_total_steps = Column(Integer, nullable=False, default=2)
     fifo_chain_step1_source_mode = Column(String(32), nullable=False, default="configured_area")
     fifo_chain_step1_material_group_id = Column(Integer, ForeignKey("material_groups.id"), nullable=True)
+    fifo_chain_step1_task_typ = Column(String(64), nullable=True)
     fifo_chain_step1_source_area_ids_json = Column(Text, nullable=True)
     fifo_chain_step1_destination_mode = Column(String(32), nullable=False, default="configured_area")
     fifo_chain_step1_destination_area_ids_json = Column(Text, nullable=True)
     fifo_chain_step2_source_mode = Column(String(32), nullable=False, default="configured_area")
     fifo_chain_step2_material_group_id = Column(Integer, ForeignKey("material_groups.id"), nullable=True)
+    fifo_chain_step2_task_typ = Column(String(64), nullable=True)
     fifo_chain_step2_source_area_ids_json = Column(Text, nullable=True)
     fifo_chain_step2_destination_mode = Column(String(32), nullable=False, default="configured_area")
     fifo_chain_step2_destination_area_ids_json = Column(Text, nullable=True)
     fifo_chain_step3_source_mode = Column(String(32), nullable=False, default="configured_area")
     fifo_chain_step3_material_group_id = Column(Integer, ForeignKey("material_groups.id"), nullable=True)
+    fifo_chain_step3_task_typ = Column(String(64), nullable=True)
     fifo_chain_step3_source_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
     fifo_chain_step3_source_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
     fifo_chain_step3_destination_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
@@ -429,6 +464,7 @@ class QrActionRule(Base):
     fifo_chain_step3_destination_area_ids_json = Column(Text, nullable=True)
     fifo_chain_step4_source_mode = Column(String(32), nullable=False, default="configured_area")
     fifo_chain_step4_material_group_id = Column(Integer, ForeignKey("material_groups.id"), nullable=True)
+    fifo_chain_step4_task_typ = Column(String(64), nullable=True)
     fifo_chain_step4_source_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
     fifo_chain_step4_source_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
     fifo_chain_step4_destination_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
@@ -438,6 +474,7 @@ class QrActionRule(Base):
     fifo_chain_step4_destination_area_ids_json = Column(Text, nullable=True)
     fifo_chain_step5_source_mode = Column(String(32), nullable=False, default="configured_area")
     fifo_chain_step5_material_group_id = Column(Integer, ForeignKey("material_groups.id"), nullable=True)
+    fifo_chain_step5_task_typ = Column(String(64), nullable=True)
     fifo_chain_step5_source_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
     fifo_chain_step5_source_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
     fifo_chain_step5_destination_area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
@@ -453,6 +490,7 @@ class QrActionRule(Base):
     task_typ = Column(String(64), nullable=True)
     agv_code = Column(String(128), nullable=True)
     requires_scanner_station = Column(Integer, nullable=False, default=1)
+    allow_same_cell_move = Column(Boolean, nullable=False, default=False)
     is_active = Column(Integer, nullable=False, default=1)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)

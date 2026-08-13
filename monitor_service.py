@@ -13,10 +13,19 @@ from fifo_service import simulate_order_completed
 from logging_config import get_logger
 from models import DebugConsoleEvent, MovementOrder, Rack, SessionLocal, apply_rack_reservation_status
 
-ACTIVE_REMOTE_QUERY_STATUSES = {"pending_dispatch", "dispatched", "in_progress", "cancel_requested_total", "cancel_requested_undo"}
-RACK_RESERVATION_ACTIVE_STATUSES = ("pending_dispatch", "dispatched", "in_progress", "cancel_requested_total", "cancel_requested_undo")
+ACTIVE_REMOTE_QUERY_STATUSES = {"pending_dispatch", "dispatched", "in_progress", "cancel_requested_total", "cancel_requested_undo", "cancel_error"}
+RACK_RESERVATION_ACTIVE_STATUSES = ("pending_dispatch", "dispatched", "in_progress", "cancel_requested_total", "cancel_requested_undo", "cancel_error")
 _MONITOR_RUN_LOCK = threading.Lock()
 logger = get_logger("app.monitor")
+
+
+def _set_rcs_status(row: MovementOrder, value: str, *, changed_at: datetime) -> None:
+    normalized = str(value or "").strip().lower()
+    previous = str(row.rcs_status or "").strip().lower()
+    if normalized and normalized != previous:
+        row.rcs_status_changed_at = changed_at
+    if normalized:
+        row.rcs_status = normalized
 
 
 def _active_orders_for_rack(db, rack_id: int | None, *, exclude_order_id: int | None = None):
@@ -412,7 +421,7 @@ def _record_status_query_for_order(
     row.status_query_checked_at = now
     row.rcs_last_update = now
     if normalized_status:
-        row.rcs_status = normalized_status
+        _set_rcs_status(row, normalized_status, changed_at=now)
     if update_message and message:
         row.rcs_message = message
     row.updated_at = now
@@ -470,7 +479,7 @@ def _apply_touched_remote_statuses(db, touched_rows: list[tuple[int, str]]):
     for row_id, task_status in touched_rows:
         row = db.execute(select(MovementOrder).where(MovementOrder.id == row_id)).scalar_one()
         row = apply_remote_status_to_order(db, row, task_status, auto_commit=False)
-        row.rcs_status = task_status or row.rcs_status
+        _set_rcs_status(row, task_status, changed_at=datetime.utcnow())
         row.updated_at = datetime.utcnow()
         db.add(row)
 
@@ -714,7 +723,7 @@ def check_active_tasks(
                         row.status_query_checked_at = now
                         row.rcs_last_update = now
                         if reliable_status:
-                            row.rcs_status = task_status or row.rcs_status
+                            _set_rcs_status(row, task_status, changed_at=now)
                         row.rcs_message = message or row.rcs_message
                         _append_status_query_log(db, row, kind="status_query", request_payload=request_payload, response_payload=response_payload, message=message, arrived_at=now)
                         db.add(row)
@@ -734,7 +743,7 @@ def check_active_tasks(
                 for row_id, task_status in touched_rows:
                     row = db.execute(select(MovementOrder).where(MovementOrder.id == row_id)).scalar_one()
                     row = apply_remote_status_to_order(db, row, task_status, auto_commit=False)
-                    row.rcs_status = task_status or row.rcs_status
+                    _set_rcs_status(row, task_status, changed_at=datetime.utcnow())
                     row.updated_at = datetime.utcnow()
                     db.add(row)
 

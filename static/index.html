@@ -387,7 +387,7 @@
 </div>
 <div class="row"><label>Matter Area</label><input disabled="" id="areaMatterArea" placeholder="Parametro matterArea para cancelacion" type="text"/></div>
 <div class="row"><label>Descripción</label><textarea disabled="" id="areaDescription" rows="2"></textarea></div>
-<div class="row"><button class="btn primary" disabled="" id="btnSaveArea">Guardar área</button><button class="btn ghost" disabled="" id="btnNewArea">Nueva</button><button class="btn danger" disabled="" id="btnDeleteArea">Borrar</button></div>
+<div class="row qr-record-actions"><span class="qr-record-state" id="areaRecordState">Nuevo</span><button class="btn primary" disabled="" id="btnSaveArea">Guardar área</button><button class="btn ghost" disabled="" id="btnNewArea">Nueva</button><button class="btn danger" disabled="" id="btnDeleteArea">Eliminar área</button><button class="btn ghost hidden" disabled="" id="btnRestoreArea">Restaurar área</button><label class="qr-show-deleted"><input id="showDeletedAreas" type="checkbox"/> Mostrar eliminados</label></div>
 <div class="list-box" id="areasList"></div>
 <div class="small" id="areaMsg"></div>
 </div>
@@ -403,7 +403,7 @@
 <div><label>Activo</label><select disabled="" id="materialActive"><option value="1">Sí</option><option value="0">No</option></select></div>
 </div>
 <div class="row"><label>Descripción</label><textarea disabled="" id="materialDescription" rows="2"></textarea></div>
-<div class="row"><button class="btn primary" disabled="" id="btnSaveMaterial">Guardar material</button><button class="btn ghost" disabled="" id="btnNewMaterial">Nuevo</button><button class="btn danger" disabled="" id="btnDeleteMaterial">Borrar</button></div>
+<div class="row qr-record-actions"><span class="qr-record-state" id="materialRecordState">Nuevo</span><button class="btn primary" disabled="" id="btnSaveMaterial">Guardar material</button><button class="btn ghost" disabled="" id="btnNewMaterial">Nuevo</button><button class="btn danger" disabled="" id="btnDeleteMaterial">Eliminar material</button><button class="btn ghost hidden" disabled="" id="btnRestoreMaterial">Restaurar material</button><label class="qr-show-deleted"><input id="showDeletedMaterials" type="checkbox"/> Mostrar eliminados</label></div>
 <div class="list-box" id="materialsList"></div>
 <div class="small" id="materialMsg"></div>
 </div>
@@ -442,6 +442,8 @@
 <div class="row"><button class="btn primary" disabled="" id="btnSaveRack">Guardar rack</button><button class="btn ghost" disabled="" id="btnNewRack">Nuevo</button><button class="btn danger" disabled="" id="btnDeleteRack">Borrar</button></div>
 <div class="list-box" id="racksList"></div>
 <div class="small" id="rackMsg"></div>
+<div class="cleanup-warning hidden" id="rackActiveOrderWarning"></div>
+<button class="btn warn hidden" id="btnRackOpenCleanup" type="button">Abrir Diagn&oacute;stico y limpieza</button>
 </div>
 <div class="card" id="card-operator-windows">
 <h3>Ventanas configurables</h3>
@@ -570,6 +572,9 @@
 <div><label>Modo de ruta</label><select disabled="" id="scannerRouteMode"><option value="simple_area">Simple por origen/destino</option><option value="double_area">Doble &aacute;rea / multipunto</option><option value="fifo_chain">Flujo doble FIFO / tareas encadenadas</option></select></div>
 <div class="hidden" data-fifo-chain-owner="scanner"><label>Cantidad de tramos</label><select disabled="" id="scannerFifoChainTotalSteps"><option value="2">2 tramos</option><option value="3">3 tramos</option><option value="4">4 tramos</option><option value="5">5 tramos</option></select><div class="small">El QR tiene prioridad. El scanner se usa como respaldo.</div></div>
 </div>
+<div class="row">
+<div class="switch-wrap"><label class="switch"><input disabled="" id="scannerAllowSameCellMove" type="checkbox"/><span class="slider"></span></label><div><b>Permitir origen y destino en la misma celda</b><div class="small">Solo activar si el RCS acepta origen y destino iguales.</div></div></div>
+</div>
 <div class="small">Los valores del QR tienen prioridad. La estaci&oacute;n/scanner se usa como respaldo cuando el QR no trae una configuraci&oacute;n.</div>
 <div class="qr-section-title">Tramo 1</div>
 <div class="row two-col">
@@ -637,7 +642,8 @@
 <div><label>&Aacute;rea racks vac&iacute;os</label><select disabled="" id="scannerEmptyRackArea"><option value="">Sin &aacute;rea</option></select></div>
 </div>
 <div class="row">
-<div><label>&Aacute;rea para regresar material al cancelar</label><select disabled="" id="scannerCancelReturnArea"><option value="">Sin configurar</option></select><div class="small">Se utilizar&aacute; para Cancelar/Devolver desde el PDA. El &aacute;rea debe tener Matter Area configurado.</div><div class="qr-cell-summary hidden" id="scannerCancelReturnAreaWarning"></div></div>
+<div><label>Modo Cancelar/Devolver</label><select id="scannerCancelReturnMode"><option value="configured_area">&Aacute;rea configurada del Scanner</option><option value="current_step_source">Origen del tramo actual</option></select><div class="small">Define de d&oacute;nde se tomar&aacute; el Matter Area para Cancelar/Devolver desde PDA.</div></div>
+<div><label>&Aacute;rea para regresar material al cancelar</label><select disabled="" id="scannerCancelReturnArea"><option value="">Sin configurar</option></select><div class="small">Se utilizar&aacute; cuando el modo sea &Aacute;rea configurada del Scanner. El &aacute;rea debe tener Matter Area configurado.</div><div class="qr-cell-summary hidden" id="scannerCancelReturnAreaWarning"></div></div>
 </div>
 <div class="row two-col">
 <div data-fifo-chain-general="scanner"><label>Material default</label><select disabled="" id="scannerDefaultMaterial"><option value="">Sin material</option></select></div>
@@ -659,7 +665,7 @@
 <div><label>Activo</label><select disabled="" id="scannerActive"><option value="1">S&iacute;</option><option value="0">No</option></select></div>
 <div></div>
 </div>
-<div class="row"><button class="btn primary" disabled="" id="btnSaveScannerStation" type="button">Guardar scanner</button><button class="btn ghost" disabled="" id="btnNewScannerStation" type="button">Nuevo</button><button class="btn danger" disabled="" id="btnDisableScannerStation" type="button">Desactivar</button></div>
+<div class="row qr-record-actions"><span class="qr-record-state" id="scannerRecordState">Nuevo</span><button class="btn primary" disabled="" id="btnSaveScannerStation" type="button">Guardar scanner</button><button class="btn ghost" disabled="" id="btnNewScannerStation" type="button">Nuevo</button><button aria-label="Eliminar Scanner seleccionado" class="btn danger" disabled="" id="btnDisableScannerStation" type="button">Eliminar</button><button aria-label="Restaurar Scanner seleccionado" class="btn ghost hidden" disabled="" id="btnRestoreScannerStation" type="button">Restaurar</button><label class="qr-show-deleted"><input id="showDeletedScannerStations" type="checkbox"/> Mostrar eliminados</label></div>
 <div class="list-box qr-list" id="scannerStationsList"></div>
 </div>
 <div class="qr-panel" id="qrPanelRules">
@@ -689,6 +695,9 @@
 <div class="row two-col">
 <div><label>Modo de ruta</label><select disabled="" id="qrRouteMode"><option value="simple_area">Simple por origen/destino</option><option value="double_area">Doble &aacute;rea / multipunto</option><option value="fifo_chain">Flujo doble FIFO / tareas encadenadas</option></select></div>
 <div class="hidden" data-fifo-chain-owner="qr"><label>Cantidad de tramos</label><select disabled="" id="qrFifoChainTotalSteps"><option value="2">2 tramos</option><option value="3">3 tramos</option><option value="4">4 tramos</option><option value="5">5 tramos</option></select></div>
+</div>
+<div class="row">
+<div class="switch-wrap"><label class="switch"><input disabled="" id="qrAllowSameCellMove" type="checkbox"/><span class="slider"></span></label><div><b>Permitir origen y destino en la misma celda</b><div class="small">Permite crear tareas tipo KARA-01 &rarr; KARA-01 cuando no hay otra celda disponible.</div></div></div>
 </div>
 <div class="small">Si el QR trae ruta configurada, tiene prioridad sobre los valores default del scanner.</div>
 <div class="qr-section-title">Tramo 1</div>
@@ -760,7 +769,7 @@
 <div><label>Requiere scanner</label><select disabled="" id="qrRequiresScanner"><option value="1">S&iacute;</option><option value="0">No</option></select></div>
 <div><label>Activo</label><select disabled="" id="qrActive"><option value="1">S&iacute;</option><option value="0">No</option></select></div>
 </div>
-<div class="row"><button class="btn primary" disabled="" id="btnSaveQrRule" type="button">Guardar QR</button><button class="btn ghost" disabled="" id="btnNewQrRule" type="button">Nuevo</button><button class="btn danger" disabled="" id="btnDisableQrRule" type="button">Desactivar</button></div>
+<div class="row qr-record-actions"><span class="qr-record-state" id="qrRuleRecordState">Nuevo</span><button class="btn primary" disabled="" id="btnSaveQrRule" type="button">Guardar QR</button><button class="btn ghost" disabled="" id="btnNewQrRule" type="button">Nuevo</button><button aria-label="Eliminar QR seleccionado" class="btn danger" disabled="" id="btnDisableQrRule" type="button">Eliminar</button><button aria-label="Restaurar QR seleccionado" class="btn ghost hidden" disabled="" id="btnRestoreQrRule" type="button">Restaurar</button><label class="qr-show-deleted"><input id="showDeletedQrRules" type="checkbox"/> Mostrar eliminados</label></div>
 <div class="list-box qr-list" id="qrRulesList"></div>
 </div>
 <div class="qr-panel" id="qrPanelTerminals">
@@ -788,7 +797,7 @@
 <div><label>Last seen</label><input disabled="" id="scanTerminalLastSeen" type="text"/></div>
 <div><label>Last IP</label><input disabled="" id="scanTerminalLastIp" type="text"/></div>
 </div>
-<div class="row"><button class="btn primary" disabled="" id="btnSaveScanTerminal" type="button">Guardar terminal</button><button class="btn ghost" disabled="" id="btnNewScanTerminal" type="button">Nuevo</button><button class="btn ghost" disabled="" id="btnRefreshScanTerminals" type="button">Refrescar terminales</button><button class="btn danger" disabled="" id="btnDisableScanTerminal" type="button">Desactivar</button></div>
+<div class="row qr-record-actions"><span class="qr-record-state" id="scanTerminalRecordState">Nuevo</span><button class="btn primary" disabled="" id="btnSaveScanTerminal" type="button">Guardar terminal</button><button class="btn ghost" disabled="" id="btnNewScanTerminal" type="button">Nuevo</button><button class="btn ghost" disabled="" id="btnRefreshScanTerminals" type="button">Refrescar terminales</button><button aria-label="Eliminar Terminal seleccionada" class="btn danger" disabled="" id="btnDisableScanTerminal" type="button">Eliminar</button><button aria-label="Restaurar Terminal seleccionada" class="btn ghost hidden" disabled="" id="btnRestoreScanTerminal" type="button">Restaurar</button><label class="qr-show-deleted"><input id="showDeletedScanTerminals" type="checkbox"/> Mostrar eliminados</label></div>
 <div class="list-box qr-list" id="scanTerminalsList"></div>
 </div>
 <div class="qr-panel" id="qrPanelEvents">
@@ -815,10 +824,12 @@
 </div>
 <div class="qr-route-simple-help hidden" id="qrTransitionSimpleHelp">Modo simple: cuando una orden se complete desde este origen hacia este destino, el rack cambiar&aacute; al material seleccionado. Puede aplicar aunque la orden haya sido creada por QR, PDA, estaci&oacute;n de trabajo u otro flujo.</div>
 <div class="qr-execute-warning">La transici&oacute;n se aplica solo al completar correctamente la orden, no al crearla ni al despacharla.</div>
+<div class="small">Una transici&oacute;n asociada directamente al QR que origin&oacute; la orden tiene precedencia sobre transiciones generales coincidentes. Entre transiciones del mismo nivel se respeta la prioridad num&eacute;rica.</div>
 <div class="row two-col qr-transition-advanced-only">
 <div><label>QR asociado opcional</label><select disabled="" id="qrTransitionQrRule"><option value="">Cualquier QR</option></select></div>
 <div><label>Scanner / estaci&oacute;n opcional</label><select disabled="" id="qrTransitionScanner"><option value="">Cualquier scanner</option></select></div>
 </div>
+<div class="small qr-transition-advanced-only">Cuando se seleccione un QR, esta transici&oacute;n tendr&aacute; precedencia sobre reglas generales coincidentes para las &oacute;rdenes originadas por ese QR.</div>
 <div class="row two-col">
 <div data-qr-transition-source-config><label>&Aacute;rea origen opcional</label><select disabled="" id="qrTransitionSourceArea"><option value="">Cualquier origen</option></select></div>
 <div><label>&Aacute;rea destino opcional</label><select disabled="" id="qrTransitionDestinationArea"><option value="">Cualquier destino</option></select></div>
@@ -850,7 +861,8 @@
 <div class="row two-col">
 <div><label>Activo</label><select disabled="" id="qrTransitionActive"><option value="1">S&iacute;</option><option value="0">No</option></select></div>
 </div>
-<div class="row"><button class="btn primary" disabled="" id="btnSaveQrTransitionRule" type="button">Guardar transici&oacute;n</button><button class="btn ghost" disabled="" id="btnNewQrTransitionRule" type="button">Nuevo</button><button class="btn danger" disabled="" id="btnDisableQrTransitionRule" type="button">Desactivar</button></div>
+<div class="row qr-record-actions"><span class="qr-record-state" id="qrTransitionRecordState">Nuevo</span><button class="btn primary" disabled="" id="btnSaveQrTransitionRule" type="button">Guardar transici&oacute;n</button><button class="btn ghost" disabled="" id="btnNewQrTransitionRule" type="button">Nuevo</button><button aria-label="Eliminar Transición seleccionada" class="btn danger" disabled="" id="btnDisableQrTransitionRule" type="button">Eliminar</button><button aria-label="Restaurar Transición seleccionada" class="btn ghost hidden" disabled="" id="btnRestoreQrTransitionRule" type="button">Restaurar</button><label class="qr-show-deleted"><input id="showDeletedQrTransitions" type="checkbox"/> Mostrar eliminados</label></div>
+<div class="small" id="qrTransitionValidationResult">Sin validar.</div>
 <div class="diagnosis-table-wrap qr-transitions-wrap" id="qrTransitionRulesList">Sin transiciones configuradas.</div>
 <div class="list-box qr-transition-preview">
 <h4>Probar transici&oacute;n por MovementOrder ID</h4>
@@ -862,10 +874,25 @@
 <div class="small">Solo aplica si la orden ya est&aacute; completada.</div>
 <div class="small" id="qrTransitionPreviewResult">Sin preview.</div>
 </div>
-<div class="list-box qr-transition-preview">
-<h4>Historial de transiciones</h4>
-<div class="row"><button class="btn ghost" disabled="" id="btnRefreshQrTransitionLogs" type="button">Actualizar historial</button></div>
-<div class="diagnosis-table-wrap qr-transitions-wrap" id="qrTransitionLogsList">Sin historial de transiciones.</div>
+<div class="list-box qr-transition-history-section">
+<button aria-controls="qrTransitionHistoryContent" aria-expanded="false" class="qr-transition-history-toggle" disabled="" id="qrTransitionHistoryToggle" type="button"><span aria-hidden="true" id="qrTransitionHistoryChevron">&#9654;</span> Historial de transiciones (<span id="qrTransitionHistoryCount">0</span>)</button>
+<div class="hidden" id="qrTransitionHistoryContent">
+<div class="qr-transition-history-summary" id="qrTransitionHistorySummary"></div>
+<div class="qr-transition-history-filters" data-qr-history-controls>
+<label>Resultado<select data-qr-history-filter="status"><option value="">Todos</option><option value="applied">Applied</option><option value="skipped">Skipped</option><option value="error">Error</option><option value="ambiguous">Ambiguous</option></select></label>
+<label>Regla<select data-qr-history-filter="rule"><option value="">Todas</option></select></label>
+<label>Orden / taskCode<input data-qr-history-filter="order" placeholder="Orden o taskCode" type="search"/></label>
+<label>Rack<input data-qr-history-filter="rack" placeholder="Rack" type="search"/></label>
+<label>QR<input data-qr-history-filter="qr" placeholder="QR" type="search"/></label>
+<label>Scanner<input data-qr-history-filter="scanner" placeholder="C&oacute;digo o nombre" type="search"/></label>
+<label>Ejecuci&oacute;n<input data-qr-history-filter="execution" placeholder="execution_id" type="search"/></label>
+<label>Buscar en historial<input data-qr-history-filter="search" placeholder="Orden, taskCode, rack, regla, QR, scanner o mensaje" type="search"/></label>
+<label>L&iacute;mite<select data-qr-history-filter="limit"><option value="50">50</option><option value="100">100</option><option selected value="200">200</option></select></label>
+</div>
+<div aria-live="polite" class="qr-transition-history-view-state" id="qrTransitionHistoryState">Expande para cargar el historial.</div>
+<div class="diagnosis-table-wrap qr-transition-history-table-wrap hidden" id="qrTransitionLogsList"><table class="diagnosis-table qr-transition-history-table qr-transition-history-table-compact"><thead><tr><th>Fecha/hora</th><th>Regla</th><th>Orden</th><th>Rack</th><th>Material anterior &rarr; siguiente</th><th>Resultado</th><th>Mensaje</th><th>Detalle</th></tr></thead><tbody id="qrTransitionHistoryTableBody"></tbody></table></div>
+<div class="row qr-transition-history-actions"><button class="btn ghost" disabled="" id="btnRefreshQrTransitionLogs" type="button">Actualizar</button><button class="btn" disabled="" id="btnOpenQrTransitionHistory" type="button">Abrir historial</button></div>
+</div>
 </div>
 </div>
 <div class="small" id="qrAdminMsg"></div>
@@ -1027,6 +1054,9 @@
 </div>
 <div class="card" id="card-config-rcs">
 <h3>Configuración RCS</h3>
+<div class="row">
+<div class="switch-wrap"><label class="switch"><input disabled="" id="rcsSimulatorEnabled" type="checkbox"/><span class="slider"></span></label><div><b>Simulador RCS local</b><div class="small">Al activarlo, las tareas se aceptan y se reportan como finalizadas sin contactar el servidor RCS real.</div></div></div>
+</div>
 <div class="row">
 <label>URL base</label>
 <input disabled="" id="rcsBaseUrl" placeholder="Ej. http://192.168.1.50:8080" type="text"/>
@@ -1228,6 +1258,26 @@ reqCode automático · reqTime automático · mapShortName configurable y habili
 </div>
 </aside>
 </main>
+<div aria-hidden="true" aria-labelledby="qrTransitionHistoryModalTitle" aria-modal="true" class="modal hidden" id="qrTransitionHistoryModal" role="dialog" tabindex="-1">
+<div class="modal-card qr-transition-history-modal-card">
+<div class="modal-header qr-transition-history-modal-header"><div><h3 id="qrTransitionHistoryModalTitle">Historial de transiciones (<span id="qrTransitionHistoryModalCount">0</span>)</h3><div class="qr-transition-history-summary" id="qrTransitionHistoryModalSummary"></div></div><button aria-label="Cerrar historial" class="btn ghost" id="btnCloseQrTransitionHistoryX" type="button">X</button></div>
+<div class="qr-transition-history-filters" data-qr-history-controls>
+<label>Resultado<select data-qr-history-filter="status"><option value="">Todos</option><option value="applied">Applied</option><option value="skipped">Skipped</option><option value="error">Error</option><option value="ambiguous">Ambiguous</option></select></label>
+<label>Regla<select data-qr-history-filter="rule"><option value="">Todas</option></select></label>
+<label>Orden / taskCode<input data-qr-history-filter="order" placeholder="Orden o taskCode" type="search"/></label>
+<label>Rack<input data-qr-history-filter="rack" placeholder="Rack" type="search"/></label>
+<label>QR<input data-qr-history-filter="qr" placeholder="QR" type="search"/></label>
+<label>Scanner<input data-qr-history-filter="scanner" placeholder="C&oacute;digo o nombre" type="search"/></label>
+<label>Ejecuci&oacute;n<input data-qr-history-filter="execution" placeholder="execution_id" type="search"/></label>
+<label>Buscar en historial<input data-qr-history-filter="search" placeholder="Orden, taskCode, rack, regla, QR, scanner o mensaje" type="search"/></label>
+<label>L&iacute;mite<select data-qr-history-filter="limit"><option value="50">50</option><option value="100">100</option><option selected value="200">200</option></select></label>
+</div>
+<div class="row qr-transition-history-actions"><button class="btn ghost" disabled="" id="btnRefreshQrTransitionLogsModal" type="button">Actualizar</button><button class="btn ghost" id="btnCloseQrTransitionHistory" type="button">Cerrar</button></div>
+<div aria-live="polite" class="qr-transition-history-view-state" id="qrTransitionHistoryModalState">Sin historial de transiciones.</div>
+<div class="diagnosis-table-wrap qr-transition-history-modal-table-wrap hidden" id="qrTransitionHistoryModalList"><table class="diagnosis-table qr-transition-history-table"><thead><tr><th>Fecha/hora</th><th>Regla</th><th>Orden</th><th>QR</th><th>Scanner</th><th>Rack</th><th>Material anterior</th><th>Material siguiente</th><th>Status</th><th>Resultado</th><th>Mensaje</th><th>Detalle</th></tr></thead><tbody id="qrTransitionHistoryModalTableBody"></tbody></table></div>
+<div class="hidden qr-transition-history-detail" id="qrTransitionHistoryDetail"></div>
+</div>
+</div>
 <div class="modal hidden" id="qrRulePreviewModal">
 <div class="modal-card qr-modal-card">
 <div class="modal-header qr-modal-header">
@@ -1331,6 +1381,8 @@ reqCode automático · reqTime automático · mapShortName configurable y habili
 <section class="diagnosis-section">
 <h4>Locations inconsistentes</h4>
 <div class="diagnosis-table-wrap" id="diagnosisInconsistentLocations">Sin datos.</div>
+<div class="small">La reparación segura solo corrige el estado libre/ocupado. No mueve racks ni cambia materiales.</div>
+<button class="btn warn" id="btnRepairInconsistentLocations" type="button">Reparar inconsistencias seguras</button>
 </section>
 <section class="diagnosis-section">
 <h4>Integrity check</h4>
@@ -1345,6 +1397,30 @@ reqCode automático · reqTime automático · mapShortName configurable y habili
 <button class="btn danger" id="btnCloseSelectedOrders" type="button">Cerrar &oacute;rdenes seleccionadas</button>
 <button class="btn danger" id="btnReleaseSelectedRacks" type="button">Liberar racks seleccionados</button>
 <button class="btn danger" id="btnResolveSelectedInconsistentRacks" type="button">Resolver racks inconsistentes seleccionados</button>
+</div>
+</div>
+</div>
+<div class="modal hidden" id="forceReleaseConfirmModal">
+<div class="modal-card cleanup-confirm-card">
+<div class="modal-header"><h3>Confirmar cierre local</h3></div>
+<div class="modal-body">
+<div class="cleanup-warning">
+<b>El RCS todav&iacute;a puede reportar una o m&aacute;s tareas como activas.</b><br/><br/>
+Esta acci&oacute;n:<br/>
+- cerrar&aacute; las &oacute;rdenes &uacute;nicamente en esta aplicaci&oacute;n;<br/>
+- liberar&aacute; localmente los racks;<br/>
+- no detendr&aacute; f&iacute;sicamente al robot;<br/>
+- no cancelar&aacute; la tarea en RCS;<br/>
+- no cambiar&aacute; la ubicaci&oacute;n registrada;<br/>
+- no cambiar&aacute; el material.
+</div>
+<label class="force-release-confirm-check"><input id="forceReleasePhysicalConfirm" type="checkbox"/> Confirmo que verifiqu&eacute; f&iacute;sicamente que las tareas ya no se est&aacute;n ejecutando.</label>
+<label>Motivo obligatorio<textarea id="forceReleaseReason" maxlength="256" placeholder="Ej. La tarea qued&oacute; hu&eacute;rfana en RCS."></textarea></label>
+<div class="small" id="forceReleaseConfirmMsg"></div>
+</div>
+<div class="row">
+<button class="btn ghost" id="btnCancelForceRelease" type="button">Cancelar</button>
+<button class="btn danger" id="btnConfirmForceRelease" type="button" disabled>Confirmar cierre local y liberar racks</button>
 </div>
 </div>
 </div>
@@ -1388,6 +1464,16 @@ reqCode automático · reqTime automático · mapShortName configurable y habili
 </div>
 </div>
 </div>
-<script src="/static/app.js?v=fifo-chain-origin-destination-ui-20260723"></script>
+<div aria-hidden="true" aria-labelledby="qrDeleteRestoreTitle" aria-modal="true" class="qr-admin-modal hidden" id="qrDeleteRestoreModal" role="dialog" tabindex="-1">
+<div class="qr-admin-modal-card">
+<button aria-label="Cerrar confirmación" class="btn ghost qr-admin-modal-close" id="btnCloseQrDeleteRestoreModal" type="button">&times;</button>
+<h3 id="qrDeleteRestoreTitle">Confirmar acción</h3>
+<div id="qrDeleteRestoreBody"></div>
+<label class="qr-delete-confirm hidden" id="qrDeleteConfirmWrap"><input id="qrDeleteConfirmCheck" type="checkbox"/> Confirmo que deseo eliminar esta configuraci&oacute;n.</label>
+<div class="small hidden" id="qrDeleteRestoreError" role="alert"></div>
+<div class="row qr-admin-modal-actions"><button class="btn ghost" id="btnCancelQrDeleteRestore" type="button">Cancelar</button><button class="btn danger" disabled="" id="btnConfirmQrDeleteRestore" type="button">Eliminar configuraci&oacute;n</button></div>
+</div>
+</div>
+<script src="/static/app.js?v=catalog-safe-delete-ui-20260731"></script>
 </body>
 </html>

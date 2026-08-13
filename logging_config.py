@@ -16,7 +16,8 @@ ERROR_LOG_FILE = LOG_DIR / "error.log"
 RCS_LOG_FILE = LOG_DIR / "rcs.log"
 PROGRAMMING_LOG_FILE = LOG_DIR / "programming.log"
 IO_LOG_FILE = LOG_DIR / "io.log"
-LOG_FILES = (LOG_FILE, ERROR_LOG_FILE, RCS_LOG_FILE, PROGRAMMING_LOG_FILE, IO_LOG_FILE)
+QR_LOG_FILE = LOG_DIR / "qr.log"
+LOG_FILES = (LOG_FILE, ERROR_LOG_FILE, RCS_LOG_FILE, PROGRAMMING_LOG_FILE, IO_LOG_FILE, QR_LOG_FILE)
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 5
 
@@ -103,9 +104,11 @@ def configure_logging() -> Path:
         rcs_filter = _LoggerNameFilter("app.rcs_client", "app.rcs")
         programming_filter = _LoggerNameFilter("app.programming", "app.simulator", "app.simulation")
         io_filter = _LoggerNameFilter("app.io")
+        qr_filter = _LoggerNameFilter("app.scanner", "app.qr", "app.qr_transition")
         _add_rotating_handler(root_logger, RCS_LOG_FILE, logging.INFO, formatter, rcs_filter)
         _add_rotating_handler(root_logger, PROGRAMMING_LOG_FILE, logging.INFO, formatter, programming_filter)
         _add_rotating_handler(root_logger, IO_LOG_FILE, logging.INFO, formatter, io_filter)
+        _add_rotating_handler(root_logger, QR_LOG_FILE, logging.INFO, formatter, qr_filter)
 
         def _log_unhandled_exception(exc_type, exc_value, exc_tb):
             if issubclass(exc_type, KeyboardInterrupt):

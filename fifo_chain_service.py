@@ -108,6 +108,8 @@ def _select_destination_cell_for_next_step(
     destination_area: Area,
     destination_cell_id: Optional[int],
     next_step: int,
+    allow_same_cell_move: bool = False,
+    same_cell_source_cell: Optional[Location] = None,
 ) -> Location:
     reserved_ids = _reserved_destination_cell_ids(db)
     if destination_cell_id:
@@ -116,8 +118,11 @@ def _select_destination_cell_for_next_step(
             destination_cell_id,
             destination_area,
             f"Celda destino paso {next_step}",
-            destination=True,
+            destination=False,
         )
+        same_cell = bool(same_cell_source_cell is not None and cell.id == same_cell_source_cell.id)
+        if getattr(cell, "rack_id", None) is not None and not (allow_same_cell_move and same_cell and cell.rack_id == same_cell_source_cell.rack_id):
+            raise ValueError(f"Celda destino paso {next_step} ya esta ocupada")
         if cell.id in reserved_ids:
             raise ValueError(f"La celda destino paso {next_step} ya esta reservada")
         return cell
@@ -134,6 +139,9 @@ def _select_destination_cell_for_next_step(
     for cell in cells:
         if cell.id not in reserved_ids and str(cell.code or "").strip():
             return cell
+    if allow_same_cell_move and same_cell_source_cell is not None and same_cell_source_cell.area_id == destination_area.id:
+        if same_cell_source_cell.id not in reserved_ids and str(getattr(same_cell_source_cell, "code", "") or "").strip():
+            return same_cell_source_cell
     area_label = destination_area.name or destination_area.code or destination_area.id
     raise ValueError(f"Paso {next_step}: no hay espacio libre en el area destino {area_label}.")
 
@@ -146,12 +154,19 @@ def resolve_destination_cell_for_step(
     destination_cell_id=None,
     destination_area_ids=None,
     next_step: int,
+    allow_same_cell_move: bool = False,
+    same_cell_source_cell: Optional[Location] = None,
 ) -> tuple[Area, Location]:
     mode = str(destination_mode or "configured_area").strip() or "configured_area"
     if mode == "configured_area":
         area = _load_area(db, _as_int(destination_area_id, "destination_area_id"), f"Area destino paso {next_step}")
         return area, _select_destination_cell_for_next_step(
-            db, destination_area=area, destination_cell_id=_as_optional_int(destination_cell_id), next_step=next_step
+            db,
+            destination_area=area,
+            destination_cell_id=_as_optional_int(destination_cell_id),
+            next_step=next_step,
+            allow_same_cell_move=allow_same_cell_move,
+            same_cell_source_cell=same_cell_source_cell,
         )
     if mode not in {"any_area_with_space", "selected_areas_with_space"}:
         raise ValueError(f"destination_mode invalido para paso {next_step}: {mode}")
@@ -166,7 +181,12 @@ def resolve_destination_cell_for_step(
     for area in ordered_areas:
         try:
             cell = _select_destination_cell_for_next_step(
-                db, destination_area=area, destination_cell_id=None, next_step=next_step
+                db,
+                destination_area=area,
+                destination_cell_id=None,
+                next_step=next_step,
+                allow_same_cell_move=allow_same_cell_move,
+                same_cell_source_cell=same_cell_source_cell,
             )
             return area, cell
         except ValueError:
@@ -301,8 +321,6 @@ def resolve_fifo_request_by_material_selected_areas(
         .order_by(Rack.fifo_entered_at.asc().nullslast(), Rack.code.asc(), Location.y.asc(), Location.x.asc())
     ).all()
     for rack, cell, area in rows:
-        if excluded_area_id is not None and area.id == int(excluded_area_id):
-            continue
         status = _normalize_rack_status(rack.status)
         if rack.id in active_rack_ids or status in INACTIVE_RACK_STATUSES or (status and status not in ACTIVE_RACK_STATUSES):
             continue
@@ -315,43 +333,6 @@ def resolve_fifo_request_by_material_selected_areas(
 def _select_rack_for_next_step_global_material(db, *, material_group_id, destination_area: Area, next_step: int) -> tuple[Rack, MaterialGroup, Area, Location]:
     material = _resolve_material_group_for_fifo(db, material_group_id)
     rack, cell, area = resolve_fifo_request_by_material_any_area(db, material.id)
-    if area.id == destination_area.id:
-        # Evitar origen=destino para el paso 2. Si el primer candidato cae en destino,
-        # seguir buscando con el mismo filtro FIFO pero saltando esa area.
-        active_rack_ids = {
-            int(row[0])
-            for row in db.execute(
-                select(MovementOrder.rack_id).where(
-                    MovementOrder.rack_id.is_not(None),
-                    MovementOrder.status.in_(RACK_RESERVATION_ACTIVE_STATUSES),
-                )
-            ).all()
-            if row and row[0] is not None
-        }
-        rows = (
-            db.execute(
-                select(Rack, Location, Area)
-                .join(Location, Location.rack_id == Rack.id)
-                .join(Area, Area.id == Location.area_id)
-                .where(Rack.material_group_id == material.id)
-                .where(Location.rack_id.is_not(None))
-                .where(Location.enabled == 1)
-                .where(Location.is_visible == 1)
-                .where(Area.is_active == 1)
-                .order_by(Rack.fifo_entered_at.asc().nullslast(), Rack.code.asc(), Location.y.asc(), Location.x.asc())
-            )
-            .all()
-        )
-        for candidate_rack, candidate_cell, candidate_area in rows:
-            if candidate_area.id == destination_area.id or candidate_rack.id in active_rack_ids:
-                continue
-            status = _normalize_rack_status(candidate_rack.status)
-            if status in INACTIVE_RACK_STATUSES or (status and status not in ACTIVE_RACK_STATUSES):
-                continue
-            if not str(getattr(candidate_cell, "code", "") or "").strip():
-                continue
-            return candidate_rack, material, candidate_area, candidate_cell
-        raise ValueError(f"No hay rack disponible con material {material.code or material.id} fuera del area destino para paso {next_step}.")
     return rack, material, area, cell
 
 
@@ -394,35 +375,29 @@ def create_fifo_chain_next_step(db, completed_order: MovementOrder, config: dict
     source_mode = str(config.get("source_mode") or "configured_area").strip() or "configured_area"
     destination_mode = str(config.get("destination_mode") or "configured_area").strip() or "configured_area"
     fifo_material_policy = str(config.get("fifo_material_policy") or "any_available_from_source").strip() or "any_available_from_source"
+    allow_same_cell_move = bool(config.get("allow_same_cell_move") or False)
     priority = _normalize_priority(str(config.get("priority") or "normal"))
-
-    destination_area, destination_cell = resolve_destination_cell_for_step(
-        db, destination_mode=destination_mode,
-        destination_area_id=config.get("destination_area_id"),
-        destination_cell_id=config.get("destination_cell_id"),
-        destination_area_ids=config.get("destination_area_ids_json"),
-        next_step=next_step,
-    )
+    configured_source_cell_id = _as_optional_int(config.get("source_cell_id"))
+    configured_destination_cell_id = _as_optional_int(config.get("destination_cell_id"))
+    if configured_source_cell_id and configured_destination_cell_id and configured_source_cell_id == configured_destination_cell_id and not allow_same_cell_move:
+        raise ValueError("La celda origen y destino no pueden ser la misma, salvo que se habilite Permitir movimiento en la misma celda.")
 
     if source_mode == "any_area_by_material":
         rack, material, source_area, source_cell = _select_rack_for_next_step_global_material(
             db,
             material_group_id=config.get("step2_material_group_id") or config.get("material_group_id"),
-            destination_area=destination_area,
+            destination_area=None,
             next_step=next_step,
         )
     elif source_mode == "selected_areas_by_material":
         rack, source_cell, source_area = resolve_fifo_request_by_material_selected_areas(
             db, config.get("material_group_id"), config.get("source_area_ids_json"),
-            excluded_area_id=destination_area.id,
         )
         material = _resolve_material_group_for_fifo(db, config.get("material_group_id"))
     else:
         source_area_id = _as_int(config.get("source_area_id"), "source_area_id")
-        source_cell_id = _as_optional_int(config.get("source_cell_id"))
+        source_cell_id = configured_source_cell_id
         source_area = _load_area(db, source_area_id, f"Area origen paso {next_step}")
-        if source_area.id == destination_area.id:
-            raise ValueError(f"El area origen y destino del paso {next_step} no pueden ser iguales")
         source_cell = (
             _load_cell(db, source_cell_id, source_area, f"Celda origen paso {next_step}")
             if source_cell_id else None
@@ -435,6 +410,21 @@ def create_fifo_chain_next_step(db, completed_order: MovementOrder, config: dict
             fifo_material_policy=fifo_material_policy,
             next_step=next_step,
         )
+
+    destination_area, destination_cell = resolve_destination_cell_for_step(
+        db,
+        destination_mode=destination_mode,
+        destination_area_id=config.get("destination_area_id"),
+        destination_cell_id=config.get("destination_cell_id"),
+        destination_area_ids=config.get("destination_area_ids_json"),
+        next_step=next_step,
+        allow_same_cell_move=allow_same_cell_move,
+        same_cell_source_cell=source_cell,
+    )
+
+    same_cell_move = source_cell.id == destination_cell.id
+    if same_cell_move and not allow_same_cell_move:
+        raise ValueError("La celda origen y destino no pueden ser la misma, salvo que se habilite Permitir movimiento en la misma celda.")
 
     now = datetime.utcnow()
     order = MovementOrder(
@@ -493,6 +483,11 @@ def create_fifo_chain_next_step(db, completed_order: MovementOrder, config: dict
     db.add(rack)
     db.commit()
     db.refresh(order)
+    if same_cell_move:
+        logger.info(
+            "SAME_CELL_MOVE_ALLOWED movement_order_id=%s order_code=%s route_mode=%s source_cell_code=%s destination_cell_code=%s allow_same_cell_move=%s",
+            order.id, order.order_code, "fifo_chain", source_cell.code, destination_cell.code, True,
+        )
 
     logger.info(
         "FIFO_CHAIN_NEXT_STEP_CREATED fifo_chain_group_id=%s completed_order_id=%s next_order_id=%s step=%s source_mode=%s source_cell_id=%s destination_cell_id=%s rack_id=%s fifo_material_policy=%s",
