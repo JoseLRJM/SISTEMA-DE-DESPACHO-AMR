@@ -24,14 +24,17 @@ import traceback
 import uuid
 import zipfile
 from pathlib import PurePosixPath
+from types import SimpleNamespace
 
-from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select, func, delete, text, or_
+from sqlalchemy import select, func, delete, text, or_, event
 
 from logging_config import ensure_log_file, get_logger
+from db_diagnostics import EXPECTED_INDEXES, check_expected_indexes, open_read_only
+from performance_observability import metrics as performance_metrics
 from rcs_client import RcsClient, RcsError, RcsSimpleResponse, RcsTaskRequest, RcsTaskResponse, RcsTaskStatusResponse
 from monitor_service import TaskMonitor, build_auto_status_query_payload, generate_req_code_ms, apply_remote_status_to_order, _normalize_remote_status, _single_task_response_item, _task_code_from_error_message
 from scanner_service import ScanPreviewError, execute_scan, preview_scan, resolve_cancel_return_target, resolve_scan_terminal, terminal_preview_scan
@@ -82,15 +85,65 @@ from models import (
 
 
 
-RUNTIME_BROADCAST_INTERVAL_SECONDS = 1.0
+RUNTIME_RECENT_ORDER_LIMIT = 100
 ROBOT_MONITOR_CACHE_MAX_AGE_SECONDS = 5.0
 NO_MATERIAL_CODE = "SIN_MATERIAL"
 NO_MATERIAL_NAME = "Sin material"
 NO_MATERIAL_COLOR = "#94a3b8"
 RACK_RESERVATION_ACTIVE_STATUSES = ("pending_dispatch", "dispatched", "in_progress", "cancel_requested_total", "cancel_requested_undo", "cancel_error")
 logger = get_logger("app.main")
+HTTP_SLOW_WARNING_MS = float(os.getenv("PERF_HTTP_SLOW_MS", "500"))
+SQL_SLOW_WARNING_MS = float(os.getenv("PERF_SQL_SLOW_MS", "100"))
+RCS_SLOW_WARNING_MS = float(os.getenv("PERF_RCS_SLOW_MS", "5000"))
+WEBSOCKET_LARGE_WARNING_BYTES = int(os.getenv("PERF_WS_LARGE_BYTES", str(1024 * 1024)))
 SOFTWARE_UPDATE_LOCK = threading.Lock()
 CONFIG_AUDIT_CONTEXT = contextvars.ContextVar("CONFIG_AUDIT_CONTEXT", default={})
+
+
+def _performance_endpoint_label(method: str, path: str) -> str:
+    important = {
+        "/api/fifo/execute": "fifo_execute",
+        "/api/direct-move/execute": "direct_move_execute",
+        "/api/locations": "locations",
+        "/api/catalog": "catalog",
+        "/api/movement-orders": "movement_orders",
+        "/api/runtime-snapshot": "runtime_snapshot",
+        "/api/robot-status-monitor": "robot_monitor",
+        "/api/admin/performance-health": "admin_performance_health",
+    }
+    if path in important:
+        return important[path]
+    if path.startswith("/api/operator-windows/"):
+        return "operator_window"
+    return f"{method.upper()} other"
+
+
+def _sql_before_cursor_execute(_conn, _cursor, _statement, _parameters, context, _executemany):
+    context._performance_started_at = time.perf_counter()
+
+
+def _sql_finish(context) -> None:
+    started = getattr(context, "_performance_started_at", None)
+    if started is None:
+        return
+    duration_ms = (time.perf_counter() - started) * 1000.0
+    performance_metrics.record("sql", duration_ms, label="statement")
+    if duration_ms > SQL_SLOW_WARNING_MS:
+        logger.warning("SLOW_SQL duration_ms=%.1f", duration_ms)
+
+
+def _sql_after_cursor_execute(_conn, _cursor, _statement, _parameters, context, _executemany):
+    _sql_finish(context)
+
+
+def _sql_handle_error(exception_context):
+    if exception_context.execution_context is not None:
+        _sql_finish(exception_context.execution_context)
+
+
+event.listen(engine, "before_cursor_execute", _sql_before_cursor_execute)
+event.listen(engine, "after_cursor_execute", _sql_after_cursor_execute)
+event.listen(engine, "handle_error", _sql_handle_error)
 
 
 def _set_config_audit_context(**values):
@@ -125,6 +178,7 @@ CLEANUP_RCS_TERMINAL_STATUS_MAP = {
     "aborted": "failed",
     "terminated": "failed",
 }
+CLEANUP_RCS_TERMINAL_INPUT_STATUSES = tuple(CLEANUP_RCS_TERMINAL_STATUS_MAP)
 
 
 def _app_root() -> str:
@@ -136,31 +190,68 @@ _stuck_cancel_return_auto_release_last_ts = 0.0
 
 class RuntimeWebSocketManager:
     def __init__(self):
-        self._connections: set[WebSocket] = set()
+        self._connections: dict[WebSocket, asyncio.Queue] = {}
+        self._sender_tasks: dict[WebSocket, asyncio.Task] = {}
         self._lock = asyncio.Lock()
 
-    async def connect(self, websocket: WebSocket):
+    async def accept(self, websocket: WebSocket):
         await websocket.accept()
-        async with self._lock:
-            self._connections.add(websocket)
 
-    async def disconnect(self, websocket: WebSocket):
+    async def connect(self, websocket: WebSocket):
+        queue = asyncio.Queue(maxsize=100)
         async with self._lock:
-            self._connections.discard(websocket)
+            self._connections[websocket] = queue
+            self._sender_tasks[websocket] = asyncio.create_task(self._sender(websocket, queue))
+
+    async def _sender(self, websocket: WebSocket, queue: asyncio.Queue):
+        try:
+            while True:
+                payload = await queue.get()
+                started = time.perf_counter()
+                if hasattr(websocket, "send"):
+                    encoded_payload = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+                    payload_size = len(encoded_payload.encode("utf-8"))
+                    await websocket.send({"type": "websocket.send", "text": encoded_payload})
+                else:
+                    # Small test doubles may only implement send_json.
+                    payload_size = len(json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8"))
+                    await websocket.send_json(payload)
+                duration_ms = (time.perf_counter() - started) * 1000.0
+                performance_metrics.record("websocket", duration_ms, label="send_json", size_bytes=payload_size)
+                if payload_size > WEBSOCKET_LARGE_WARNING_BYTES:
+                    logger.warning("SLOW_WEBSOCKET_PAYLOAD size_bytes=%s duration_ms=%.1f", payload_size, duration_ms)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await self.disconnect(websocket, from_sender=True)
+
+    async def disconnect(self, websocket: WebSocket, from_sender: bool = False):
+        async with self._lock:
+            self._connections.pop(websocket, None)
+            task = self._sender_tasks.pop(websocket, None)
+        if task is not None and not from_sender:
+            task.cancel()
 
     async def broadcast_json(self, payload: dict):
         async with self._lock:
-            targets = list(self._connections)
-        dead = []
-        for ws in targets:
+            targets = list(self._connections.items())
+        for _ws, queue in targets:
             try:
-                await ws.send_json(payload)
-            except Exception:
-                dead.append(ws)
-        if dead:
-            async with self._lock:
-                for ws in dead:
-                    self._connections.discard(ws)
+                queue.put_nowait(payload)
+            except asyncio.QueueFull:
+                while not queue.empty():
+                    with contextlib.suppress(asyncio.QueueEmpty):
+                        queue.get_nowait()
+                with contextlib.suppress(asyncio.QueueFull):
+                    queue.put_nowait({"type": "runtime_resync_required", "revision": _runtime_current_revision()})
+
+    async def send_json(self, websocket: WebSocket, payload: dict):
+        async with self._lock:
+            queue = self._connections.get(websocket)
+        if queue is None:
+            await websocket.send_json(payload)
+        else:
+            await queue.put(payload)
 
     async def count(self) -> int:
         async with self._lock:
@@ -168,10 +259,133 @@ class RuntimeWebSocketManager:
 
 
 runtime_ws_manager = RuntimeWebSocketManager()
-_runtime_snapshot_state_lock = threading.Lock()
-_runtime_snapshot_last_hash = ""
+_runtime_revision_lock = threading.Lock()
+_runtime_revision = 0
+_runtime_event_history = []
+_runtime_event_queue = None
+_runtime_event_loop = None
+_runtime_queue_overflow = False
+_locations_revision_lock = threading.Lock()
+_locations_revision = int(time.time() * 1000)
+_locations_count_lock = threading.Lock()
+_locations_count_cache = None
 _robot_monitor_cache_lock = threading.Lock()
-_robot_monitor_cache = {"timestamp": 0.0, "payload": None}
+_robot_monitor_refresh_lock = threading.Lock()
+_robot_monitor_background_stop_event = threading.Event()
+_robot_monitor_cache = {"timestamp": 0.0, "payload": None, "last_error": ""}
+
+
+def _runtime_current_revision() -> int:
+    with _runtime_revision_lock:
+        return _runtime_revision
+
+
+def _locations_current_revision() -> int:
+    with _locations_revision_lock:
+        return _locations_revision
+
+
+def _increment_locations_revision() -> int:
+    global _locations_revision
+    with _locations_revision_lock:
+        _locations_revision += 1
+        return _locations_revision
+
+
+def _locations_current_count() -> int:
+    global _locations_count_cache
+    with _locations_count_lock:
+        if _locations_count_cache is not None:
+            return _locations_count_cache
+        with SessionLocal() as db:
+            _locations_count_cache = int(db.execute(select(func.count()).select_from(Location)).scalar_one() or 0)
+        return _locations_count_cache
+
+
+def _adjust_locations_count(changes: dict) -> None:
+    global _locations_count_cache
+    with _locations_count_lock:
+        if _locations_count_cache is None:
+            return
+        created = sum(1 for (kind, _entity_id), action in changes.items() if kind == "location" and action == "created")
+        deleted = sum(1 for (kind, _entity_id), action in changes.items() if kind == "location" and action == "deleted")
+        _locations_count_cache = max(0, _locations_count_cache + created - deleted)
+
+
+def publish_runtime_event(event_type: str, payload: dict, *, enqueue: bool = True) -> dict:
+    """Publish a small runtime event without blocking the committing thread."""
+    global _runtime_revision, _runtime_queue_overflow
+    with _runtime_revision_lock:
+        _runtime_revision += 1
+        message = {"type": event_type, "revision": _runtime_revision, "payload": payload}
+        _runtime_event_history.append(message)
+        del _runtime_event_history[:-1000]
+        loop = _runtime_event_loop
+        queue = _runtime_event_queue
+    if enqueue and loop is not None and queue is not None and loop.is_running():
+        def enqueue():
+            global _runtime_queue_overflow
+            try:
+                queue.put_nowait(message)
+            except asyncio.QueueFull:
+                _runtime_queue_overflow = True
+        loop.call_soon_threadsafe(enqueue)
+    return message
+
+
+def _queue_runtime_change(change: dict) -> None:
+    global _runtime_queue_overflow
+    with _runtime_revision_lock:
+        loop = _runtime_event_loop
+        queue = _runtime_event_queue
+    if loop is None or queue is None or not loop.is_running():
+        return
+    def enqueue():
+        global _runtime_queue_overflow
+        try:
+            queue.put_nowait({"_change": change})
+        except asyncio.QueueFull:
+            _runtime_queue_overflow = True
+    loop.call_soon_threadsafe(enqueue)
+
+
+def _runtime_events_since(revision: int) -> list:
+    with _runtime_revision_lock:
+        return [message for message in _runtime_event_history if int(message.get("revision") or 0) > revision]
+
+
+@event.listens_for(SessionLocal, "after_flush")
+def _capture_runtime_session_changes(session, _flush_context):
+    changes = session.info.setdefault("runtime_changes", {})
+    tracked = (
+        (MovementOrder, "order"), (Location, "location"), (Rack, "rack"),
+        (DebugConsoleEvent, "debug_event"), (Area, "catalog"), (MaterialGroup, "catalog"),
+    )
+    for collection, action in ((session.new, "created"), (session.dirty, "updated"), (session.deleted, "deleted")):
+        for row in collection:
+            if action == "updated" and not session.is_modified(row, include_collections=False):
+                continue
+            for model, kind in tracked:
+                if isinstance(row, model) and getattr(row, "id", None) is not None:
+                    changes[(kind, int(row.id))] = action
+                    if kind == "order" and getattr(row, "rack_id", None):
+                        changes[("rack", int(row.rack_id))] = "updated"
+                    break
+
+
+@event.listens_for(SessionLocal, "after_commit")
+def _publish_runtime_session_changes(session):
+    changes = session.info.pop("runtime_changes", {})
+    if any(kind == "location" for kind, _entity_id in changes):
+        _adjust_locations_count(changes)
+        _increment_locations_revision()
+    for (kind, entity_id), action in changes.items():
+        _queue_runtime_change({"kind": kind, "id": entity_id, "action": action})
+
+
+@event.listens_for(SessionLocal, "after_rollback")
+def _discard_runtime_session_changes(session):
+    session.info.pop("runtime_changes", None)
 
 class LocationPatchAdmin(BaseModel):
     status: Optional[int] = Field(default=None, description="0 libre, 1 ocupado")
@@ -1672,6 +1886,76 @@ class MovementOrderOut(BaseModel):
     can_undo: bool = False
 
 
+class MovementOrderSummaryOut(BaseModel):
+    order_id: int
+    order_code: str
+    order_type: str
+    status: str
+    priority: str
+    agv_code: Optional[str] = None
+    task_typ: Optional[str] = None
+    comment: Optional[str] = None
+    created_at: datetime
+    created_by: Optional[str] = None
+    rack_id: Optional[int] = None
+    rack_code: Optional[str] = None
+    rack_missing: bool = False
+    material_group_id: Optional[int] = None
+    material_group_name: Optional[str] = None
+    source_area_id: Optional[int] = None
+    source_area_name: Optional[str] = None
+    destination_area_id: Optional[int] = None
+    destination_area_name: Optional[str] = None
+    source_cell_id: Optional[int] = None
+    destination_cell_id: Optional[int] = None
+    source_cell: dict
+    destination_cell: dict
+    current_cell: Optional[dict] = None
+    dispatch_status: str = "not_sent"
+    remote_task_code: Optional[str] = None
+    req_code: Optional[str] = None
+    rcs_status: Optional[str] = None
+    rcs_message: Optional[str] = None
+    cancel_source: Optional[str] = None
+    cancel_reason: Optional[str] = None
+    closed_by: Optional[str] = None
+    closed_at: Optional[datetime] = None
+    release_source: Optional[str] = None
+    dispatched_at: Optional[datetime] = None
+    rcs_last_update: Optional[datetime] = None
+    status_query_checked_at: Optional[datetime] = None
+    rcs_status_changed_at: Optional[datetime] = None
+    route_mode: str = "simple_area"
+    trmx_group_id: Optional[str] = None
+    trmx_step: Optional[int] = None
+    trmx_total_steps: Optional[int] = None
+    trmx_parent_order_id: Optional[int] = None
+    trmx_status: Optional[str] = None
+    trmx_select_policy: Optional[str] = None
+    fifo_chain_group_id: Optional[str] = None
+    fifo_chain_step: Optional[int] = None
+    fifo_chain_total_steps: Optional[int] = None
+    fifo_chain_parent_order_id: Optional[int] = None
+    fifo_chain_status: Optional[str] = None
+    fifo_chain_select_policy: Optional[str] = None
+    can_simulate_complete: bool = False
+    can_undo: bool = False
+
+
+class MovementOrderDetailOut(MovementOrderOut):
+    dispatch_request_payload: Optional[dict] = None
+    dispatch_response_payload: Optional[dict] = None
+    rcs_response_payload: Optional[dict] = None
+    override_payload: Optional[dict] = None
+
+
+class MovementOrderPageOut(BaseModel):
+    items: List[MovementOrderSummaryOut]
+    total: int
+    limit: int
+    offset: int
+
+
 
 
 class MovementOrderJsonIn(BaseModel):
@@ -1725,7 +2009,9 @@ class DebugConsoleEventOut(BaseModel):
 
 
 class RuntimeSnapshotOut(BaseModel):
-    orders: List[MovementOrderOut] = []
+    orders: List[MovementOrderSummaryOut] = []
+    orders_total: int = 0
+    recent_order_limit: int = RUNTIME_RECENT_ORDER_LIMIT
     locations: List[LocationOut] = []
     debug_log: List[DebugConsoleEventOut] = []
     robot_monitor: Optional["RobotMonitorResponse"] = None
@@ -2684,16 +2970,15 @@ def _apply_action_custom_fields_to_rack(rack: Rack, custom_rows: list) -> None:
             rack.quantity = rack.quantity or 0
 
 
-def _rack_reservation_order(db, rack_id: Optional[int]) -> Optional[MovementOrder]:
+def _rack_reservation_order(db, rack_id: Optional[int]):
     if not rack_id:
         return None
     return (
         db.execute(
-            select(MovementOrder)
+            select(MovementOrder.id, MovementOrder.remote_task_code, MovementOrder.order_code)
             .where(MovementOrder.rack_id == rack_id, MovementOrder.status.in_(RACK_RESERVATION_ACTIVE_STATUSES))
             .order_by(MovementOrder.created_at.desc(), MovementOrder.id.desc())
         )
-        .scalars()
         .first()
     )
 
@@ -2754,6 +3039,89 @@ def _rack_out(db, r: Rack) -> RackOut:
         reservation_task_identifier=reservation["reservation_task_identifier"],
     )
 
+
+
+def _catalog_out(db) -> CatalogOut:
+    """Build the catalog with a fixed query count, independent of rack count."""
+    area_rows = db.execute(
+        select(
+            Area.id, Area.code, Area.name, Area.description, Area.matter_area,
+            Area.color, Area.area_type, Area.is_active, Area.priority, Area.updated_at,
+        )
+        .where(Area.is_active == 1)
+        .order_by(Area.priority.asc(), Area.name.asc())
+    ).all()
+    material_rows = db.execute(
+        select(
+            MaterialGroup.id, MaterialGroup.code, MaterialGroup.name,
+            MaterialGroup.description, MaterialGroup.color,
+            MaterialGroup.is_active, MaterialGroup.updated_at,
+        )
+        .where(MaterialGroup.is_active == 1)
+        .order_by(MaterialGroup.name.asc())
+    ).all()
+    rack_rows = db.execute(
+        select(
+            Rack.id, Rack.code, Rack.name, Rack.status, Rack.material_group_id,
+            Rack.lot, Rack.manufacturer_code, Rack.quantity, Rack.comment,
+            Rack.fifo_entered_at, Rack.last_moved_at, Rack.rack_custom_fields_json,
+            Rack.updated_at,
+            MaterialGroup.name.label("material_group_name"),
+            Location.x.label("location_x"), Location.y.label("location_y"),
+            Location.area_id.label("area_id"), Area.name.label("area_name"),
+        )
+        .outerjoin(Location, Location.rack_id == Rack.id)
+        .outerjoin(MaterialGroup, MaterialGroup.id == Rack.material_group_id)
+        .outerjoin(Area, Area.id == Location.area_id)
+        .order_by(Rack.code.asc())
+    ).all()
+
+    rack_ids = [row.id for row in rack_rows]
+    latest_order_by_rack = {}
+    if rack_ids:
+        active_order_rows = db.execute(
+            select(
+                MovementOrder.id, MovementOrder.rack_id,
+                MovementOrder.remote_task_code, MovementOrder.order_code,
+            )
+            .where(
+                MovementOrder.rack_id.in_(rack_ids),
+                MovementOrder.status.in_(RACK_RESERVATION_ACTIVE_STATUSES),
+            )
+            .order_by(MovementOrder.created_at.desc(), MovementOrder.id.desc())
+        ).all()
+        for order in active_order_rows:
+            latest_order_by_rack.setdefault(order.rack_id, order)
+
+    racks = []
+    for row in rack_rows:
+        order = latest_order_by_rack.get(row.id)
+        is_reserved = bool(order) or rack_status_is_reserved(row.status)
+        task_identifier = None
+        if order:
+            task_identifier = (order.remote_task_code or "").strip() or (order.order_code or "").strip() or str(order.id)
+        rack_status = row.status if isinstance(row.status, str) and row.status.strip() else ("occupied" if row.location_x is not None else "free")
+        racks.append(
+            RackOut(
+                id=row.id, code=row.code, name=row.name, status=rack_status,
+                material_group_id=row.material_group_id, lot=row.lot,
+                manufacturer_code=row.manufacturer_code, quantity=row.quantity,
+                comment=row.comment, fifo_entered_at=row.fifo_entered_at,
+                last_moved_at=row.last_moved_at,
+                custom_fields=_rack_custom_fields_for_row(row), updated_at=row.updated_at,
+                material_group_name=row.material_group_name,
+                location_x=row.location_x, location_y=row.location_y,
+                area_id=row.area_id, area_name=row.area_name,
+                reservation_status="Reservado" if is_reserved else "No reservado",
+                reservation_task_id=order.id if order else None,
+                reservation_task_identifier=task_identifier,
+            )
+        )
+    return CatalogOut(
+        areas=[_to_area_out(row) for row in area_rows],
+        materials=[_to_material_out(row) for row in material_rows],
+        racks=racks,
+    )
 
 
 def _location_out(db, r: Location, area_by_id: Optional[dict] = None, rack_by_id: Optional[dict] = None) -> LocationOut:
@@ -2981,6 +3349,62 @@ def _movement_order_out(
     )
 
 
+_mo_source_location = Location.__table__.alias("mo_source_location")
+_mo_destination_location = Location.__table__.alias("mo_destination_location")
+_mo_source_area = Area.__table__.alias("mo_source_area")
+_mo_destination_area = Area.__table__.alias("mo_destination_area")
+_mo_current_location = Location.__table__.alias("mo_current_location")
+_MO_RESPONSE_RELATED_SELECT = (
+    select(
+        Rack.id.label("rack_id"), Rack.code.label("rack_code"),
+        _mo_source_location.c.id.label("source_id"), _mo_source_location.c.x.label("source_x"), _mo_source_location.c.y.label("source_y"), _mo_source_location.c.code.label("source_code"), _mo_source_location.c.area_id.label("source_location_area_id"),
+        _mo_destination_location.c.id.label("destination_id"), _mo_destination_location.c.x.label("destination_x"), _mo_destination_location.c.y.label("destination_y"), _mo_destination_location.c.code.label("destination_code"), _mo_destination_location.c.area_id.label("destination_location_area_id"),
+        _mo_source_area.c.id.label("source_area_id"), _mo_source_area.c.name.label("source_area_name"),
+        _mo_destination_area.c.id.label("destination_area_id"), _mo_destination_area.c.name.label("destination_area_name"),
+        MaterialGroup.id.label("material_id"), MaterialGroup.name.label("material_name"),
+        _mo_current_location.c.id.label("current_id"), _mo_current_location.c.x.label("current_x"), _mo_current_location.c.y.label("current_y"), _mo_current_location.c.code.label("current_code"), _mo_current_location.c.rack_id.label("current_rack_id"),
+    )
+    .select_from(MovementOrder.__table__)
+    .outerjoin(Rack.__table__, Rack.id == MovementOrder.rack_id)
+    .outerjoin(_mo_source_location, _mo_source_location.c.id == MovementOrder.source_cell_id)
+    .outerjoin(_mo_destination_location, _mo_destination_location.c.id == MovementOrder.destination_cell_id)
+    .outerjoin(_mo_source_area, _mo_source_area.c.id == MovementOrder.source_area_id)
+    .outerjoin(_mo_destination_area, _mo_destination_area.c.id == MovementOrder.destination_area_id)
+    .outerjoin(MaterialGroup.__table__, MaterialGroup.id == MovementOrder.material_group_id)
+    .outerjoin(_mo_current_location, _mo_current_location.c.rack_id == MovementOrder.rack_id)
+)
+
+
+def _movement_order_out_read_optimized(db, row: MovementOrder) -> MovementOrderOut:
+    related = db.execute(_MO_RESPONSE_RELATED_SELECT.where(MovementOrder.id == row.id)).mappings().one()
+    rack = SimpleNamespace(id=related["rack_id"], code=related["rack_code"]) if related["rack_id"] is not None else None
+    source = SimpleNamespace(id=related["source_id"], x=related["source_x"], y=related["source_y"], code=related["source_code"], area_id=related["source_location_area_id"]) if related["source_id"] is not None else None
+    destination = SimpleNamespace(id=related["destination_id"], x=related["destination_x"], y=related["destination_y"], code=related["destination_code"], area_id=related["destination_location_area_id"]) if related["destination_id"] is not None else None
+    source_area = SimpleNamespace(id=related["source_area_id"], name=related["source_area_name"]) if related["source_area_id"] is not None else None
+    destination_area = SimpleNamespace(id=related["destination_area_id"], name=related["destination_area_name"]) if related["destination_area_id"] is not None else None
+    material = SimpleNamespace(id=related["material_id"], name=related["material_name"]) if related["material_id"] is not None else None
+    current = SimpleNamespace(id=related["current_id"], x=related["current_x"], y=related["current_y"], code=related["current_code"], rack_id=related["current_rack_id"]) if related["current_id"] is not None else None
+    return _movement_order_out(
+        db, row,
+        rack_by_id={rack.id: rack} if rack else {},
+        location_by_id={item.id: item for item in (source, destination) if item},
+        area_by_id={item.id: item for item in (source_area, destination_area) if item},
+        material_by_id={material.id: material} if material else {},
+        current_location_by_rack_id={current.rack_id: current} if current else {},
+    )
+
+
+def _movement_order_detail_out(db, row: MovementOrder) -> MovementOrderDetailOut:
+    base = _movement_order_out_read_optimized(db, row).model_dump()
+    return MovementOrderDetailOut(
+        **base,
+        dispatch_request_payload=_safe_json_loads(row.dispatch_request_json),
+        dispatch_response_payload=_safe_json_loads(row.dispatch_response_json),
+        rcs_response_payload=_safe_json_loads(row.rcs_response_json),
+        override_payload=_safe_json_loads(row.override_payload_json),
+    )
+
+
 def _build_movement_order_lookup_maps(db, rows: List[MovementOrder]) -> dict:
     rack_ids = sorted({row.rack_id for row in rows if row.rack_id})
     location_ids = sorted({cell_id for row in rows for cell_id in (row.source_cell_id, row.destination_cell_id) if cell_id})
@@ -3033,15 +3457,19 @@ def _movement_order_cell_position_code(cell: Location) -> str:
 
 
 def _simple_position_code_path_for_order(db, row: MovementOrder) -> list[dict]:
-    source_cell = db.execute(select(Location).where(Location.id == row.source_cell_id)).scalar_one()
-    destination_cell = db.execute(select(Location).where(Location.id == row.destination_cell_id)).scalar_one()
+    cells_by_id = {
+        cell_id: code
+        for cell_id, code in db.execute(
+            select(Location.id, Location.code).where(Location.id.in_((row.source_cell_id, row.destination_cell_id)))
+        ).all()
+    }
     return [
         {
-            "positionCode": _movement_order_cell_position_code(source_cell),
+            "positionCode": (cells_by_id[row.source_cell_id] or '').strip(),
             "type": "00",
         },
         {
-            "positionCode": _movement_order_cell_position_code(destination_cell),
+            "positionCode": (cells_by_id[row.destination_cell_id] or '').strip(),
             "type": "00",
         },
     ]
@@ -3331,7 +3759,7 @@ def _pda_scan_history_item_out(
 
 
 def _pda_cancel_response(db, action: str, row: MovementOrder, cancel_return_target: Optional[dict] = None) -> PdaMovementOrderCancelOut:
-    order_out = _movement_order_out(db, row)
+    order_out = _movement_order_out_read_optimized(db, row)
     target = cancel_return_target or {}
     return PdaMovementOrderCancelOut(
         success=True,
@@ -3351,7 +3779,7 @@ def _pda_cancel_response(db, action: str, row: MovementOrder, cancel_return_targ
 
 
 def _ensure_pda_order_can_cancel(db, row: MovementOrder):
-    order_out = _movement_order_out(db, row)
+    order_out = _movement_order_out_read_optimized(db, row)
     status = (row.status or "").strip().lower()
     dispatch_status = (row.dispatch_status or "").strip().lower()
     if status == "dispatch_error" or dispatch_status == "dispatch_error":
@@ -4221,10 +4649,25 @@ def _manual_release_rack_or_raise(db, rack: Rack, *, actor: str, reason: str, no
     now = now or datetime.utcnow()
     closed_orders = []
     active_orders = _active_orders_for_rack(db, rack.id)
-    min_age_minutes = _cancel_undo_auto_recovery_min_age_minutes(db)
+    cleanup_min_age_minutes = _cleanup_min_age_minutes(db)
+    confirmed_failed_orders = [
+        order for order in active_orders
+        if _normalized_cleanup_rcs_terminal_status(order.rcs_status) == "failed"
+        and _validate_cleanup_order_eligible(db, order, now=now, min_age_minutes=cleanup_min_age_minutes)[0]
+    ]
+    for order in confirmed_failed_orders:
+        closed_orders.append(_force_close_old_active_order(db, order, now=now, admin_user=actor, reason=reason))
+    if confirmed_failed_orders:
+        db.flush()
+        active_orders = _active_orders_for_rack(db, rack.id)
+
+    cancel_min_age_minutes = _cancel_undo_auto_recovery_min_age_minutes(db)
     releasable_orders = [
         order for order in active_orders
-        if (order.status or "") == "cancel_requested_undo" and _cancel_undo_recovery_candidate(db, order, now=now, min_age_minutes=min_age_minutes)[0]
+        if (
+            ((order.status or "") == "cancel_requested_undo" and _cancel_undo_recovery_candidate(db, order, now=now, min_age_minutes=cancel_min_age_minutes)[0])
+            or _validate_cleanup_order_eligible(db, order, now=now, min_age_minutes=cleanup_min_age_minutes)[0]
+        )
     ]
     blocking_orders = [order for order in active_orders if order not in releasable_orders]
 
@@ -5827,6 +6270,8 @@ app.state.task_monitor = TaskMonitor(interval_seconds=3)
 
 @app.middleware("http")
 async def log_unhandled_http_errors(request: Request, call_next):
+    performance_started = time.perf_counter()
+    response = None
     request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
     client_ip = request.client.host if request.client else ""
     token = _set_config_audit_context(
@@ -5849,7 +6294,91 @@ async def log_unhandled_http_errors(request: Request, call_next):
         )
         raise
     finally:
+        duration_ms = (time.perf_counter() - performance_started) * 1000.0
+        response_size = None
+        if response is not None:
+            try:
+                response_size = int(response.headers.get("content-length"))
+            except (TypeError, ValueError):
+                response_size = None
+        endpoint_label = _performance_endpoint_label(request.method, request.url.path)
+        performance_metrics.record("http", duration_ms, label=endpoint_label, size_bytes=response_size)
+        if duration_ms > HTTP_SLOW_WARNING_MS:
+            logger.warning("SLOW_HTTP method=%s path=%s duration_ms=%.1f", request.method, request.url.path, duration_ms)
         _reset_config_audit_context(token)
+
+
+def _performance_database_path() -> str:
+    configured = engine.url.database or DB_URL.replace("sqlite:///", "", 1)
+    return os.path.abspath(configured)
+
+
+def _index_health_snapshot() -> dict:
+    db_path = _performance_database_path()
+    with open_read_only(db_path) as connection:
+        expected = check_expected_indexes(connection, EXPECTED_INDEXES)
+        physical_by_table = {}
+        for table_name in Base.metadata.tables:
+            physical_by_table[table_name] = {
+                row[1] for row in connection.execute(f'PRAGMA index_list("{table_name.replace(chr(34), chr(34) * 2)}")')
+            }
+    declared = {
+        index.name
+        for table in Base.metadata.tables.values()
+        for index in table.indexes
+        if index.name
+    }
+    physical = {name for names in physical_by_table.values() for name in names if not name.startswith("sqlite_autoindex_")}
+    return {
+        **expected,
+        "drift": {
+            "declared_and_present": sorted(declared & physical),
+            "declared_but_missing": sorted(declared - physical),
+            "present_but_not_declared": sorted(physical - declared),
+        },
+    }
+
+
+@app.get("/api/admin/performance-health")
+async def performance_health(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    db_path = _performance_database_path()
+    wal_path = db_path + "-wal"
+    with SessionLocal() as db:
+        orders_total = int(db.execute(select(func.count()).select_from(MovementOrder)).scalar_one() or 0)
+        orders_active = int(db.execute(select(func.count()).select_from(MovementOrder).where(MovementOrder.status.in_(RACK_RESERVATION_ACTIVE_STATUSES))).scalar_one() or 0)
+        scan_events_total = int(db.execute(select(func.count()).select_from(ScanEvent)).scalar_one() or 0)
+        transition_logs_total = int(db.execute(select(func.count()).select_from(QrTransitionLog)).scalar_one() or 0)
+    with _robot_monitor_cache_lock:
+        robot_timestamp = float(_robot_monitor_cache.get("timestamp") or 0.0)
+        robot_last_error = str(_robot_monitor_cache.get("last_error") or "")
+        robot_available = _robot_monitor_cache.get("payload") is not None
+    return {
+        "database": {
+            "filename": os.path.basename(db_path),
+            "size_bytes": os.path.getsize(db_path) if os.path.exists(db_path) else 0,
+            "wal_bytes": os.path.getsize(wal_path) if os.path.exists(wal_path) else 0,
+            "integrity_last_check": None,
+            "integrity_note": "Run db_diagnostics.py manually for a full integrity check.",
+        },
+        "orders": {"total": orders_total, "active": orders_active},
+        "events": {"scan_events": scan_events_total, "qr_transition_logs": transition_logs_total},
+        "websocket": {"clients": await runtime_ws_manager.count(), "last_revision": _runtime_current_revision()},
+        "robot_monitor": {
+            "cache_available": robot_available,
+            "stale": not robot_timestamp or (time.time() - robot_timestamp) > ROBOT_MONITOR_CACHE_MAX_AGE_SECONDS,
+            "last_success": datetime.fromtimestamp(robot_timestamp, tz=timezone.utc).isoformat() if robot_timestamp else None,
+            "last_error": robot_last_error or None,
+        },
+        "performance": {**performance_metrics.snapshot(), "rcs": {"status": "not_instrumented", "reason": "critical transport path intentionally unchanged"}},
+        "indexes": _index_health_snapshot(),
+        "thresholds": {
+            "http_slow_ms": HTTP_SLOW_WARNING_MS,
+            "sql_slow_ms": SQL_SLOW_WARNING_MS,
+            "rcs_slow_ms": RCS_SLOW_WARNING_MS,
+            "websocket_large_bytes": WEBSOCKET_LARGE_WARNING_BYTES,
+        },
+    }
 
 
 @app.on_event("startup")
@@ -5898,11 +6427,19 @@ def on_startup():
         app.state.rack_sync_scheduler_thread = _start_rack_sync_scheduler()
     except Exception:
         logger.exception("Failed to start rack sync scheduler")
+    try:
+        _robot_monitor_background_stop_event.clear()
+        app.state.robot_monitor_cache_thread = _start_robot_monitor_cache_updater()
+    except Exception:
+        logger.exception("Failed to start robot monitor cache updater")
     logger.info("Application startup completed")
 
 
 @app.on_event("startup")
 async def on_startup_runtime_ws():
+    global _runtime_event_loop, _runtime_event_queue
+    _runtime_event_loop = asyncio.get_running_loop()
+    _runtime_event_queue = asyncio.Queue(maxsize=2048)
     app.state.runtime_broadcast_task = asyncio.create_task(_runtime_broadcast_loop())
 
 
@@ -5917,6 +6454,10 @@ def on_shutdown():
         _rack_sync_scheduler_stop_event.set()
     except Exception:
         logger.exception("Failed to stop rack sync scheduler")
+    try:
+        _robot_monitor_background_stop_event.set()
+    except Exception:
+        logger.exception("Failed to stop robot monitor cache updater")
     task = getattr(app.state, "runtime_broadcast_task", None)
     if task is not None:
         task.cancel()
@@ -7349,6 +7890,10 @@ class RobotMonitorResponse(BaseModel):
     message: str = ""
     reqCode: str = ""
     robots: List[RobotMonitorItem] = []
+    cacheAvailable: bool = False
+    stale: bool = False
+    lastUpdated: Optional[str] = None
+    refreshing: bool = False
 
 
 _AMR_STATUS_MAP = {
@@ -7583,12 +8128,32 @@ def get_robot_status_monitor(force: int = 0):
 
 @app.websocket("/ws/runtime")
 async def runtime_websocket(websocket: WebSocket):
-    await runtime_ws_manager.connect(websocket)
+    await runtime_ws_manager.accept(websocket)
     try:
-        payload = await asyncio.to_thread(_build_runtime_snapshot_payload, 300, 1)
-        await websocket.send_json({"type": "runtime_snapshot", "payload": payload})
+        has_locations = str(websocket.query_params.get("has_locations") or "").strip().lower() in {"1", "true", "yes"}
+        try:
+            client_locations_revision = int(websocket.query_params.get("locations_revision")) if has_locations else None
+        except (TypeError, ValueError):
+            client_locations_revision = None
+        snapshot_message = await asyncio.to_thread(_build_runtime_snapshot_message, client_locations_revision)
+        snapshot_revision = snapshot_message["revision"]
+        await websocket.send_json(snapshot_message)
+        await runtime_ws_manager.connect(websocket)
+        for message in _runtime_events_since(snapshot_revision):
+            await runtime_ws_manager.send_json(websocket, message)
         while True:
-            await websocket.receive_text()
+            raw = await websocket.receive_text()
+            try:
+                message = json.loads(raw)
+            except (TypeError, ValueError):
+                message = {}
+            if message.get("type") == "resync":
+                try:
+                    current_locations_revision = int(message.get("locations_revision")) if message.get("has_locations") else None
+                except (TypeError, ValueError):
+                    current_locations_revision = None
+                resync_message = await asyncio.to_thread(_build_runtime_snapshot_message, current_locations_revision)
+                await runtime_ws_manager.send_json(websocket, resync_message)
     except WebSocketDisconnect:
         pass
     except Exception:
@@ -7631,56 +8196,248 @@ def admin_show_configured_range(x_admin_token: Optional[str] = Header(default=No
 
 
 def _list_locations_out(db) -> List[LocationOut]:
-    rows = db.execute(select(Location)).scalars().all()
-    area_by_id, rack_by_id = _build_location_lookup_maps(db, rows)
-    return [_location_out(db, r, area_by_id=area_by_id, rack_by_id=rack_by_id) for r in rows]
+    rows = db.execute(select(
+        Location.id,
+        Location.x,
+        Location.y,
+        Location.status,
+        Location.is_visible,
+        Location.updated_at,
+        Location.code,
+        Location.enabled,
+        Location.note,
+        Location.area_id,
+        Location.rack_id,
+        Location.free_enabled,
+        Location.free_x,
+        Location.free_y,
+        Location.free_w,
+        Location.free_h,
+    )).all()
+    area_ids = {row.area_id for row in rows if row.area_id is not None}
+    rack_ids = {row.rack_id for row in rows if row.rack_id is not None}
+    area_name_by_id = dict(db.execute(
+        select(Area.id, Area.name).where(Area.id.in_(area_ids))
+    ).all()) if area_ids else {}
+    rack_by_id = {
+        row.id: row for row in db.execute(
+            select(Rack.id, Rack.code, Rack.status).where(Rack.id.in_(rack_ids))
+        ).all()
+    } if rack_ids else {}
+    active_order_by_rack = {}
+    if rack_ids:
+        order_rows = db.execute(
+            select(
+                MovementOrder.rack_id,
+                MovementOrder.id,
+                MovementOrder.remote_task_code,
+                MovementOrder.order_code,
+            )
+            .where(
+                MovementOrder.rack_id.in_(rack_ids),
+                MovementOrder.status.in_(RACK_RESERVATION_ACTIVE_STATUSES),
+            )
+            .order_by(MovementOrder.rack_id, MovementOrder.created_at.desc(), MovementOrder.id.desc())
+        ).all()
+        for order in order_rows:
+            active_order_by_rack.setdefault(order.rack_id, order)
 
-
-def _list_movement_orders_out(db) -> List[MovementOrderOut]:
-    rows = db.execute(select(MovementOrder).order_by(MovementOrder.created_at.desc(), MovementOrder.id.desc())).scalars().all()
-    lookup = _build_movement_order_lookup_maps(db, rows)
-    out: List[MovementOrderOut] = []
+    result = []
     for row in rows:
-        try:
-            out.append(_movement_order_out(db, row, **lookup))
-        except Exception as exc:
-            logger.exception(
-                "RUNTIME_SNAPSHOT_ORDER_SERIALIZE_ERROR movement_order_id=%s order_code=%s error=%s",
-                getattr(row, "id", None),
-                getattr(row, "order_code", None),
-                exc,
-            )
-            out.append(
-                MovementOrderOut(
-                    order_id=row.id,
-                    order_code=row.order_code or f"ORDER-{row.id}",
-                    order_type=row.order_type or "unknown",
-                    status=row.status or "serialize_error",
-                    priority=row.priority or "normal",
-                    agv_code=row.agv_code,
-                    task_typ=row.task_typ,
-                    comment=f"Error serializando orden para snapshot: {exc}",
-                    created_at=row.created_at or datetime.utcnow(),
-                    created_by=row.created_by,
-                    rack_id=row.rack_id,
-                    rack_code=None,
-                    rack_missing=bool(row.rack_id),
-                    material_group_id=row.material_group_id,
-                    source_area_id=row.source_area_id,
-                    destination_area_id=row.destination_area_id,
-                    source_cell_id=row.source_cell_id,
-                    destination_cell_id=row.destination_cell_id,
-                    source_cell={},
-                    destination_cell={},
-                    current_cell=None,
-                    dispatch_status=row.dispatch_status or "not_sent",
-                    remote_task_code=row.remote_task_code,
-                    req_code=row.req_code,
-                    rcs_status=row.rcs_status,
-                    rcs_message=str(exc),
-                )
-            )
-    return out
+        rack = rack_by_id.get(row.rack_id)
+        order = active_order_by_rack.get(row.rack_id)
+        is_reserved = bool(order) or bool(rack and rack_status_is_reserved(rack.status))
+        task_identifier = None
+        if order:
+            task_identifier = (order.remote_task_code or "").strip() or (order.order_code or "").strip() or str(order.id)
+        result.append(LocationOut(
+            id=row.id,
+            x=row.x,
+            y=row.y,
+            status=int(row.status or 0),
+            is_visible=row.is_visible,
+            updated_at=row.updated_at,
+            code=row.code,
+            enabled=row.enabled,
+            note=row.note,
+            area_id=row.area_id,
+            rack_id=row.rack_id,
+            free_enabled=int(row.free_enabled or 0),
+            free_x=row.free_x,
+            free_y=row.free_y,
+            free_w=row.free_w,
+            free_h=row.free_h,
+            area_name=area_name_by_id.get(row.area_id),
+            rack_code=rack.code if rack else None,
+            reservation_status="Reservado" if is_reserved else "No reservado",
+            reservation_task_id=order.id if order else None,
+            reservation_task_identifier=task_identifier,
+            reservation_rack_id=rack.id if rack else None,
+            reservation_rack_code=rack.code if rack else None,
+        ))
+    return result
+
+
+MOVEMENT_ORDER_SUMMARY_COLUMNS = (
+    MovementOrder.id,
+    MovementOrder.order_code,
+    MovementOrder.order_type,
+    MovementOrder.status,
+    MovementOrder.priority,
+    MovementOrder.agv_code,
+    MovementOrder.task_typ,
+    MovementOrder.comment,
+    MovementOrder.created_at,
+    MovementOrder.created_by,
+    MovementOrder.rack_id,
+    MovementOrder.material_group_id,
+    MovementOrder.source_area_id,
+    MovementOrder.destination_area_id,
+    MovementOrder.source_cell_id,
+    MovementOrder.destination_cell_id,
+    MovementOrder.dispatch_status,
+    MovementOrder.remote_task_code,
+    MovementOrder.req_code,
+    MovementOrder.rcs_status,
+    MovementOrder.rcs_message,
+    MovementOrder.cancel_source,
+    MovementOrder.cancel_reason,
+    MovementOrder.closed_by,
+    MovementOrder.closed_at,
+    MovementOrder.release_source,
+    MovementOrder.dispatched_at,
+    MovementOrder.rcs_last_update,
+    MovementOrder.status_query_checked_at,
+    MovementOrder.rcs_status_changed_at,
+    MovementOrder.route_mode,
+    MovementOrder.trmx_group_id,
+    MovementOrder.trmx_step,
+    MovementOrder.trmx_total_steps,
+    MovementOrder.trmx_parent_order_id,
+    MovementOrder.trmx_status,
+    MovementOrder.trmx_select_policy,
+    MovementOrder.fifo_chain_group_id,
+    MovementOrder.fifo_chain_step,
+    MovementOrder.fifo_chain_total_steps,
+    MovementOrder.fifo_chain_parent_order_id,
+    MovementOrder.fifo_chain_status,
+    MovementOrder.fifo_chain_select_policy,
+)
+
+
+def _movement_order_summary_out(
+    row,
+    *,
+    rack_by_id: dict,
+    location_by_id: dict,
+    area_by_id: dict,
+    material_by_id: dict,
+    current_location_by_rack_id: dict,
+) -> MovementOrderSummaryOut:
+    rack = rack_by_id.get(row.rack_id) if row.rack_id else None
+    source_cell = location_by_id.get(row.source_cell_id) if row.source_cell_id else None
+    destination_cell = location_by_id.get(row.destination_cell_id) if row.destination_cell_id else None
+    source_area = area_by_id.get(row.source_area_id) if row.source_area_id else None
+    destination_area = area_by_id.get(row.destination_area_id) if row.destination_area_id else None
+    material = material_by_id.get(row.material_group_id) if row.material_group_id else None
+    current_cell_row = current_location_by_rack_id.get(row.rack_id) if row.rack_id else None
+    return MovementOrderSummaryOut(
+        order_id=row.id,
+        order_code=row.order_code,
+        order_type=row.order_type,
+        status=row.status,
+        priority=row.priority,
+        agv_code=row.agv_code,
+        task_typ=row.task_typ,
+        comment=row.comment,
+        created_at=row.created_at,
+        created_by=row.created_by,
+        rack_id=row.rack_id,
+        rack_code=rack.code if rack else None,
+        rack_missing=bool(row.rack_id and rack is None),
+        material_group_id=row.material_group_id,
+        material_group_name=material.name if material else None,
+        source_area_id=row.source_area_id,
+        source_area_name=source_area.name if source_area else None,
+        destination_area_id=row.destination_area_id,
+        destination_area_name=destination_area.name if destination_area else None,
+        source_cell_id=row.source_cell_id,
+        destination_cell_id=row.destination_cell_id,
+        source_cell={"id": source_cell.id, "x": source_cell.x, "y": source_cell.y, "code": source_cell.code, "area_id": source_cell.area_id} if source_cell else {},
+        destination_cell={"id": destination_cell.id, "x": destination_cell.x, "y": destination_cell.y, "code": destination_cell.code, "area_id": destination_cell.area_id} if destination_cell else {},
+        current_cell={"id": current_cell_row.id, "x": current_cell_row.x, "y": current_cell_row.y, "code": current_cell_row.code} if current_cell_row else None,
+        dispatch_status=row.dispatch_status or "not_sent",
+        remote_task_code=row.remote_task_code,
+        req_code=row.req_code,
+        rcs_status=row.rcs_status,
+        rcs_message=row.rcs_message,
+        cancel_source=row.cancel_source,
+        cancel_reason=row.cancel_reason,
+        closed_by=row.closed_by,
+        closed_at=row.closed_at,
+        release_source=row.release_source,
+        dispatched_at=row.dispatched_at,
+        rcs_last_update=row.rcs_last_update,
+        status_query_checked_at=row.status_query_checked_at,
+        rcs_status_changed_at=row.rcs_status_changed_at,
+        route_mode=_normalize_route_mode(row.route_mode),
+        trmx_group_id=row.trmx_group_id,
+        trmx_step=row.trmx_step,
+        trmx_total_steps=row.trmx_total_steps,
+        trmx_parent_order_id=row.trmx_parent_order_id,
+        trmx_status=row.trmx_status,
+        trmx_select_policy=row.trmx_select_policy,
+        fifo_chain_group_id=row.fifo_chain_group_id,
+        fifo_chain_step=row.fifo_chain_step,
+        fifo_chain_total_steps=row.fifo_chain_total_steps,
+        fifo_chain_parent_order_id=row.fifo_chain_parent_order_id,
+        fifo_chain_status=row.fifo_chain_status,
+        fifo_chain_select_policy=row.fifo_chain_select_policy,
+        can_simulate_complete=row.status in {"pending_dispatch", "dispatched", "in_progress", "cancel_requested_total", "cancel_requested_undo"},
+        can_undo=row.status in {"pending_dispatch", "dispatched", "in_progress", "cancel_requested_total", "cancel_requested_undo"},
+    )
+
+
+def _movement_order_summaries_from_rows(db, rows) -> List[MovementOrderSummaryOut]:
+    lookup = _build_movement_order_lookup_maps(db, rows)
+    return [_movement_order_summary_out(row, **lookup) for row in rows]
+
+
+def _list_movement_orders_out(db) -> List[MovementOrderSummaryOut]:
+    active_rows = db.execute(
+        select(*MOVEMENT_ORDER_SUMMARY_COLUMNS)
+        .where(MovementOrder.status.in_(RACK_RESERVATION_ACTIVE_STATUSES))
+    ).all()
+    recent_terminal_rows = db.execute(
+        select(*MOVEMENT_ORDER_SUMMARY_COLUMNS)
+        .where(MovementOrder.status.notin_(RACK_RESERVATION_ACTIVE_STATUSES))
+        .order_by(MovementOrder.created_at.desc(), MovementOrder.id.desc())
+        .limit(RUNTIME_RECENT_ORDER_LIMIT)
+    ).all()
+    rows_by_id = {row.id: row for row in active_rows}
+    rows_by_id.update({row.id: row for row in recent_terminal_rows})
+    rows = sorted(
+        rows_by_id.values(),
+        key=lambda row: (row.created_at or datetime.min, row.id or 0),
+        reverse=True,
+    )
+    return _movement_order_summaries_from_rows(db, rows)
+
+
+def _list_movement_orders_page_out(db, *, limit: int, offset: int) -> MovementOrderPageOut:
+    total = int(db.execute(select(func.count()).select_from(MovementOrder)).scalar_one() or 0)
+    rows = db.execute(
+        select(*MOVEMENT_ORDER_SUMMARY_COLUMNS)
+        .order_by(MovementOrder.created_at.desc(), MovementOrder.id.desc())
+        .limit(limit)
+        .offset(offset)
+    ).all()
+    return MovementOrderPageOut(
+        items=_movement_order_summaries_from_rows(db, rows),
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 def _list_debug_console_events_out(db, limit: int = 200) -> List[DebugConsoleEventOut]:
@@ -7694,6 +8451,7 @@ def _list_debug_console_events_out(db, limit: int = 200) -> List[DebugConsoleEve
 
 
 def _get_robot_status_monitor_response(db) -> RobotMonitorResponse:
+    query_started = time.perf_counter()
     cfg = _get_rcs_config(db)
     if not cfg.resolved_base_url:
         return RobotMonitorResponse(ok=False, code="", message="Falta capturar la URL base del RCS.", reqCode="", robots=[])
@@ -7739,13 +8497,20 @@ def _get_robot_status_monitor_response(db) -> RobotMonitorResponse:
             payload=response,
             message=response_message or "Respuesta de monitoreo AMR",
         )
-        return RobotMonitorResponse(
+        result = RobotMonitorResponse(
             ok=response_code == "0",
             code=response_code,
             message=response_message,
             reqCode=str(response.get("reqCode", payload.get("reqCode", "")) or ""),
             robots=items,
         )
+        logger.info(
+            "RCS robot status query completed | duration_ms=%.1f | ok=%s | robots=%s",
+            (time.perf_counter() - query_started) * 1000.0,
+            result.ok,
+            len(result.robots),
+        )
+        return result
     except RcsError as exc:
         _append_debug_console_event(
             db,
@@ -7755,6 +8520,11 @@ def _get_robot_status_monitor_response(db) -> RobotMonitorResponse:
             endpoint=endpoint,
             payload={"error": str(exc)},
             message=str(exc),
+        )
+        logger.warning(
+            "RCS robot status query failed | duration_ms=%.1f | error=%s",
+            (time.perf_counter() - query_started) * 1000.0,
+            exc,
         )
         return RobotMonitorResponse(ok=False, code="", message=str(exc), reqCode=payload["reqCode"], robots=[])
 
@@ -7766,78 +8536,246 @@ def _get_cached_robot_status_monitor_response(db, force: bool = False, max_age_s
         except Exception:
             max_age_seconds = ROBOT_MONITOR_CACHE_MAX_AGE_SECONDS
     if force:
-        response = _get_robot_status_monitor_response(db)
-        with _robot_monitor_cache_lock:
-            _robot_monitor_cache["timestamp"] = __import__("time").time()
-            _robot_monitor_cache["payload"] = response.model_dump()
-        return response
-    now_ts = __import__("time").time()
+        return _refresh_robot_monitor_cache(db, wait_if_busy=False)
+    now_ts = time.time()
     with _robot_monitor_cache_lock:
         cached_payload = _robot_monitor_cache.get("payload")
         cached_ts = float(_robot_monitor_cache.get("timestamp") or 0.0)
-    if cached_payload is not None and (now_ts - cached_ts) <= float(max_age_seconds):
-        return RobotMonitorResponse(**cached_payload)
-    response = _get_robot_status_monitor_response(db)
-    with _robot_monitor_cache_lock:
-        _robot_monitor_cache["timestamp"] = now_ts
-        _robot_monitor_cache["payload"] = response.model_dump()
+        last_error = str(_robot_monitor_cache.get("last_error") or "")
+    if cached_payload is None:
+        return RobotMonitorResponse(
+            ok=False,
+            message=last_error or "Sin información de robots en caché todavía.",
+            cacheAvailable=False,
+            stale=True,
+            refreshing=_robot_monitor_refresh_lock.locked(),
+        )
+    response = RobotMonitorResponse(**cached_payload)
+    response.cacheAvailable = True
+    response.stale = (now_ts - cached_ts) > float(max_age_seconds)
+    response.lastUpdated = datetime.fromtimestamp(cached_ts, tz=timezone.utc).isoformat() if cached_ts else None
+    response.refreshing = _robot_monitor_refresh_lock.locked()
+    if last_error:
+        response.message = f"Último estado conocido. Error al actualizar: {last_error}"
     return response
 
 
-def _build_runtime_snapshot_out(db, debug_limit: int = 200, include_robot_monitor: int = 1) -> RuntimeSnapshotOut:
+def _refresh_robot_monitor_cache(db, wait_if_busy: bool = False) -> RobotMonitorResponse:
+    acquired = _robot_monitor_refresh_lock.acquire(blocking=wait_if_busy)
+    if not acquired:
+        cached = _get_cached_robot_status_monitor_response(db, force=False)
+        cached.refreshing = True
+        if cached.cacheAvailable and not cached.message:
+            cached.message = "Actualización de robots en curso; mostrando el último estado conocido."
+        return cached
+    try:
+        response = _get_robot_status_monitor_response(db)
+        if response.ok:
+            cache_ts = time.time()
+            stored = response.model_copy(update={
+                "cacheAvailable": True,
+                "stale": False,
+                "lastUpdated": datetime.fromtimestamp(cache_ts, tz=timezone.utc).isoformat(),
+                "refreshing": False,
+            })
+            with _robot_monitor_cache_lock:
+                _robot_monitor_cache["timestamp"] = cache_ts
+                _robot_monitor_cache["payload"] = stored.model_dump()
+                _robot_monitor_cache["last_error"] = ""
+            publish_runtime_event("robot_monitor_updated", stored.model_dump(mode="json"))
+            return stored
+        with _robot_monitor_cache_lock:
+            _robot_monitor_cache["last_error"] = response.message or "Error desconocido al consultar RCS."
+        cached = _get_cached_robot_status_monitor_response(db, force=False)
+        cached.refreshing = False
+        result = cached if cached.cacheAvailable else response
+        publish_runtime_event("robot_monitor_updated", result.model_dump(mode="json"))
+        return result
+    finally:
+        _robot_monitor_refresh_lock.release()
+
+
+def _robot_monitor_cache_update_once() -> float:
+    interval_seconds = ROBOT_MONITOR_CACHE_MAX_AGE_SECONDS
+    with SessionLocal() as db:
+        try:
+            interval_seconds = max(1.0, float(get_setting(db, "rcs_agv_monitor_interval_seconds", str(ROBOT_MONITOR_CACHE_MAX_AGE_SECONDS)) or ROBOT_MONITOR_CACHE_MAX_AGE_SECONDS))
+            cfg = _get_rcs_config(db)
+            if int(cfg.enable_amr_monitor or 0) == 1:
+                _refresh_robot_monitor_cache(db, wait_if_busy=False)
+        except Exception:
+            logger.exception("Robot monitor background cache update failed")
+    return interval_seconds
+
+
+def _robot_monitor_cache_update_loop():
+    while not _robot_monitor_background_stop_event.is_set():
+        interval_seconds = _robot_monitor_cache_update_once()
+        _robot_monitor_background_stop_event.wait(interval_seconds)
+
+
+def _start_robot_monitor_cache_updater() -> threading.Thread:
+    existing = getattr(app.state, "robot_monitor_cache_thread", None)
+    if existing is not None and existing.is_alive():
+        return existing
+    thread = threading.Thread(target=_robot_monitor_cache_update_loop, name="robot-monitor-cache", daemon=True)
+    thread.start()
+    return thread
+
+
+def _build_runtime_snapshot_out(db, debug_limit: int = 200, include_robot_monitor: int = 1, include_locations: int = 1) -> RuntimeSnapshotOut:
     _maybe_auto_release_stuck_cancel_return_orders()
     robot_monitor = _get_cached_robot_status_monitor_response(db, force=False) if int(include_robot_monitor or 0) == 1 else None
+    orders_total = int(db.execute(select(func.count()).select_from(MovementOrder)).scalar_one() or 0)
     return RuntimeSnapshotOut(
         orders=_list_movement_orders_out(db),
-        locations=_list_locations_out(db),
+        orders_total=orders_total,
+        recent_order_limit=RUNTIME_RECENT_ORDER_LIMIT,
+        locations=_list_locations_out(db) if int(include_locations or 0) == 1 else [],
         debug_log=_list_debug_console_events_out(db, limit=debug_limit),
         robot_monitor=robot_monitor,
     )
 
 
-def _build_runtime_snapshot_payload(debug_limit: int = 200, include_robot_monitor: int = 1) -> dict:
+def _build_runtime_snapshot_payload(debug_limit: int = 200, include_robot_monitor: int = 1, include_locations: int = 1) -> dict:
+    started = time.perf_counter()
     with SessionLocal() as db:
-        snapshot = _build_runtime_snapshot_out(db, debug_limit=debug_limit, include_robot_monitor=include_robot_monitor)
-        return snapshot.model_dump(mode="json")
+        snapshot = _build_runtime_snapshot_out(db, debug_limit=debug_limit, include_robot_monitor=include_robot_monitor, include_locations=include_locations)
+        serialization_started = time.perf_counter()
+        payload = snapshot.model_dump(mode="json")
+        serialization_ms = (time.perf_counter() - serialization_started) * 1000.0
+        performance_metrics.record("serialization", serialization_ms, label="runtime_snapshot")
+        performance_metrics.record("runtime_snapshot", (time.perf_counter() - started) * 1000.0, label="build")
+        return payload
 
 
-def _payload_hash(payload: dict) -> str:
-    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+def _build_runtime_snapshot_message(client_locations_revision: Optional[int] = None) -> dict:
+    server_locations_revision = _locations_current_revision()
+    locations_match = (
+        client_locations_revision is not None
+        and int(client_locations_revision) == server_locations_revision
+    )
+    snapshot_revision = _runtime_current_revision()
+    payload = _build_runtime_snapshot_payload(300, 1, 0 if locations_match else 1)
+    return {
+        "type": "runtime_snapshot",
+        "revision": snapshot_revision,
+        "locations_revision": server_locations_revision,
+        "locations_included": not locations_match,
+        "payload": payload,
+    }
+
+
+def _runtime_related_payload(db, rack_id: Optional[int]) -> dict:
+    if not rack_id:
+        return {"rack": None, "location": None}
+    rack = db.get(Rack, rack_id)
+    location = db.execute(select(Location).where(Location.rack_id == rack_id)).scalar_one_or_none()
+    return {
+        "rack": _rack_out(db, rack).model_dump(mode="json") if rack else None,
+        "location": _location_out(db, location).model_dump(mode="json") if location else None,
+    }
+
+
+def _runtime_change_to_event(change: dict) -> Optional[tuple[str, dict]]:
+    kind = str(change.get("kind") or "")
+    entity_id = int(change.get("id") or 0)
+    action = str(change.get("action") or "updated")
+    if not entity_id:
+        return None
+    if action == "deleted":
+        event_type = {
+            "order": "order_deleted", "location": "location_deleted",
+            "rack": "rack_deleted", "debug_event": "debug_event_deleted",
+            "catalog": "catalog_invalidated",
+        }.get(kind)
+        payload = {"id": entity_id}
+        if kind == "location":
+            payload["locations_revision"] = _locations_current_revision()
+        return (event_type, payload) if event_type else None
+    with SessionLocal() as db:
+        if kind == "order":
+            row = db.execute(select(*MOVEMENT_ORDER_SUMMARY_COLUMNS).where(MovementOrder.id == entity_id)).first()
+            if not row:
+                return "order_deleted", {"id": entity_id}
+            order = _movement_order_summaries_from_rows(db, [row])[0]
+            payload = {"order": order.model_dump(mode="json"), "action": action}
+            payload.update(_runtime_related_payload(db, row.rack_id))
+            return ("order_created" if action == "created" else "order_updated"), payload
+        if kind == "location":
+            row = db.get(Location, entity_id)
+            location_revision = _locations_current_revision()
+            return ("location_updated", {"location": _location_out(db, row).model_dump(mode="json"), "locations_revision": location_revision}) if row else ("location_deleted", {"id": entity_id, "locations_revision": location_revision})
+        if kind == "rack":
+            row = db.get(Rack, entity_id)
+            if not row:
+                return "rack_deleted", {"id": entity_id}
+            payload = {"rack": _rack_out(db, row).model_dump(mode="json")}
+            location = db.execute(select(Location).where(Location.rack_id == entity_id)).scalar_one_or_none()
+            payload["location"] = _location_out(db, location).model_dump(mode="json") if location else None
+            return "rack_updated", payload
+        if kind == "debug_event":
+            row = db.get(DebugConsoleEvent, entity_id)
+            return ("debug_event_added", {"event": _debug_console_event_out(row).model_dump(mode="json")}) if row else None
+        if kind == "catalog":
+            return "catalog_invalidated", {"id": entity_id}
+    return None
 
 
 async def _runtime_broadcast_loop():
-    global _runtime_snapshot_last_hash
+    global _runtime_queue_overflow
     while True:
         try:
-            if await runtime_ws_manager.count() > 0:
-                payload = await asyncio.to_thread(_build_runtime_snapshot_payload, 300, 1)
-                payload_hash = _payload_hash(payload)
-                should_broadcast = False
-                with _runtime_snapshot_state_lock:
-                    if payload_hash != _runtime_snapshot_last_hash:
-                        _runtime_snapshot_last_hash = payload_hash
-                        should_broadcast = True
-                if should_broadcast:
-                    await runtime_ws_manager.broadcast_json({"type": "runtime_snapshot", "payload": payload})
+            if _runtime_queue_overflow:
+                _runtime_queue_overflow = False
+                await runtime_ws_manager.broadcast_json({"type": "runtime_resync_required", "revision": _runtime_current_revision()})
+            try:
+                item = await asyncio.wait_for(_runtime_event_queue.get(), timeout=30.0)
+            except asyncio.TimeoutError:
+                if await runtime_ws_manager.count() > 0:
+                    await runtime_ws_manager.broadcast_json({"type": "heartbeat", "revision": _runtime_current_revision()})
+                continue
+            if "_change" in item:
+                if await runtime_ws_manager.count() == 0:
+                    continue
+                event_data = await asyncio.to_thread(_runtime_change_to_event, item["_change"])
+                if event_data:
+                    item = publish_runtime_event(event_data[0], event_data[1], enqueue=False)
+                else:
+                    continue
+            await runtime_ws_manager.broadcast_json(item)
         except asyncio.CancelledError:
             raise
         except Exception:
-            pass
-        await asyncio.sleep(RUNTIME_BROADCAST_INTERVAL_SECONDS)
+            logger.exception("Runtime incremental broadcast failed")
 
 
 @app.get("/api/runtime-snapshot", response_model=RuntimeSnapshotOut)
-def get_runtime_snapshot(debug_limit: int = 200, include_robot_monitor: int = 0):
+def get_runtime_snapshot(debug_limit: int = 200, include_robot_monitor: int = 0, include_locations: int = 1):
     with SessionLocal() as db:
-        return _build_runtime_snapshot_out(db, debug_limit=debug_limit, include_robot_monitor=include_robot_monitor)
+        return _build_runtime_snapshot_out(db, debug_limit=debug_limit, include_robot_monitor=include_robot_monitor, include_locations=include_locations)
 
 
-@app.get("/api/locations", response_model=List[LocationOut])
-def list_locations():
-    with SessionLocal() as db:
-        _auto_release_stuck_cancel_return_orders(db, now=datetime.utcnow())
-        return _list_locations_out(db)
+@app.get("/api/locations", response_model=List[LocationOut], response_model_exclude_none=True)
+def list_locations(response: Response):
+    rows = []
+    for _attempt in range(3):
+        revision_before = _locations_current_revision()
+        with SessionLocal() as db:
+            _auto_release_stuck_cancel_return_orders(db, now=datetime.utcnow())
+            rows = _list_locations_out(db)
+        revision_after = _locations_current_revision()
+        if revision_before == revision_after:
+            response.headers["X-Locations-Revision"] = str(revision_after)
+            return rows
+    # A client receiving revision 0 must request the full snapshot fallback.
+    response.headers["X-Locations-Revision"] = "0"
+    return rows
+
+
+@app.get("/api/locations-revision")
+def get_locations_revision():
+    return {"revision": _locations_current_revision(), "count": _locations_current_count()}
 
 
 @app.get("/api/locations/{x}/{y}", response_model=LocationOut)
@@ -8526,10 +9464,7 @@ def admin_download_pre_restore_backup(filename: str, x_admin_token: Optional[str
 def get_catalog():
     with SessionLocal() as db:
         _auto_release_stuck_cancel_return_orders(db, now=datetime.utcnow())
-        areas = [_to_area_out(r) for r in db.execute(select(Area).where(Area.is_active == 1).order_by(Area.priority.asc(), Area.name.asc())).scalars().all()]
-        materials = [_to_material_out(r) for r in db.execute(select(MaterialGroup).where(MaterialGroup.is_active == 1).order_by(MaterialGroup.name.asc())).scalars().all()]
-        racks = [_rack_out(db, r) for r in db.execute(select(Rack).order_by(Rack.code.asc())).scalars().all()]
-        return CatalogOut(areas=areas, materials=materials, racks=racks)
+        return _catalog_out(db)
 
 
 @app.post("/api/fifo/validate", response_model=FifoPreviewOut)
@@ -9788,10 +10723,7 @@ def create_fifo_movement(body: FifoRequestIn):
             message = dispatch_result.rcs_message or "El RCS rechazó la creación de la tarea"
             _rollback_unsuccessful_order_dispatch(db, order, message)
             raise HTTPException(status_code=400, detail=f"El RCS no aceptó la tarea: {message}")
-        order = db.execute(select(MovementOrder).where(MovementOrder.id == order.id)).scalar_one_or_none()
-        if not order:
-            raise HTTPException(status_code=500, detail="La orden enviada ya no está disponible")
-        return _movement_order_out(db, order)
+        return _movement_order_out_read_optimized(db, order)
 
 
 @app.post("/api/direct-move/execute", response_model=MovementOrderOut)
@@ -9818,16 +10750,25 @@ def create_direct_move_movement(body: DirectMoveRequestIn):
             message = dispatch_result.rcs_message or "El RCS rechazó la creación de la tarea"
             _rollback_unsuccessful_order_dispatch(db, order, message)
             raise HTTPException(status_code=400, detail=f"El RCS no aceptó la tarea: {message}")
-        order = db.execute(select(MovementOrder).where(MovementOrder.id == order.id)).scalar_one_or_none()
-        if not order:
-            raise HTTPException(status_code=500, detail="La orden enviada ya no está disponible")
-        return _movement_order_out(db, order)
+        return _movement_order_out_read_optimized(db, order)
 
 
-@app.get("/api/movement-orders", response_model=List[MovementOrderOut])
-def list_movement_orders():
+@app.get("/api/movement-orders", response_model=MovementOrderPageOut)
+def list_movement_orders(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
     with SessionLocal() as db:
-        return _list_movement_orders_out(db)
+        return _list_movement_orders_page_out(db, limit=limit, offset=offset)
+
+
+@app.get("/api/movement-orders/{order_id}", response_model=MovementOrderDetailOut)
+def get_movement_order_detail(order_id: int):
+    with SessionLocal() as db:
+        row = db.execute(select(MovementOrder).where(MovementOrder.id == order_id)).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Orden no encontrada")
+        return _movement_order_detail_out(db, row)
 
 
 @app.get("/api/movement-orders/{order_id}/json", response_model=MovementOrderJsonOut)
@@ -9997,7 +10938,7 @@ def run_manual_status_query(order_id: int, body: MovementOrderStatusQueryIn):
             db.add(row)
             db.commit()
             db.refresh(row)
-            return _movement_order_out(db, row)
+            return _movement_order_out_read_optimized(db, row)
         except RcsError as exc:
             _append_debug_console_event(db, direction="received", module="status_query", base_url=debug_base_url, endpoint=debug_endpoint, payload={"error": str(exc)}, message=str(exc))
             now = datetime.utcnow()
@@ -10012,7 +10953,7 @@ def run_manual_status_query(order_id: int, body: MovementOrderStatusQueryIn):
             _append_status_query_log(db, row, kind="status_query", request_payload=request_payload, response_payload=error_payload, message=str(exc), arrived_at=now)
             db.commit()
             db.refresh(row)
-            return _movement_order_out(db, row)
+            return _movement_order_out_read_optimized(db, row)
 
 
 @app.get("/api/rcs/debug-log", response_model=List[DebugConsoleEventOut])
@@ -10058,7 +10999,7 @@ def simulate_complete_movement_order(order_id: int):
             rack = db.execute(select(Rack).where(Rack.id == before_rack_id)).scalar_one_or_none()
             if rack and rack_status_is_available(rack.status):
                 _log_rack_status_change(db, rack=rack, old_status=old_rack_status, new_status=rack.status, reason="order_completed", order_id=row.id, auto_commit=True)
-        return _movement_order_out(db, row)
+        return _movement_order_out_read_optimized(db, row)
 
 
 @app.post("/api/movement-orders/{order_id}/undo", response_model=MovementOrderOut)
@@ -10086,7 +11027,7 @@ def undo_selected_movement_order(order_id: int, body: Optional[MovementOrderUndo
             matter_area = ''
         force_cancel = '1' if return_to_area else '0'
         row = _execute_cancel_for_order(db, row, force_cancel, matter_area, undo_on_accept=return_to_area)
-        return _movement_order_out(db, row)
+        return _movement_order_out_read_optimized(db, row)
 
 
 @app.delete("/api/admin/movement-orders/{order_id}")
@@ -10731,16 +11672,19 @@ def _cancel_undo_recovery_candidate(db, order: MovementOrder, *, now: datetime, 
 
 
 def _validate_cleanup_order_eligible(db, order: MovementOrder, *, now: datetime, min_age_minutes: int) -> tuple[bool, str]:
+    local_status = str(order.status or "").strip().lower()
     allowed_statuses = {"cancel_requested_undo", "cancel_requested_total", "dispatched"}
-    if (order.status or "") not in allowed_statuses:
-        return False, "status no elegible"
     rcs_status = str(order.rcs_status or "").strip().lower()
-    if rcs_status not in CANCEL_RETURN_RCS_TERMINAL_STATUSES:
-        return False, "rcs_status no es completed/cancelled"
+    normalized_terminal = _normalized_cleanup_rcs_terminal_status(rcs_status)
+    confirmed_failed_active_order = local_status in RACK_RESERVATION_ACTIVE_STATUSES and normalized_terminal == "failed"
+    if local_status not in allowed_statuses and not confirmed_failed_active_order:
+        return False, "status no elegible"
+    if not normalized_terminal:
+        return False, "rcs_status no es terminal confirmado"
     created_at = order.created_at or order.updated_at or now
     if created_at > now - timedelta(minutes=min_age_minutes):
         return False, f"menor a {min_age_minutes} minutos"
-    if (order.status or "") == "in_progress":
+    if local_status == "in_progress" and normalized_terminal != "failed":
         return False, "movimiento activo"
     if _robot_monitor_indicates_order_running(order):
         return False, "AGV ejecutando la orden"
@@ -10762,7 +11706,7 @@ def _rack_safe_to_release_after_cleanup(db, rack_id: int, closed_order_id: int, 
             (
                 MovementOrder.status.in_(RACK_RESERVATION_ACTIVE_STATUSES)
                 | (MovementOrder.status == "in_progress")
-                | ((MovementOrder.created_at >= recent_cutoff) & (MovementOrder.status.notin_(("cancelled", "undone"))))
+                | ((MovementOrder.created_at >= recent_cutoff) & (MovementOrder.status.notin_(("completed", "cancelled", "undone", "failed", "forced_local_closed", "dispatch_error"))))
             ),
         )
     ).scalars().first()
@@ -10851,6 +11795,8 @@ def _release_cleanup_rack_if_safe(db, rack_id: int, *, closed_order_id: int = 0,
 
 def _close_cleanup_order(db, order: MovementOrder, *, now: datetime, reason: str, admin_user: str) -> dict:
     old_status = order.status or ""
+    if _normalized_cleanup_rcs_terminal_status(order.rcs_status) == "failed":
+        return _force_close_old_active_order(db, order, now=now, admin_user=admin_user, reason=reason)
     new_status = "undone" if old_status == "cancel_requested_undo" else "cancelled"
     order.status = new_status
     order.forced_local_close = 1
@@ -11266,8 +12212,11 @@ def _run_cleanup_diagnosis(db) -> dict:
             mo.updated_at
         FROM movement_orders mo
         LEFT JOIN racks r ON r.id = mo.rack_id
-        WHERE lower(trim(coalesce(mo.rcs_status, ''))) IN ('completed', 'cancelled')
-          AND mo.status IN ('cancel_requested_undo', 'cancel_requested_total', 'dispatched')
+        WHERE lower(trim(coalesce(mo.rcs_status, ''))) IN ('completed', 'cancelled', 'canceled', 'failed', 'aborted', 'terminated')
+          AND (
+              mo.status IN ('cancel_requested_undo', 'cancel_requested_total', 'dispatched')
+              OR (mo.status = 'in_progress' AND lower(trim(coalesce(mo.rcs_status, ''))) IN ('failed', 'aborted', 'terminated'))
+          )
         ORDER BY mo.id
         """,
     )
@@ -11493,8 +12442,8 @@ def cleanup_close_inconsistent_orders(body: CleanupSelectionIn, x_admin_token: O
             candidates = db.execute(
                 select(MovementOrder).where(
                     MovementOrder.id.in_(order_ids),
-                    MovementOrder.status.in_(("cancel_requested_undo", "cancel_requested_total", "dispatched")),
-                    func.lower(func.trim(func.coalesce(MovementOrder.rcs_status, ""))).in_(CANCEL_RETURN_RCS_TERMINAL_STATUSES),
+                    MovementOrder.status.in_(RACK_RESERVATION_ACTIVE_STATUSES),
+                    func.lower(func.trim(func.coalesce(MovementOrder.rcs_status, ""))).in_(CLEANUP_RCS_TERMINAL_INPUT_STATUSES),
                 ).order_by(MovementOrder.id.asc())
             ).scalars().all()
             found_order_ids = {order.id for order in candidates}
@@ -11509,6 +12458,22 @@ def cleanup_close_inconsistent_orders(body: CleanupSelectionIn, x_admin_token: O
                 continue
 
             closed_orders.append(_close_cleanup_order(db, order, now=now, reason="admin_cleanup", admin_user=admin_user))
+            db.flush()
+            for related_rack_id in _related_rack_ids_for_order(order):
+                released, skipped, kept_location = _release_cleanup_rack_if_safe(
+                    db,
+                    related_rack_id,
+                    closed_order_id=order.id,
+                    now=now,
+                    min_age_minutes=min_age_minutes,
+                    admin_user=admin_user,
+                )
+                if skipped:
+                    skipped_orders.append(skipped)
+                elif released:
+                    released_racks.append(released)
+                if kept_location:
+                    kept_locations += 1
 
         for rack_id in rack_ids:
             released, skipped, kept_location = _release_cleanup_rack_if_safe(db, rack_id, closed_order_id=0, now=now, min_age_minutes=min_age_minutes, admin_user=admin_user)
@@ -11614,8 +12579,22 @@ def force_release_old_active_racks(body: CleanupSelectionIn, x_admin_token: Opti
             if not active_orders:
                 skipped.append({"rack_id": rack_id, "rack_code": rack.code, "reason": "rack sin orden activa asociada"})
                 continue
+            confirmed_failed_orders = [
+                order for order in active_orders
+                if _normalized_cleanup_rcs_terminal_status(order.rcs_status) == "failed"
+                and not _robot_monitor_indicates_order_running(order)
+                and _validate_force_release_order(order, now=now, min_age_minutes=min_age_minutes)[0]
+            ]
+            if len(active_orders) > 1 and confirmed_failed_orders:
+                for order in confirmed_failed_orders:
+                    closed_orders.append(_force_close_old_active_order(db, order, now=now, admin_user=admin_user, reason=(body.reason or "").strip()))
+                db.flush()
+                active_orders = _active_orders_for_rack(db, rack_id)
             if len(active_orders) > 1:
                 skipped.append({"rack_id": rack_id, "rack_code": rack.code, "reason": "No se puede liberar: existe otra orden activa asociada al mismo rack."})
+                continue
+            if active_orders and confirmed_failed_orders:
+                skipped.append({"rack_id": rack_id, "rack_code": rack.code, "reason": "Orden fallida reconciliada; el rack permanece reservado porque existe otra orden activa asociada."})
                 continue
             if any(_rcs_status_still_active(order) for order in active_orders) and not body.confirm_local_only:
                 raise HTTPException(status_code=409, detail=FORCE_RELEASE_RCS_ACTIVE_WARNING)
@@ -12810,7 +13789,4 @@ def operator_execute_window_button(window_id: int, button_index: int, body: Oper
             message = dispatch_result.rcs_message or 'El RCS rechazó la creación de la tarea'
             _rollback_unsuccessful_order_dispatch(db, order, message)
             raise HTTPException(status_code=400, detail=f'El RCS no aceptó la tarea: {message}')
-        order = db.execute(select(MovementOrder).where(MovementOrder.id == order.id)).scalar_one_or_none()
-        if not order:
-            raise HTTPException(status_code=500, detail='La orden enviada ya no está disponible')
-        return _movement_order_out(db, order)
+        return _movement_order_out_read_optimized(db, order)

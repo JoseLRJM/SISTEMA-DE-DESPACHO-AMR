@@ -6,6 +6,7 @@ window.addEventListener("error", function(e) {
 
 const API = {
   locations: "/api/locations",
+  locationsRevision: "/api/locations-revision",
   location: (x, y) => `/api/locations/${x}/${y}`,
   gridConfig: "/api/grid-config",
   catalog: "/api/catalog",
@@ -66,6 +67,7 @@ const API = {
   fifoExecute: "/api/fifo/execute",
   directMoveExecute: "/api/direct-move/execute",
   movementOrders: "/api/movement-orders",
+  movementOrderDetail: (id) => `/api/movement-orders/${id}`,
   movementOrderJson: (id) => `/api/movement-orders/${id}/json`,
   movementOrderJsonSave: (id) => `/api/movement-orders/${id}/json`,
   movementOrderJsonReset: (id) => `/api/movement-orders/${id}/json/reset`,
@@ -121,9 +123,22 @@ const API = {
 
 const DB_W = 100;
 const DB_H = 100;
+const LOCATIONS_CACHE_SCHEMA_VERSION = 1;
+const LOCATIONS_CACHE_DB_NAME = 'sistema-despacho-amr-locations';
+const LOCATIONS_CACHE_DB_VERSION = 1;
 let GRID_W = 100;
 let GRID_H = 100;
 let locations = new Array(DB_W * DB_H).fill(null);
+let locationById = new Map();
+let locationByCode = new Map();
+let locationByRackId = new Map();
+let operationalLocations = [];
+let locationsRevision = null;
+let locationsLoaded = false;
+let locationsCacheDbPromise = null;
+let areaById = new Map();
+let rackById = new Map();
+let cellOptionsCache = new Map();
 let selected = { x: 0, y: 0 };
 const KEEP_VALUE = "__keep";
 let multiSelectedLocationIds = new Set();
@@ -152,6 +167,9 @@ const agvOverlayConfig = { scale_x: 1, scale_y: 1, offset_x: 0, offset_y: 0, rot
 let runtimeSocket = null;
 let runtimeSocketReconnectHandle = null;
 let runtimeSocketConnected = false;
+let runtimeRevision = 0;
+let runtimeResyncPending = false;
+const runtimeMetricsEnabled = new URLSearchParams(window.location.search).get('ws_metrics') === '1';
 let debugConsoleHoverPaused = false;
 let debugConsolePendingEntries = null;
 let RUNTIME_AUTO_REFRESH_MS = 5000;
@@ -813,6 +831,7 @@ const ordersList = $("ordersList");
 const orderDetailBox = $("orderDetailBox");
 const orderMsg = $("orderMsg");
 const btnRefreshOrders = $("btnRefreshOrders");
+const btnLoadOlderOrders = $("btnLoadOlderOrders");
 const btnSendStatusQuery = $("btnSendStatusQuery");
 const btnRefreshOrderJson = $("btnRefreshOrderJson");
 const btnSaveOrderJson = $("btnSaveOrderJson");
@@ -926,6 +945,11 @@ const btnOperatorActionPickDestination = $("btnOperatorActionPickDestination");
 let lastFifoPreview = null;
 let movementOrders = [];
 let selectedOrderId = null;
+let movementOrdersTotal = 0;
+let movementOrdersNextOffset = 100;
+const historicalOrderSummaries = new Map();
+const movementOrderDetailCache = new Map();
+const movementOrderDetailRequests = new Map();
 let selectedOrderJsonPayload = null;
 let selectedOrderJsonSource = "generated";
 let selectedOrderResponsePayload = null;
@@ -1130,7 +1154,7 @@ function isReservedState(value) { return String(value || "").trim().toLowerCase(
 function getLiveReservationForRack(rackId) {
   const id = Number(rackId || 0);
   if (!id) return null;
-  const loc = (locations || []).find(l => l && Number(l.rack_id) === id);
+  const loc = locationByRackId.get(id);
   if (!loc) return null;
   return {
     reservation_status: loc.reservation_status,
@@ -1595,22 +1619,24 @@ async function refreshRobotMonitor(options = {}) {
   }
   if (!robotMonitorSubtitle) return;
   const force = !!options.force;
-  if (robotMonitorRefreshInFlight && !force) return;
+  if (robotMonitorRefreshInFlight) return;
   robotMonitorRefreshInFlight = true;
   try {
-    robotMonitorSubtitle.textContent = 'Consultando RCS…';
+    robotMonitorSubtitle.textContent = force ? 'Consultando RCS…' : 'Cargando último estado…';
     const data = await fetchJson(`${API.robotStatusMonitor}?force=${force ? 1 : 0}`, { cache: 'no-store' });
     const robots = Array.isArray(data.robots) ? data.robots : [];
     const count = robots.length;
     syncRobotVisualTargets(robots);
-    robotMonitorSubtitle.textContent = count > 0 ? '' : (data.message || (data.ok ? 'Consulta exitosa sin robots.' : 'Sin conexión'));
+    robotMonitorSubtitle.textContent = data.stale
+      ? (data.message || 'Mostrando el último estado conocido.')
+      : (count > 0 ? '' : (data.message || (data.ok ? 'Consulta exitosa sin robots.' : 'Sin datos todavía')));
     renderRobotMonitorItems(latestRobotMonitorItems, data.message || 'Sin datos todavía.');
     draw();
   } catch (err) {
-    syncRobotVisualTargets([]);
     draw();
-    robotMonitorSubtitle.textContent = 'Error de monitoreo';
-    renderRobotMonitorItems([], `Error: ${String(err)}`);
+    const hasKnownState = latestRobotMonitorItems.length > 0;
+    robotMonitorSubtitle.textContent = hasKnownState ? 'Error al actualizar; mostrando el último estado conocido.' : 'Error de monitoreo';
+    renderRobotMonitorItems(latestRobotMonitorItems, `Error: ${String(err)}`);
   } finally {
     robotMonitorRefreshInFlight = false;
   }
@@ -1636,10 +1662,171 @@ function scheduleRuntimeSocketReconnect() {
   }, RUNTIME_SOCKET_RECONNECT_MS);
 }
 
+function requestRuntimeResync(reason = 'inconsistencia') {
+  if (runtimeResyncPending || !runtimeSocket || runtimeSocket.readyState !== WebSocket.OPEN) return;
+  runtimeResyncPending = true;
+  console.warn('[runtime-ws] solicitando resync', reason);
+  runtimeSocket.send(JSON.stringify({
+    type: 'resync', revision: runtimeRevision,
+    has_locations: locationsLoaded && Number.isInteger(locationsRevision),
+    locations_revision: locationsRevision,
+    reason,
+  }));
+}
+
+function applyRobotMonitorUpdated(data) {
+  if (!robotMonitorEnabled) return;
+  const robots = Array.isArray(data?.robots) ? data.robots : [];
+  syncRobotVisualTargets(robots);
+  if (robotMonitorSubtitle) {
+    robotMonitorSubtitle.textContent = data?.stale
+      ? (data?.message || 'Mostrando el último estado conocido.')
+      : (robots.length ? '' : (data?.message || (data?.ok ? 'Consulta exitosa sin robots.' : 'Sin conexión')));
+  }
+  renderRobotMonitorItems(latestRobotMonitorItems, data?.message || 'Sin datos todavía.');
+}
+
+function applyLocationUpdated(location, options = {}) {
+  if (!location) return;
+  upsertLocation(location);
+  if (options.draw !== false) draw();
+}
+
+function applyLocationDeleted(locationId) {
+  const previous = locationById.get(Number(locationId));
+  if (!previous) return;
+  if (locations[idx(previous.x, previous.y)] === previous) locations[idx(previous.x, previous.y)] = null;
+  locationById.delete(Number(previous.id));
+  const code = String(previous.code || '').trim();
+  if (code && locationByCode.get(code) === previous) locationByCode.delete(code);
+  if (previous.rack_id != null && locationByRackId.get(Number(previous.rack_id)) === previous) locationByRackId.delete(Number(previous.rack_id));
+  operationalLocations = operationalLocations.filter(item => Number(item.id) !== Number(previous.id));
+  cellOptionsCache.clear();
+  draw();
+}
+
+function applyRackUpdated(rack, options = {}) {
+  if (!rack) return;
+  const rackId = Number(rack.id);
+  const index = (catalog.racks || []).findIndex(item => Number(item.id) === rackId);
+  if (index >= 0) catalog.racks[index] = rack;
+  else catalog.racks.push(rack);
+  catalog.racks.sort((a, b) => String(a.code || '').localeCompare(String(b.code || '')));
+  rackById.set(rackId, rack);
+  if (options.render !== false) {
+    renderRackOptions();
+    renderPodPositionRackOptions();
+    renderRackList();
+  }
+}
+
+function applyRackDeleted(rackId) {
+  catalog.racks = (catalog.racks || []).filter(item => Number(item.id) !== Number(rackId));
+  rackById.delete(Number(rackId));
+  renderRackOptions();
+  renderPodPositionRackOptions();
+  renderRackList();
+  draw();
+}
+
+function applyOrderUpdated(payload, created = false) {
+  const order = payload?.order;
+  if (!order) return;
+  const numericOrderId = Number(order.order_id ?? order.id);
+  const orderId = Number.isInteger(numericOrderId) && numericOrderId > 0 ? numericOrderId : null;
+  const orderCode = String(order.order_code || '').trim();
+  const previous = movementOrders.find(item => (
+    (orderId != null && Number(item.order_id ?? item.id) === orderId)
+    || (orderCode && String(item.order_code || '').trim() === orderCode)
+  ));
+  if (created && !previous) movementOrdersTotal += 1;
+  const stableOrderId = orderId ?? Number(previous?.order_id ?? previous?.id);
+  if (previous && Number.isInteger(stableOrderId) && String(previous.status_query_checked_at || '') !== String(order.status_query_checked_at || '')) {
+    movementOrderDetailCache.delete(stableOrderId);
+  }
+  movementOrders = movementOrders.filter(item => !(
+    (orderId != null && Number(item.order_id ?? item.id) === orderId)
+    || (orderCode && String(item.order_code || '').trim() === orderCode)
+  ));
+  movementOrders.push({ ...(previous || {}), ...order });
+  movementOrders.sort((a, b) => {
+    const byDate = new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime();
+    return byDate || Number(b.order_id || 0) - Number(a.order_id || 0);
+  });
+  if (payload.rack) applyRackUpdated(payload.rack, { render: false });
+  if (payload.location) applyLocationUpdated(payload.location, { draw: false });
+  renderOrdersList();
+  updateOlderOrdersButton();
+}
+
+function applyOrderDeleted(orderId) {
+  const before = movementOrders.length;
+  movementOrders = movementOrders.filter(item => Number(item.order_id) !== Number(orderId));
+  historicalOrderSummaries.delete(Number(orderId));
+  movementOrderDetailCache.delete(Number(orderId));
+  if (movementOrders.length !== before) movementOrdersTotal = Math.max(0, movementOrdersTotal - 1);
+  if (Number(selectedOrderId) === Number(orderId)) selectedOrderId = movementOrders[0]?.order_id || null;
+  renderOrdersList();
+  updateOlderOrdersButton();
+}
+
+function applyDebugEvent(debugEvent) {
+  if (!debugEvent) return;
+  debugConsoleEvents = [debugEvent, ...debugConsoleEvents.filter(item => Number(item.id) !== Number(debugEvent.id))].slice(0, 300);
+  const selectedDetail = movementOrderDetailCache.get(Number(selectedOrderId));
+  renderOrderStatusQuery(
+    selectedDetail?.status_query_request_payload,
+    selectedDetail?.status_query_response_payload,
+    selectedDetail?.status_query_log_entries || debugConsoleEvents,
+    true,
+  );
+}
+
+async function applyRuntimeIncrementalMessage(message) {
+  const revision = Number(message?.revision);
+  if (!Number.isInteger(revision) || revision <= 0) throw new Error('revision inválida');
+  if (revision <= runtimeRevision) return;
+  if (revision !== runtimeRevision + 1) throw new Error(`salto de revisión ${runtimeRevision} -> ${revision}`);
+  const payload = message.payload || {};
+  switch (message.type) {
+    case 'order_created': applyOrderUpdated(payload, true); break;
+    case 'order_updated': applyOrderUpdated(payload, false); break;
+    case 'order_deleted': applyOrderDeleted(payload.id); break;
+    case 'location_updated': applyLocationUpdated(payload.location); break;
+    case 'location_deleted': applyLocationDeleted(payload.id); break;
+    case 'rack_updated':
+      applyRackUpdated(payload.rack);
+      if (payload.location) applyLocationUpdated(payload.location);
+      break;
+    case 'rack_deleted': applyRackDeleted(payload.id); break;
+    case 'robot_monitor_updated': applyRobotMonitorUpdated(payload); break;
+    case 'debug_event_added': applyDebugEvent(payload.event); break;
+    case 'debug_event_deleted': break;
+    case 'catalog_invalidated': await loadCatalog(); break;
+    default: throw new Error(`mensaje desconocido: ${message.type}`);
+  }
+  if ((message.type === 'location_updated' || message.type === 'location_deleted') && Number.isInteger(Number(payload.locations_revision))) {
+    locationsRevision = Number(payload.locations_revision);
+    locationsLoaded = true;
+    const cacheLocation = message.type === 'location_deleted' ? { id: payload.id } : payload.location;
+    updateLocationsCacheRecord(cacheLocation, locationsRevision, message.type === 'location_deleted')
+      .then(updated => {
+        if (updated) logLocationsCacheMetric({ source: 'websocket', id: Number(cacheLocation?.id), revision: locationsRevision });
+      })
+      .catch(error => console.warn('[locations-cache] no se pudo aplicar evento incremental', error));
+  }
+  runtimeRevision = revision;
+}
+
 function connectRuntimeSocket() {
   cleanupRuntimeSocket();
   try {
-    runtimeSocket = new WebSocket(API.runtimeWs);
+    const params = new URLSearchParams();
+    if (locationsLoaded && Number.isInteger(locationsRevision)) {
+      params.set('has_locations', '1');
+      params.set('locations_revision', String(locationsRevision));
+    }
+    runtimeSocket = new WebSocket(`${API.runtimeWs}${params.size ? `?${params.toString()}` : ''}`);
   } catch (err) {
     setConn('Error WebSocket');
     scheduleRuntimeSocketReconnect();
@@ -1651,13 +1838,48 @@ function connectRuntimeSocket() {
     setConn('Conectado (WebSocket)');
   });
 
-  runtimeSocket.addEventListener('message', (event) => {
+  runtimeSocket.addEventListener('message', async (event) => {
+    const eventStarted = performance.now();
+    let parseFinished = eventStarted;
+    let messageType = 'invalid';
     try {
       const message = JSON.parse(event.data);
+      parseFinished = performance.now();
+      messageType = String(message?.type || 'unknown');
       if (message?.type === 'runtime_snapshot' && message.payload) {
-        applyRuntimeSnapshotData(message.payload, selectedOrderId);
+        const locationsIncluded = message.locations_included !== false;
+        applyRuntimeSnapshotData(message.payload, selectedOrderId, { preserveLocations: !locationsIncluded });
+        if (Number.isInteger(Number(message.locations_revision))) {
+          locationsRevision = Number(message.locations_revision);
+          locationsLoaded = true;
+        }
+        if (locationsIncluded && locationsRevision) {
+          writeLocationsCache(message.payload.locations || [], locationsRevision)
+            .catch(error => console.warn('[locations-cache] no se pudo reconstruir desde snapshot', error));
+        }
+        runtimeRevision = Number(message.revision) || 0;
+        runtimeResyncPending = false;
+      } else if (message?.type === 'heartbeat') {
+        if (Number(message.revision) > runtimeRevision) requestRuntimeResync('heartbeat adelantado');
+      } else if (message?.type === 'runtime_resync_required') {
+        requestRuntimeResync('servidor solicitó resincronización');
+      } else {
+        await applyRuntimeIncrementalMessage(message);
       }
-    } catch (_) {}
+    } catch (err) {
+      console.error('[runtime-ws] no se pudo aplicar evento', err);
+      requestRuntimeResync(String(err));
+    } finally {
+      if (runtimeMetricsEnabled) {
+        console.info('[runtime-ws-metric]', JSON.stringify({
+          type: messageType,
+          bytes: new Blob([event.data]).size,
+          parse_ms: Number((parseFinished - eventStarted).toFixed(3)),
+          apply_ms: Number((performance.now() - parseFinished).toFixed(3)),
+          total_ms: Number((performance.now() - eventStarted).toFixed(3)),
+        }));
+      }
+    }
   });
 
   runtimeSocket.addEventListener('close', () => {
@@ -2940,7 +3162,10 @@ function zoomAtPoint(nextScale, mx, my) {
 }
 async function fetchJson(url, options = {}) {
   const finalOptions = { cache: 'no-store', ...options };
+  const onResponse = finalOptions.onResponse;
+  delete finalOptions.onResponse;
   const res = await fetchWithAdminSession(url, finalOptions);
+  if (typeof onResponse === 'function') onResponse(res);
   const text = await res.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch (_) {}
@@ -3773,15 +3998,252 @@ async function loadGridConfig() {
   if (runtimeReconnectSeconds) runtimeReconnectSeconds.value = String(Number(cfg.runtime_reconnect_seconds) || 3);
   setConn("Conectado");
 }
-async function loadLocations() {
-  const rows = await fetchJson(API.locations);
+function openLocationsCacheDb() {
+  if (!window.indexedDB) return Promise.reject(new Error('IndexedDB no disponible'));
+  if (locationsCacheDbPromise) return locationsCacheDbPromise;
+  locationsCacheDbPromise = new Promise((resolve, reject) => {
+    const request = window.indexedDB.open(LOCATIONS_CACHE_DB_NAME, LOCATIONS_CACHE_DB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains('locations')) db.createObjectStore('locations', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('metadata')) db.createObjectStore('metadata');
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('No se pudo abrir IndexedDB'));
+    request.onblocked = () => reject(new Error('IndexedDB bloqueado por otra pestaña'));
+  }).catch((error) => {
+    locationsCacheDbPromise = null;
+    throw error;
+  });
+  return locationsCacheDbPromise;
+}
+
+function idbRequest(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('Error de IndexedDB'));
+  });
+}
+
+function waitForIdbTransaction(transaction) {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = () => resolve(true);
+    transaction.onerror = () => reject(transaction.error || new Error('Transacción IndexedDB fallida'));
+    transaction.onabort = () => reject(transaction.error || new Error('Transacción IndexedDB cancelada'));
+  });
+}
+
+async function clearLocationsCache() {
+  try {
+    const db = await openLocationsCacheDb();
+    const transaction = db.transaction(['locations', 'metadata'], 'readwrite');
+    transaction.objectStore('locations').clear();
+    transaction.objectStore('metadata').clear();
+    await waitForIdbTransaction(transaction);
+    return true;
+  } catch (error) {
+    console.warn('[locations-cache] no se pudo limpiar', error);
+    return false;
+  }
+}
+
+function locationsCacheRowsAreValid(rows, expectedCount) {
+  if (!Array.isArray(rows) || rows.length !== Number(expectedCount)) return false;
+  const ids = new Set();
+  for (const row of rows) {
+    if (!row || !Number.isInteger(Number(row.id)) || !Number.isFinite(Number(row.x)) || !Number.isFinite(Number(row.y))) return false;
+    ids.add(Number(row.id));
+  }
+  return ids.size === rows.length;
+}
+
+async function readLocationsCache(expectedRevision, expectedCount) {
+  const db = await openLocationsCacheDb();
+  const metadataTransaction = db.transaction('metadata', 'readonly');
+  const metadata = await idbRequest(metadataTransaction.objectStore('metadata').get('state'));
+  if (!metadata || Number(metadata.schemaVersion) !== LOCATIONS_CACHE_SCHEMA_VERSION
+      || Number(metadata.locationsRevision) !== Number(expectedRevision)
+      || Number(metadata.count) !== Number(expectedCount)) return null;
+  const rowsTransaction = db.transaction('locations', 'readonly');
+  const rows = await idbRequest(rowsTransaction.objectStore('locations').getAll());
+  if (!locationsCacheRowsAreValid(rows, expectedCount)) throw new Error('Caché de locations corrupta');
+  return rows;
+}
+
+async function writeLocationsCache(rows, revision) {
+  if (!Array.isArray(rows) || !Number.isInteger(Number(revision)) || Number(revision) <= 0) return false;
+  const db = await openLocationsCacheDb();
+  const transaction = db.transaction(['locations', 'metadata'], 'readwrite');
+  const locationsStore = transaction.objectStore('locations');
+  const metadataStore = transaction.objectStore('metadata');
+  const existingMetadata = await idbRequest(metadataStore.get('state'));
+  if (Number(existingMetadata?.locationsRevision || 0) > Number(revision)) {
+    transaction.abort();
+    return false;
+  }
+  locationsStore.clear();
+  for (const row of rows) locationsStore.put(row);
+  metadataStore.put({
+    schemaVersion: LOCATIONS_CACHE_SCHEMA_VERSION,
+    locationsRevision: Number(revision),
+    count: rows.length,
+    updatedAt: new Date().toISOString(),
+  }, 'state');
+  await waitForIdbTransaction(transaction);
+  return true;
+}
+
+async function updateLocationsCacheRecord(location, revision, deleted = false) {
+  if (!Number.isInteger(Number(revision)) || Number(revision) <= 0) return false;
+  const db = await openLocationsCacheDb();
+  const transaction = db.transaction(['locations', 'metadata'], 'readwrite');
+  const locationsStore = transaction.objectStore('locations');
+  const metadataStore = transaction.objectStore('metadata');
+  const metadata = await idbRequest(metadataStore.get('state'));
+  if (!metadata || Number(metadata.schemaVersion) !== LOCATIONS_CACHE_SCHEMA_VERSION) {
+    transaction.abort();
+    return false;
+  }
+  if (Number(metadata.locationsRevision || 0) > Number(revision)) {
+    transaction.abort();
+    return false;
+  }
+  const previous = await idbRequest(locationsStore.get(Number(location?.id)));
+  if (deleted) locationsStore.delete(Number(location?.id));
+  else locationsStore.put(location);
+  const nextCount = Number(metadata.count) + (deleted && previous ? -1 : (!deleted && !previous ? 1 : 0));
+  metadataStore.put({ ...metadata, locationsRevision: Number(revision), count: nextCount, updatedAt: new Date().toISOString() }, 'state');
+  await waitForIdbTransaction(transaction);
+  return true;
+}
+
+function logLocationsCacheMetric(payload) {
+  if (runtimeMetricsEnabled) console.info('[locations-cache-metric]', JSON.stringify(payload));
+}
+
+function rebuildLocationIndexes() {
+  locationById = new Map();
+  locationByCode = new Map();
+  locationByRackId = new Map();
+  operationalLocations = [];
+  for (const loc of locations) {
+    if (!loc) continue;
+    locationById.set(Number(loc.id), loc);
+    const code = String(loc.code || '').trim();
+    if (code) locationByCode.set(code, loc);
+    if (loc.rack_id != null) locationByRackId.set(Number(loc.rack_id), loc);
+    if (isOperationalConfiguredLocation(loc)) operationalLocations.push(loc);
+  }
+  cellOptionsCache.clear();
+}
+function replaceLocations(rows) {
   locations = new Array(DB_W * DB_H).fill(null);
-  for (const loc of rows) locations[idx(loc.x, loc.y)] = loc;
+  for (const loc of rows || []) locations[idx(loc.x, loc.y)] = loc;
+  rebuildLocationIndexes();
+}
+function upsertLocation(loc) {
+  if (!loc) return;
+  const gridIndex = idx(loc.x, loc.y);
+  const previousById = locationById.get(Number(loc.id));
+  if (previousById && idx(previousById.x, previousById.y) !== gridIndex && locations[idx(previousById.x, previousById.y)] === previousById) {
+    locations[idx(previousById.x, previousById.y)] = null;
+  }
+  const previous = locations[gridIndex];
+  if (previous) {
+    locationById.delete(Number(previous.id));
+    const previousCode = String(previous.code || '').trim();
+    if (previousCode && locationByCode.get(previousCode) === previous) locationByCode.delete(previousCode);
+    if (previous.rack_id != null && locationByRackId.get(Number(previous.rack_id)) === previous) locationByRackId.delete(Number(previous.rack_id));
+  }
+  locations[gridIndex] = loc;
+  locationById.set(Number(loc.id), loc);
+  const code = String(loc.code || '').trim();
+  if (code) locationByCode.set(code, loc);
+  if (loc.rack_id != null) locationByRackId.set(Number(loc.rack_id), loc);
+  operationalLocations = operationalLocations.filter(item => Number(item.id) !== Number(loc.id));
+  if (isOperationalConfiguredLocation(loc)) operationalLocations.push(loc);
+  operationalLocations.sort((a, b) => idx(a.x, a.y) - idx(b.x, b.y));
+  cellOptionsCache.clear();
+}
+function rebuildCatalogIndexes() {
+  areaById = new Map((catalog.areas || []).map(area => [Number(area.id), area]));
+  rackById = new Map((catalog.racks || []).map(rack => [Number(rack.id), rack]));
+  rebuildLocationIndexes();
+}
+function renderLoadedLocationAndCatalogData() {
+  renderAreaOptions();
+  renderMaterialOptions();
+  renderRackOptions();
+  renderPodPositionRackOptions();
+  renderAreaList();
+  renderMaterialList();
+  renderRackList();
   renderOperatorCellOptions();
   renderQrCatalogOptions();
 }
-async function loadCatalog() {
+async function loadLocations(options = {}) {
+  const started = performance.now();
+  let responseRevision = null;
+  const rows = await fetchJson(API.locations, {
+    onResponse: (response) => {
+      const parsed = Number(response.headers.get('X-Locations-Revision'));
+      responseRevision = Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+    },
+  });
+  replaceLocations(rows);
+  locationsRevision = responseRevision;
+  locationsLoaded = true;
+  logLocationsCacheMetric({ source: 'http', count: rows.length, revision: responseRevision, elapsed_ms: Number((performance.now() - started).toFixed(1)) });
+  if (responseRevision) {
+    writeLocationsCache(rows, responseRevision).catch(error => console.warn('[locations-cache] no se pudo guardar', error));
+  }
+  if (options.render !== false) {
+    renderOperatorCellOptions();
+    renderQrCatalogOptions();
+  }
+}
+
+async function loadLocationsCached(options = {}) {
+  const started = performance.now();
+  let revisionInfo;
+  try {
+    revisionInfo = await fetchJson(API.locationsRevision);
+    const revision = Number(revisionInfo?.revision);
+    const count = Number(revisionInfo?.count);
+    if (!Number.isInteger(revision) || revision <= 0 || !Number.isInteger(count) || count < 0) throw new Error('Revisión de locations inválida');
+    try {
+      const cachedRows = await readLocationsCache(revision, count);
+      if (cachedRows) {
+        replaceLocations(cachedRows);
+        locationsRevision = revision;
+        locationsLoaded = true;
+        logLocationsCacheMetric({ source: 'indexeddb', count, revision, elapsed_ms: Number((performance.now() - started).toFixed(1)) });
+        if (options.render !== false) {
+          renderOperatorCellOptions();
+          renderQrCatalogOptions();
+        }
+        return;
+      }
+    } catch (error) {
+      console.warn('[locations-cache] lectura inválida; usando HTTP', error);
+      await clearLocationsCache();
+    }
+  } catch (error) {
+    console.warn('[locations-cache] no se pudo consultar la revisión; usando HTTP', error);
+  }
+  await loadLocations(options);
+}
+async function loadCatalog(options = {}) {
   catalog = await fetchJson(API.catalog);
+  rebuildCatalogIndexes();
+  if (options.render === false) {
+    if (adminToken) await loadAdminAreaMaterialRecords();
+    else {
+      adminAreas = [...(catalog.areas || [])];
+      adminMaterials = [...(catalog.materials || [])];
+    }
+    return;
+  }
   renderAreaOptions();
   renderMaterialOptions();
   renderRackOptions();
@@ -3808,12 +4270,28 @@ async function loadAdminAreaMaterialRecords() {
 
 function applyRuntimeSnapshotData(snapshot, preferredOrderId = null, options = {}) {
   const rows = Array.isArray(snapshot?.locations) ? snapshot.locations : [];
-  const orders = Array.isArray(snapshot?.orders) ? snapshot.orders : [];
+  const runtimeOrders = Array.isArray(snapshot?.orders) ? snapshot.orders : [];
   const debugLog = Array.isArray(snapshot?.debug_log) ? snapshot.debug_log : [];
 
-  locations = new Array(DB_W * DB_H).fill(null);
-  for (const loc of rows) locations[idx(loc.x, loc.y)] = loc;
-  movementOrders = orders;
+  if (!options.preserveLocations) replaceLocations(rows);
+  movementOrdersTotal = Number(snapshot?.orders_total ?? movementOrdersTotal ?? runtimeOrders.length) || runtimeOrders.length;
+  const recentLimit = Number(snapshot?.recent_order_limit || 100) || 100;
+  movementOrdersNextOffset = Math.max(movementOrdersNextOffset, recentLimit);
+  const mergedOrders = new Map(historicalOrderSummaries);
+  for (const order of runtimeOrders) mergedOrders.set(Number(order.order_id), order);
+  for (const [orderId, detail] of movementOrderDetailCache) {
+    const summary = mergedOrders.get(Number(orderId));
+    if (!summary) continue;
+    if (String(summary.status_query_checked_at || '') !== String(detail.status_query_checked_at || '')) {
+      movementOrderDetailCache.delete(Number(orderId));
+      continue;
+    }
+    mergedOrders.set(Number(orderId), { ...detail, ...summary });
+  }
+  movementOrders = Array.from(mergedOrders.values()).sort((a, b) => {
+    const byDate = new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime();
+    return byDate || Number(b.order_id || 0) - Number(a.order_id || 0);
+  });
   debugConsoleEvents = debugLog;
 
   if (preferredOrderId && movementOrders.some(x => x.order_id === preferredOrderId)) {
@@ -3823,37 +4301,39 @@ function applyRuntimeSnapshotData(snapshot, preferredOrderId = null, options = {
     selectedOrderId = movementOrders.length ? movementOrders[0].order_id : null;
   }
 
-  renderOperatorCellOptions();
   renderOrdersList();
-  renderOrderStatusQuery(null, null, debugConsoleEvents, true);
-  renderDirectMoveSelection();
-  const deferCellRender = !options.forceAdminRender && isEditingLockEffective("cell");
-  if (deferCellRender) {
-    editingLock.pendingRuntimeSnapshot = snapshot;
-    updateEditRefreshNotices();
-  } else {
-    const selectedLoc = getLocationAtGrid(selected.x, selected.y);
-    if (isMultiSelectionActive()) {
-      multiSelectedLocationIds = new Set(Array.from(multiSelectedLocationIds).filter(id => getLocationById(id)));
-      fillMultiCellForm();
-    } else if (selectedLoc) {
-      fillCellForm(selectedLoc);
+  const selectedDetail = movementOrderDetailCache.get(Number(selectedOrderId));
+  renderOrderStatusQuery(
+    selectedDetail?.status_query_request_payload,
+    selectedDetail?.status_query_response_payload,
+    selectedDetail?.status_query_log_entries || debugConsoleEvents,
+    true,
+  );
+  updateOlderOrdersButton();
+  if (!options.preserveLocations) {
+    renderOperatorCellOptions();
+    renderDirectMoveSelection();
+    const deferCellRender = !options.forceAdminRender && isEditingLockEffective("cell");
+    if (deferCellRender) {
+      editingLock.pendingRuntimeSnapshot = snapshot;
+      updateEditRefreshNotices();
+    } else {
+      const selectedLoc = getLocationAtGrid(selected.x, selected.y);
+      if (isMultiSelectionActive()) {
+        multiSelectedLocationIds = new Set(Array.from(multiSelectedLocationIds).filter(id => getLocationById(id)));
+        fillMultiCellForm();
+      } else if (selectedLoc) {
+        fillCellForm(selectedLoc);
+      }
+      setCellBulkControlsState();
+      refreshRackReservationFieldsForSelection();
     }
-    setCellBulkControlsState();
-    refreshRackReservationFieldsForSelection();
+    draw();
   }
-
-  draw();
 
   if (robotMonitorEnabled) {
     const data = snapshot?.robot_monitor || { ok: false, robots: [], message: 'Sin datos todavía.' };
-    const robots = Array.isArray(data.robots) ? data.robots : [];
-    const count = robots.length;
-    syncRobotVisualTargets(robots);
-    if (robotMonitorSubtitle) {
-      robotMonitorSubtitle.textContent = count > 0 ? '' : (data.message || (data.ok ? 'Consulta exitosa sin robots.' : 'Sin conexión'));
-    }
-    renderRobotMonitorItems(latestRobotMonitorItems, data.message || 'Sin datos todavía.');
+    applyRobotMonitorUpdated(data);
   } else {
     latestRobotMonitorItems = [];
   }
@@ -4297,7 +4777,7 @@ function buildRackSelectOptions(selectedValue = "") {
 function cellOptionLabel(loc) {
   if (!loc) return "";
   const code = String(loc.code || "").trim();
-  const area = (catalog.areas || []).find(a => Number(a.id) === Number(loc.area_id));
+  const area = areaById.get(Number(loc.area_id));
   return `${code || `(${loc.x},${loc.y})`}${area ? ` - ${area.name || area.code}` : ""}`;
 }
 function isCoordinateOnlyText(value) {
@@ -4308,7 +4788,7 @@ function hasOperationalLocationData(loc) {
   if (!loc) return false;
   const code = String(loc.code || "").trim();
   const note = String(loc.note || "").trim();
-  const area = (catalog.areas || []).find(a => Number(a.id) === Number(loc.area_id));
+  const area = areaById.get(Number(loc.area_id));
   const areaCode = String(area?.code || loc.area_code || "").trim();
   const areaName = String(area?.name || loc.area_name || "").trim();
   return (
@@ -4323,13 +4803,16 @@ function isOperationalConfiguredLocation(loc) {
 }
 function buildCellOptions(selectedValue = "") {
   const selectedText = String(selectedValue || "");
-  const rows = (locations || []).filter(isOperationalConfiguredLocation);
-  const hasSelected = selectedText && rows.some(loc => String(loc.id) === selectedText);
-  const selectedLoc = selectedText ? (locations || []).find(loc => loc && String(loc.id) === selectedText) : null;
+  if (cellOptionsCache.has(selectedText)) return cellOptionsCache.get(selectedText);
+  const rows = operationalLocations;
+  const selectedLoc = selectedText ? locationById.get(Number(selectedText)) : null;
+  const hasSelected = !!(selectedLoc && rows.includes(selectedLoc));
   const staleOption = selectedText && selectedLoc && !hasSelected
     ? `<option value="${selectedLoc.id}" selected>${escapeHtml(cellOptionLabel(selectedLoc))} - no configurada / no operativa</option>`
     : "";
-  return `<option value="">Sin celda</option>${staleOption}` + rows.map(loc => `<option value="${loc.id}" ${selectedText === String(loc.id) ? "selected" : ""}>${escapeHtml(cellOptionLabel(loc))}</option>`).join("");
+  const html = `<option value="">Sin celda</option>${staleOption}` + rows.map(loc => `<option value="${loc.id}" ${selectedText === String(loc.id) ? "selected" : ""}>${escapeHtml(cellOptionLabel(loc))}</option>`).join("");
+  cellOptionsCache.set(selectedText, html);
+  return html;
 }
 function renderQrCellSummary(selectEl, targetEl) {
   if (!targetEl) return;
@@ -4339,13 +4822,13 @@ function renderQrCellSummary(selectEl, targetEl) {
     targetEl.innerHTML = "No hay celda seleccionada.";
     return;
   }
-  const loc = (locations || []).find(row => row && Number(row.id) === Number(locId));
+  const loc = locationById.get(Number(locId));
   if (!loc) {
     targetEl.classList.add("warn");
     targetEl.innerHTML = "Esta celda no est&aacute; configurada u operativa. Selecciona otra celda.";
     return;
   }
-  const area = (catalog.areas || []).find(a => Number(a.id) === Number(loc.area_id));
+  const area = areaById.get(Number(loc.area_id));
   const code = String(loc.code || "").trim() || `(${loc.x},${loc.y})`;
   const note = String(loc.note || "").trim();
   const areaText = area ? `${area.code || ""}${area.name ? ` - ${area.name}` : ""}`.trim() : (loc.area_name || "");
@@ -6783,7 +7266,7 @@ async function refreshReservationUiState() {
   }
   draw();
 }
-async function refreshBackground() {
+async function refreshBackground(options = {}) {
   const bg = await fetchJson(API.background);
   bgState.url = bg.url;
   bgState.scale_x = Number(bg.scale_x || 1);
@@ -6796,7 +7279,7 @@ async function refreshBackground() {
   bgOffY.value = bgState.offset_y;
   bgStateLbl.textContent = bg.url ? "Imagen cargada" : "Sin imagen";
   if (!bg.url) {
-    bgState.img = null; bgState.loaded = false; draw(); return;
+    bgState.img = null; bgState.loaded = false; if (options.draw !== false) draw(); return;
   }
   await new Promise((resolve) => {
     const img = new Image();
@@ -6804,7 +7287,7 @@ async function refreshBackground() {
     img.onerror = () => { bgState.img = null; bgState.loaded = false; resolve(); };
     img.src = `${bg.url}?t=${Date.now()}`;
   });
-  draw();
+  if (options.draw !== false) draw();
 }
 async function saveBgTransform() {
   if (!adminToken) return;
@@ -6838,7 +7321,7 @@ function setRobotMonitorEnabled(enabled, options = {}) {
   }
   if (robotMonitorEnabled) {
     if (!options.skipImmediateRefresh) {
-      refreshRobotMonitor({ force: true }).catch(() => {});
+      refreshRobotMonitor({ force: false }).catch(() => {});
     }
   } else {
     syncRobotVisualTargets([]);
@@ -7176,7 +7659,7 @@ async function adminShowConfiguredRange() {
 }
 function getLocationById(locId) {
   if (locId == null || locId === "" || Number.isNaN(Number(locId))) return null;
-  return locations.find(l => l && Number(l.id) === Number(locId)) || null;
+  return locationById.get(Number(locId)) || null;
 }
 function getLocationAtGrid(x, y) {
   const loc = locations[idx(x, y)];
@@ -7231,24 +7714,94 @@ function directMovePayload() {
     created_by: 'operador',
   };
 }
+const dispatchUiActionsInFlight = new Set();
+const POST_DISPATCH_RESYNC_TIMEOUT_MS = 1500;
+function beginDispatchUiAction(key, button, messageElement) {
+  if (dispatchUiActionsInFlight.has(key)) return null;
+  dispatchUiActionsInFlight.add(key);
+  const previous = {
+    disabled: Boolean(button?.disabled),
+    text: button?.textContent ?? '',
+  };
+  if (button) {
+    button.disabled = true;
+    button.textContent = 'Enviando...';
+  }
+  if (messageElement) messageElement.textContent = 'Enviando...';
+  return () => {
+    dispatchUiActionsInFlight.delete(key);
+    if (button) {
+      button.disabled = previous.disabled;
+      button.textContent = previous.text;
+    }
+  };
+}
+function applyDispatchHttpResult(result) {
+  if (!result) return;
+  applyOrderUpdated({ order: result }, true);
+}
+function runtimeSocketIsHealthy() {
+  return runtimeSocketConnected
+    && runtimeSocket?.readyState === WebSocket.OPEN
+    && !runtimeResyncPending;
+}
+function waitForRuntimeSocketHealth(timeoutMs = POST_DISPATCH_RESYNC_TIMEOUT_MS) {
+  if (runtimeSocketIsHealthy()) return Promise.resolve(true);
+  return new Promise(resolve => {
+    const deadline = performance.now() + timeoutMs;
+    const check = () => {
+      if (runtimeSocketIsHealthy()) return resolve(true);
+      if (performance.now() >= deadline) return resolve(false);
+      window.setTimeout(check, 50);
+    };
+    check();
+  });
+}
+async function recoverPostDispatchCoherence(result, messageElement) {
+  if (runtimeSocketIsHealthy()) return 'websocket';
+  const successMessage = messageElement?.textContent || `Orden ${result?.order_code || ''} enviada.`;
+  if (messageElement) messageElement.textContent = `${successMessage} Resincronizando vista...`;
+  try {
+    const socketUsable = runtimeSocket?.readyState === WebSocket.OPEN;
+    if (socketUsable) {
+      requestRuntimeResync('recuperación posterior al despacho');
+      if (await waitForRuntimeSocketHealth()) {
+        if (messageElement) messageElement.textContent = successMessage;
+        return 'websocket-resync';
+      }
+    }
+    await loadMovementOrders(result?.order_id ?? result?.id ?? null, true, true);
+    if (messageElement) messageElement.textContent = successMessage;
+    return 'http-snapshot';
+  } catch (error) {
+    console.warn('[dispatch] tarea aceptada; no se pudo resincronizar la vista', error);
+    if (messageElement) messageElement.textContent = `${successMessage} La tarea fue aceptada, pero la vista se actualizará al reconectar.`;
+    return 'deferred-reconnect';
+  }
+}
 async function executeDirectMoveRequest() {
   if (!directMoveSourceCellId) throw new Error('Selecciona la celda origen en la tabla.');
   if (!directMoveDestinationCellId) throw new Error('Selecciona la celda destino en la tabla.');
+  const finishUiAction = beginDispatchUiAction('direct-move', btnExecuteDirectMove, directMsg);
+  if (!finishUiAction) return;
   const payload = directMovePayload();
   let result;
   try {
-    result = await fetchJson(API.directMoveExecute, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-  } catch (err) {
-    await refreshAfterDispatchError();
-    throw err;
+    try {
+      result = await fetchJson(API.directMoveExecute, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    } catch (err) {
+      await refreshAfterDispatchError();
+      throw err;
+    }
+    applyDispatchHttpResult(result);
+    directMsg.textContent = `Orden ${result.order_code} creada y enviada al RCS para movimiento directo del rack ${result.rack_code}.`;
+    recoverPostDispatchCoherence(result, directMsg);
+    await selectCell(Number(result.source_cell.x), Number(result.source_cell.y));
+    renderDirectMoveSelection();
+    draw();
+  } finally {
+    finishUiAction();
   }
-  directMsg.textContent = `Orden ${result.order_code} creada y enviada al RCS para movimiento directo del rack ${result.rack_code}.`;
-  await loadLocations();
-  await loadCatalog();
-  await loadMovementOrders(result.order_id);
-  await selectCell(Number(result.source_cell.x), Number(result.source_cell.y));
-  renderDirectMoveSelection();
-  draw();
 }
 function fillCellForm(loc) {
   setBulkSelectMode(false);
@@ -7380,7 +7933,7 @@ async function saveMultiSelectedCells() {
   for (const loc of rows) {
     if (Object.keys(patch).length) {
       const saved = await fetchJson(API.adminLocPatch(loc.x, loc.y), { method: "PATCH", headers: { "Content-Type": "application/json", ...fetchHeaders() }, body: JSON.stringify(patch) });
-      locations[idx(saved.x, saved.y)] = saved;
+      upsertLocation(saved);
     }
     if (changeReservation && loc.rack_id) {
       await fetchJson(API.adminRackReservation(loc.rack_id), { method: "PATCH", headers: { "Content-Type": "application/json", ...fetchHeaders() }, body: JSON.stringify({ reserved: Number(cellReservationState.value || 0) }) });
@@ -7420,7 +7973,7 @@ async function saveSelectedCell() {
     await fetchJson(API.adminRackReservation(rackIdForReservation), { method: "PATCH", headers: { "Content-Type": "application/json", ...fetchHeaders() }, body: JSON.stringify({ reserved: targetReserved }) });
     loc = await fetchJson(API.adminLocPatch(selected.x, selected.y), { headers: { ...fetchHeaders() } });
   }
-  locations[idx(selected.x, selected.y)] = loc;
+  upsertLocation(loc);
   finishEditingLock("cell", { applyPending: false });
   await refreshReservationUiState();
   cellMsg.textContent = `Celda (${selected.x}, ${selected.y}) guardada.`;
@@ -7439,7 +7992,7 @@ async function saveFreeLocationLayout(loc) {
     headers: { "Content-Type": "application/json", ...fetchHeaders() },
     body: JSON.stringify(payload),
   });
-  locations[idx(saved.x, saved.y)] = saved;
+  upsertLocation(saved);
   return saved;
 }
 async function saveArea() {
@@ -7519,21 +8072,26 @@ async function validateFifoRequest() {
   fifoMsg.textContent = preview.message || "Selección validada.";
 }
 async function executeFifoRequest() {
+  const finishUiAction = beginDispatchUiAction('fifo', btnExecuteFifo, fifoMsg);
+  if (!finishUiAction) return;
   const payload = fifoPayload();
   let result;
   try {
-    result = await fetchJson(API.fifoExecute, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-  } catch (err) {
-    await refreshAfterDispatchError();
-    throw err;
+    try {
+      result = await fetchJson(API.fifoExecute, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    } catch (err) {
+      await refreshAfterDispatchError();
+      throw err;
+    }
+    applyDispatchHttpResult(result);
+    fifoMsg.textContent = `Orden ${result.order_code} creada y enviada al RCS para ${result.rack_code}.`;
+    recoverPostDispatchCoherence(result, fifoMsg);
+    renderFifoPreview(null);
+    await selectCell(Number(result.source_cell.x), Number(result.source_cell.y));
+    draw();
+  } finally {
+    finishUiAction();
   }
-  fifoMsg.textContent = `Orden ${result.order_code} creada y enviada al RCS para ${result.rack_code}.`;
-  await loadLocations();
-  await loadCatalog();
-  await loadMovementOrders(result.order_id);
-  renderFifoPreview(null);
-  await selectCell(Number(result.source_cell.x), Number(result.source_cell.y));
-  draw();
 }
 
 async function refreshAfterDispatchError() {
@@ -7582,6 +8140,68 @@ function fifoChainDeveloperNoteHtml(order) {
   return "";
 }
 
+function updateOlderOrdersButton() {
+  if (!btnLoadOlderOrders) return;
+  const hasMore = movementOrdersNextOffset < movementOrdersTotal;
+  btnLoadOlderOrders.disabled = !hasMore;
+  btnLoadOlderOrders.textContent = hasMore
+    ? `Cargar anteriores (${Math.min(movementOrdersNextOffset, movementOrdersTotal)} de ${movementOrdersTotal})`
+    : `Historial cargado (${movementOrdersTotal})`;
+}
+
+function rememberMovementOrderDetail(orderId, detail) {
+  const id = Number(orderId);
+  if (movementOrderDetailCache.has(id)) movementOrderDetailCache.delete(id);
+  movementOrderDetailCache.set(id, detail);
+  while (movementOrderDetailCache.size > 20) {
+    movementOrderDetailCache.delete(movementOrderDetailCache.keys().next().value);
+  }
+}
+
+async function loadMovementOrderDetail(orderId, options = {}) {
+  const id = Number(orderId);
+  if (!id) return null;
+  if (!options.force && movementOrderDetailCache.has(id)) return movementOrderDetailCache.get(id);
+  if (movementOrderDetailRequests.has(id)) return movementOrderDetailRequests.get(id);
+  const request = fetchJson(API.movementOrderDetail(id), { cache: 'no-store' })
+    .then((detail) => {
+      rememberMovementOrderDetail(id, detail);
+      const index = movementOrders.findIndex(order => Number(order.order_id) === id);
+      if (index >= 0) movementOrders[index] = { ...movementOrders[index], ...detail };
+      if (selectedOrderId === id) {
+        renderSelectedOrderDetail(movementOrders[index] || detail);
+        renderOrderStatusQuery(
+          detail.status_query_request_payload,
+          detail.status_query_response_payload,
+          detail.status_query_log_entries || [],
+          true,
+        );
+      }
+      return detail;
+    })
+    .finally(() => movementOrderDetailRequests.delete(id));
+  movementOrderDetailRequests.set(id, request);
+  return request;
+}
+
+async function loadOlderMovementOrders() {
+  if (movementOrdersNextOffset >= movementOrdersTotal) return;
+  if (btnLoadOlderOrders) btnLoadOlderOrders.disabled = true;
+  const page = await fetchJson(`${API.movementOrders}?limit=100&offset=${movementOrdersNextOffset}`, { cache: 'no-store' });
+  const items = Array.isArray(page?.items) ? page.items : [];
+  for (const order of items) historicalOrderSummaries.set(Number(order.order_id), order);
+  movementOrdersTotal = Number(page?.total ?? movementOrdersTotal) || movementOrdersTotal;
+  movementOrdersNextOffset = Number(page?.offset ?? movementOrdersNextOffset) + Number(page?.limit ?? items.length);
+  const merged = new Map(movementOrders.map(order => [Number(order.order_id), order]));
+  for (const order of items) merged.set(Number(order.order_id), order);
+  movementOrders = Array.from(merged.values()).sort((a, b) => {
+    const byDate = new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime();
+    return byDate || Number(b.order_id || 0) - Number(a.order_id || 0);
+  });
+  renderOrdersList();
+  updateOlderOrdersButton();
+}
+
 function renderOrdersList() {
   if (!ordersList) return;
   if (!movementOrders.length) {
@@ -7613,6 +8233,7 @@ function renderOrdersList() {
       selectedOrderId = Number(btn.dataset.orderId);
       renderOrdersList();
       renderSelectedOrderDetail(movementOrders.find(x => x.order_id === selectedOrderId) || null);
+      loadMovementOrderDetail(selectedOrderId).catch(err => { orderMsg.textContent = `No se pudo cargar el detalle: ${String(err)}`; });
     });
   });
   ordersList.querySelectorAll('[data-cancel-order-id]').forEach(btn => {
@@ -7622,6 +8243,7 @@ function renderOrdersList() {
       const order = movementOrders.find(x => x.order_id === selectedOrderId) || null;
       renderOrdersList();
       renderSelectedOrderDetail(order);
+      loadMovementOrderDetail(selectedOrderId).catch(err => { orderMsg.textContent = `No se pudo cargar el detalle: ${String(err)}`; });
       try {
         openHistoryUndoModal(order);
       } catch (err) {
@@ -7922,10 +8544,10 @@ async function runMonitorNow() {
 }
 
 
-async function loadMovementOrders(preferredOrderId = null, skipMonitor = false) {
+async function loadMovementOrders(preferredOrderId = null, skipMonitor = false, includeLocations = true) {
   const includeRobotMonitor = robotMonitorEnabled && !skipMonitor ? 1 : 0;
-  const snapshot = await fetchJson(`${API.runtimeSnapshot}?debug_limit=300&include_robot_monitor=${includeRobotMonitor}`, { cache: 'no-store' });
-  applyRuntimeSnapshotData(snapshot, preferredOrderId);
+  const snapshot = await fetchJson(`${API.runtimeSnapshot}?debug_limit=300&include_robot_monitor=${includeRobotMonitor}&include_locations=${includeLocations ? 1 : 0}`, { cache: 'no-store' });
+  applyRuntimeSnapshotData(snapshot, preferredOrderId, { preserveLocations: !includeLocations });
 }
 
 async function autoRefreshRuntimeSections(preferredOrderId = null) {
@@ -8305,8 +8927,8 @@ function renderOperatorCellOptions() {
 }
 
 function renderOperatorButtonCellLabels() {
-  const sourceLoc = operatorButtonSourceCell?.value ? locations.find(loc => loc && Number(loc.id) === Number(operatorButtonSourceCell.value)) : null;
-  const destLoc = operatorButtonDestinationCell?.value ? locations.find(loc => loc && Number(loc.id) === Number(operatorButtonDestinationCell.value)) : null;
+  const sourceLoc = operatorButtonSourceCell?.value ? locationById.get(Number(operatorButtonSourceCell.value)) : null;
+  const destLoc = operatorButtonDestinationCell?.value ? locationById.get(Number(operatorButtonDestinationCell.value)) : null;
   if (operatorButtonSourceCellLabel) operatorButtonSourceCellLabel.textContent = sourceLoc ? (sourceLoc.code ? `${sourceLoc.code} (${sourceLoc.x}, ${sourceLoc.y})` : `(${sourceLoc.x}, ${sourceLoc.y})`) : 'Haz clic en "Elegir en matriz"';
   if (operatorButtonDestinationCellLabel) operatorButtonDestinationCellLabel.textContent = destLoc ? (destLoc.code ? `${destLoc.code} (${destLoc.x}, ${destLoc.y})` : `(${destLoc.x}, ${destLoc.y})`) : 'Haz clic en "Elegir en matriz"';
 }
@@ -8316,10 +8938,10 @@ function actionModeLabel(mode) {
   return mode === 'fifo' ? 'Solicitud FIFO' : (mode === 'direct_move' ? 'Movimiento directo' : (mode === 'direct_move_config' ? 'Movimiento directo configurable' : (mode === 'point_to_area' ? 'Mover de punto a área' : (mode === 'cancel_return' ? 'Cancelar/devolver' : mode))));
 }
 
-function getLocationById(id) { return id ? locations.find(loc => loc && Number(loc.id) === Number(id)) : null; }
-function getRackById(id) { return id ? (catalog.racks || []).find(r => r && Number(r.id) === Number(id)) : null; }
+function getLocationById(id) { return id ? (locationById.get(Number(id)) || null) : null; }
+function getRackById(id) { return id ? (rackById.get(Number(id)) || null) : null; }
 function getMaterialById(id) { return id ? (catalog.materials || []).find(m => m && Number(m.id) === Number(id)) : null; }
-function getAreaById(id) { return id ? (catalog.areas || []).find(a => a && Number(a.id) === Number(id)) : null; }
+function getAreaById(id) { return id ? (areaById.get(Number(id)) || null) : null; }
 function getRackFromLocation(loc) { return loc && loc.rack_id ? getRackById(loc.rack_id) : null; }
 function syncCellReservationFromRackSelection() {
   if (!cellRack) return;
@@ -8916,19 +9538,25 @@ async function confirmOperatorActionModal() {
   }
 
   if (!activeOperatorWindow?.id || !operatorActionState.button) throw new Error('No hay acción seleccionada.');
+  const finishUiAction = beginDispatchUiAction('operator-window', btnOperatorActionConfirm, operatorActionModalMsg);
+  if (!finishUiAction) return;
   try {
-    await fetchJson(API.operatorWindowExecute(activeOperatorWindow.id, operatorActionState.button.button_index), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(operatorActionRequestBody()) });
-  } catch (err) {
-    await refreshAfterDispatchError();
-    throw err;
+    let result;
+    try {
+      result = await fetchJson(API.operatorWindowExecute(activeOperatorWindow.id, operatorActionState.button.button_index), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(operatorActionRequestBody()) });
+    } catch (err) {
+      await refreshAfterDispatchError();
+      throw err;
+    }
+    applyDispatchHttpResult(result);
+    closeOperatorActionModal();
+    clearOperatorActionPanel();
+    operatorWindowMsg.textContent = 'Tarea generada y aceptada por el RCS.';
+    recoverPostDispatchCoherence(result, operatorWindowMsg);
+    draw();
+  } finally {
+    finishUiAction();
   }
-  closeOperatorActionModal();
-  clearOperatorActionPanel();
-  operatorWindowMsg.textContent = 'Tarea generada y aceptada por el RCS.';
-  await loadLocations();
-  await loadCatalog();
-  await loadMovementOrders();
-  draw();
 }
 
 function getAreaByIdForCancel(id) {
@@ -9268,7 +9896,7 @@ btnAddFreeCell?.addEventListener("click", async () => {
       headers: { "Content-Type": "application/json", ...fetchHeaders() },
       body: JSON.stringify({ display_rows: GRID_H, display_cols: GRID_W }),
     });
-    locations[idx(loc.x, loc.y)] = loc;
+    upsertLocation(loc);
     if (mapLayoutModeSelect) {
       mapLayoutModeSelect.value = "free";
       mapLayoutMode = "free";
@@ -9536,6 +10164,10 @@ btnClearStatusQuery?.addEventListener("click", () => {
   orderMsg.textContent = 'Editor de consulta limpiado.';
 });
 btnRefreshOrders?.addEventListener("click", () => loadMovementOrders().catch(err => orderMsg.textContent = `Error: ${String(err)}`));
+btnLoadOlderOrders?.addEventListener("click", () => loadOlderMovementOrders().catch(err => {
+  updateOlderOrdersButton();
+  orderMsg.textContent = `Error cargando historial anterior: ${String(err)}`;
+}));
 btnSendStatusQuery?.addEventListener("click", () => runMonitorNow().catch(err => orderMsg.textContent = `Error: ${String(err)}`));
 btnRefreshOrderJson?.addEventListener("click", () => loadSelectedOrderJson().catch(err => orderMsg.textContent = `Error: ${String(err)}`));
 btnSaveOrderJson?.addEventListener("click", () => saveSelectedOrderJsonOverride().catch(err => orderMsg.textContent = `Error: ${String(err)}`));
@@ -9669,24 +10301,28 @@ if (operatorActionDynamicFields) operatorActionDynamicFields.addEventListener('i
     initRobotMonitorInteractions();
     resizeCanvasToContainer();
     await loadGridConfig();
-    await loadLocations();
-    await loadCatalog();
-    await loadScanQrScanners().catch(err => { if (scanQrMsg) scanQrMsg.textContent = `No se pudo cargar scanners: ${String(err)}`; });
-    await loadScanQrHistory({ quiet: true }).catch(err => { if (scanQrMsg) scanQrMsg.textContent = `No se pudo cargar historial QR: ${String(err)}`; });
-    await loadOperatorWindows();
-    await loadMovementOrders();
+    await Promise.all([
+      loadLocationsCached({ render: false }),
+      loadCatalog({ render: false }),
+      loadScanQrScanners().catch(err => { if (scanQrMsg) scanQrMsg.textContent = `No se pudo cargar scanners: ${String(err)}`; }),
+      loadScanQrHistory({ quiet: true }).catch(err => { if (scanQrMsg) scanQrMsg.textContent = `No se pudo cargar historial QR: ${String(err)}`; }),
+      loadOperatorWindows(),
+      refreshBackground({ draw: false }),
+      loadPublicRcsMonitorConfig(),
+    ]);
+    rebuildCatalogIndexes();
+    renderLoadedLocationAndCatalogData();
+    await loadMovementOrders(null, false, false);
     if (runtimeAutoRefreshHandle) clearInterval(runtimeAutoRefreshHandle);
     runtimeAutoRefreshHandle = null;
     connectRuntimeSocket();
     fitMapToScreen();
-    await refreshBackground();
-    await loadPublicRcsMonitorConfig();
-    if (robotMonitorEnabled) {
-      await refreshRobotMonitor({ force: true });
-    }
     clearAreaForm(); clearMaterialForm(); clearRackForm();
     await selectCell(0, 0);
     draw();
+    if (robotMonitorEnabled) {
+      window.setTimeout(() => { refreshRobotMonitor({ force: false }).catch(() => {}); }, 0);
+    }
   } catch (err) {
     setConn("Error de conexión");
     alert(`No se pudo iniciar la app: ${String(err)}`);
