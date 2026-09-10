@@ -3,6 +3,11 @@ from __future__ import annotations
 import json
 import re
 import time
+import hashlib
+import os
+import tempfile
+from contextlib import contextmanager
+from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional
 from uuid import uuid4
@@ -2899,6 +2904,18 @@ def _save_execute_rejected_event(db, *, scanner_code, qr_value, created_by=None,
 
 
 def preview_scan(db, scanner_code, qr_value, created_by=None, terminal=None):
+    previous = db.info.get("qr_preview_read_only")
+    db.info["qr_preview_read_only"] = True
+    try:
+        return _preview_scan_read_only(db, scanner_code, qr_value, created_by, terminal)
+    finally:
+        if previous is None:
+            db.info.pop("qr_preview_read_only", None)
+        else:
+            db.info["qr_preview_read_only"] = previous
+
+
+def _preview_scan_read_only(db, scanner_code, qr_value, created_by=None, terminal=None):
     execution_id = _new_qr_execution_id()
     started_at = time.perf_counter()
     preflight_started_at = None
@@ -3041,7 +3058,63 @@ def preview_scan(db, scanner_code, qr_value, created_by=None, terminal=None):
         return result
 
 
+@contextmanager
+def _scan_execution_lock(db, scanner_code, qr_value):
+    """Host-wide lock held through success-event commit, across threads/workers.
+
+    OS releases the lock on process exit. Files are never unlinked while another
+    worker could hold an open handle; only their byte-range lock is significant.
+    """
+    bind = db.get_bind()
+    database = bind.url.database
+    identity = os.path.normcase(str(Path(database).resolve())) if database and database != ":memory:" else str(id(bind))
+    key = hashlib.sha256(json.dumps([identity, str(scanner_code or "").strip(), normalize_qr_value(qr_value)]).encode()).hexdigest()
+    directory = Path(tempfile.gettempdir()) / "despacho-amr-qr-locks"
+    directory.mkdir(exist_ok=True)
+    with (directory / key).open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        acquired = False
+        try:
+            if os.name == "nt":
+                import msvcrt
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    acquired = True
+                except OSError as exc:
+                    if exc.errno not in (13, 11, 36):
+                        raise
+            else:
+                import fcntl
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                except BlockingIOError:
+                    pass
+            yield acquired
+        finally:
+            if acquired:
+                handle.seek(0)
+                if os.name == "nt":
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def execute_scan(db, scanner_code, qr_value, created_by=None, terminal=None, dispatch_func=None, rollback_func=None, audit_rack_func=None):
+    with _scan_execution_lock(db, scanner_code, qr_value) as acquired:
+        if not acquired:
+            return {"ok": False, "mode": "execute", "status": "duplicate", "error_code": "DUPLICATE_SCAN",
+                    "scanner": {"scanner_code": str(scanner_code or "").strip()}, "qr": {"qr_value": normalize_qr_value(qr_value)},
+                    "scanner_code": str(scanner_code or "").strip(), "qr_value": normalize_qr_value(qr_value),
+                    "message": "Este scanner/QR ya tiene una ejecución en curso. No se creó otra orden."}
+        return _execute_scan_locked(db, scanner_code, qr_value, created_by, terminal, dispatch_func, rollback_func, audit_rack_func)
+
+
+def _execute_scan_locked(db, scanner_code, qr_value, created_by=None, terminal=None, dispatch_func=None, rollback_func=None, audit_rack_func=None):
     execution_id = _new_qr_execution_id()
     started_at = time.perf_counter()
     preflight_started_at = None
@@ -3696,13 +3769,13 @@ def terminal_preview_scan(db, terminal_code, qr_value, mode="preview", api_key=N
     if requested_mode not in {"preview", "execute"}:
         raise ScanPreviewError("mode invalido. Solo preview esta habilitado.", "rejected")
     terminal, station = resolve_scan_terminal(db, terminal_code, api_key)
-    terminal.last_seen_at = datetime.utcnow()
-    terminal.last_ip = (str(client_ip or "").strip() or None)
-    terminal.updated_at = datetime.utcnow()
-    db.add(terminal)
-    db.commit()
-    db.refresh(terminal)
     if requested_mode == "execute":
+        terminal.last_seen_at = datetime.utcnow()
+        terminal.last_ip = (str(client_ip or "").strip() or None)
+        terminal.updated_at = datetime.utcnow()
+        db.add(terminal)
+        db.commit()
+        db.refresh(terminal)
         if str(terminal.mode or "preview").strip().lower() != "execute" or int(terminal.allow_execute or 0) != 1:
             normalized_qr = normalize_qr_value(qr_value)
             return _save_execute_rejected_event(db, scanner_code=station.scanner_code, qr_value=normalized_qr, created_by=terminal.terminal_code, station=station, terminal=terminal, message="El terminal no esta habilitado para ejecucion.")

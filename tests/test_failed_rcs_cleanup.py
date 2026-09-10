@@ -1,4 +1,5 @@
 import unittest
+import json
 from datetime import datetime, timedelta
 
 from sqlalchemy import create_engine
@@ -57,6 +58,9 @@ class FailedRcsCleanupTests(unittest.TestCase):
             rcs_status=rcs_status,
             dispatch_status="success",
             remote_task_code=f"RCS-{rack_code}",
+            status_query_checked_at=self.now,
+            status_query_request_json=json.dumps({"taskCodes": [f"RCS-{rack_code}"]}),
+            status_query_response_json=json.dumps({"code": 0, "taskCode": f"RCS-{rack_code}", "taskStatus": rcs_status}),
             created_at=self.now - timedelta(minutes=60),
             updated_at=self.now - timedelta(minutes=60),
         )
@@ -156,6 +160,10 @@ class FailedRcsCleanupTests(unittest.TestCase):
             destination_cell_id=2,
             status="dispatched",
             rcs_status="failed",
+            remote_task_code="RCS-NO-RACK",
+            status_query_checked_at=self.now,
+            status_query_request_json=json.dumps({"taskCodes": ["RCS-NO-RACK"]}),
+            status_query_response_json=json.dumps({"code": 0, "taskCode": "RCS-NO-RACK", "taskStatus": "failed"}),
             created_at=self.now - timedelta(minutes=60),
         )
         eligible, _ = main._validate_cleanup_order_eligible(self.db, order, now=self.now, min_age_minutes=30)

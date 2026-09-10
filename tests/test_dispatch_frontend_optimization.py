@@ -135,7 +135,7 @@ async function loadMovementOrders() {{ loads += 1; }}
 """)
 
     def test_http_first_and_websocket_first_are_idempotent_dynamically(self):
-        upsert = self.source[self.source.index("function applyOrderUpdated"):self.source.index("function applyOrderDeleted")]
+        upsert = self.source[self.source.index("function entityUpdateIsOlder"):self.source.index("function applyOrderDeleted")]
         self._run_node(f"""
 const assert = require('assert');
 let movementOrders = [], movementOrdersTotal = 0; const movementOrderDetailCache = new Map();

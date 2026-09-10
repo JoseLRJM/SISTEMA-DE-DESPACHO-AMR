@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+import secrets
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -9,26 +10,26 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from urllib3.exceptions import ConnectTimeoutError, MaxRetryError, ProxyError
 from urllib.parse import urlsplit, urlunsplit
 
 from logging_config import get_logger
+from rcs_observability import sanitize, sanitize_text, audited_post, record_attempt, observe_prepared_request
 
 logger = get_logger("app.rcs_client")
 
 
+def generate_request_code() -> str:
+    """Opaque 80-bit identity (20 chars), within the RCS String(32) contract.
+
+    OS randomness avoids shared clocks/counters across threads, workers and restarts.
+    Call once per logical request, never inside the HTTP retry loop.
+    """
+    return secrets.token_hex(10)
+
+
 def _safe_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    safe = {}
-    for key, value in dict(payload or {}).items():
-        key_text = str(key or "").strip().lower()
-        if (key_text == "key" or any(fragment in key_text for fragment in ("password", "token", "authorization", "auth_header", "secret", "api_key", "apikey"))) and value:
-            safe[key] = "[REDACTED]"
-        elif isinstance(value, dict):
-            safe[key] = _safe_payload(value)
-        elif isinstance(value, list):
-            safe[key] = [_safe_payload(item) if isinstance(item, dict) else item for item in value]
-        else:
-            safe[key] = value
-    return safe
+    return sanitize(payload)
 
 
 def _payload_context(payload: Dict[str, Any]) -> Dict[str, str]:
@@ -60,11 +61,13 @@ def _log_empty_data(action: str, endpoint: str, payload: Dict[str, Any], data: D
 
 
 class RcsError(Exception):
-    pass
+    def __init__(self, message):
+        super().__init__(sanitize_text(message))
 
 
 class RcsHttpError(RcsError):
     def __init__(self, status_code: int, body: str):
+        body = sanitize_text(body)
         super().__init__(f"HTTP {status_code}: {body[:500]}")
         self.status_code = status_code
         self.body = body
@@ -76,6 +79,47 @@ class RcsParseError(RcsError):
 
 class RcsTimeoutError(RcsError):
     pass
+
+
+class RcsNotSentError(RcsError):
+    """All attempts failed before a connection could carry the creation POST."""
+
+
+def _connection_establishment_error(error) -> bool:
+    if isinstance(error, ProxyError):
+        error = error.original_error
+    # NewConnectionError (including refused/unreachable/DNS) subclasses this.
+    return isinstance(error, ConnectTimeoutError)
+
+
+class _DeliveryAwareRetry(Retry):
+    def increment(self, method=None, url=None, response=None, error=None, _pool=None, _stacktrace=None):
+        record_attempt(response=response, error=error)
+        try:
+            return super().increment(method, url, response, error, _pool, _stacktrace)
+        except MaxRetryError as exc:
+            # The final connect failure alone cannot exonerate earlier attempts.
+            exc.rcs_all_attempts_not_sent = (
+                response is None and _connection_establishment_error(error)
+                and all(item.status is None and not item.redirect_location
+                        and _connection_establishment_error(item.error) for item in self.history)
+            )
+            raise
+
+
+class _AuditHTTPAdapter(HTTPAdapter):
+    def send(self, request, **kwargs):
+        observe_prepared_request(request)
+        return super().send(request, **kwargs)
+
+
+def _confirmed_not_sent(error) -> bool:
+    wrapped = next((item for item in error.args if isinstance(item, MaxRetryError)), None)
+    if wrapped is not None:
+        return getattr(wrapped, "rcs_all_attempts_not_sent", False) is True
+    # requests documents this specific exception as safe to retry. Generic
+    # Timeout/ConnectionError/ProtocolError offer no equivalent proof.
+    return isinstance(error, requests.ConnectTimeout)
 
 
 @dataclass
@@ -239,8 +283,6 @@ def _extract_task_status_items(data: Dict[str, Any], payload: Dict[str, Any]) ->
             or ""
         ).strip()
         agv_code = str(candidate.get("agvCode") or candidate.get("robotCode") or "").strip()
-        if not task_code and len(requested_codes) == 1:
-            task_code = requested_codes[0]
         if task_code or task_status:
             items.append({
                 "taskCode": task_code,
@@ -250,15 +292,8 @@ def _extract_task_status_items(data: Dict[str, Any], payload: Dict[str, Any]) ->
                 "raw": candidate,
             })
 
-    if not items and requested_codes:
-        for code in requested_codes:
-            items.append({
-                "taskCode": code,
-                "taskStatus": str(data.get("taskStatus") or data.get("status") or "").strip(),
-                "agvCode": str(data.get("agvCode") or "").strip(),
-                "message": str(data.get("message") or ""),
-                "raw": data,
-            })
+    # No configured endpoint contract guarantees an identity-free status. Never
+    # manufacture the requested taskCode: the monitor must see remote evidence.
     return items
 
 
@@ -288,7 +323,7 @@ class RcsClient:
         })
         if default_headers:
             self.session.headers.update(default_headers)
-        retry = Retry(
+        retry = _DeliveryAwareRetry(
             total=max_retries,
             connect=max_retries,
             read=max_retries,
@@ -298,7 +333,7 @@ class RcsClient:
             allowed_methods=frozenset(["GET", "POST", "PUT", "DELETE", "PATCH"]),
             raise_on_status=False,
         )
-        adapter = HTTPAdapter(max_retries=retry)
+        adapter = _AuditHTTPAdapter(max_retries=retry)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
 
@@ -341,8 +376,7 @@ class RcsClient:
             context["mapShortName"] or "-",
         )
         try:
-            resp = self.session.post(
-                url,
+            resp = audited_post(self.session, url, operation="query",
                 data=json.dumps(payload),
                 headers=headers,
                 timeout=self.timeout,
@@ -355,7 +389,7 @@ class RcsClient:
             logger.warning("RCS request network error | endpoint=%s | robot=%s | task=%s | error=%s", endpoint, context["robot"] or "-", context["task"] or "-", e)
             raise RcsError(f"Error de red enviando JSON al RCS: {e}") from e
         if not (200 <= resp.status_code < 300):
-            logger.warning("RCS request http error | endpoint=%s | status=%s | body=%s", endpoint, resp.status_code, resp.text[:500])
+            logger.warning("RCS request http error | endpoint=%s | status=%s | body=%s", endpoint, resp.status_code, sanitize_text(resp.text)[:500])
             raise RcsHttpError(resp.status_code, resp.text)
         data = self._safe_json(resp)
         logger.info("RCS request success | endpoint=%s | robot=%s | task=%s | status=%s | response_code=%s", endpoint, context["robot"] or "-", context["task"] or "-", resp.status_code, _response_code(data) or "-")
@@ -369,8 +403,7 @@ class RcsClient:
         context = _payload_context(payload)
         logger.info("RCS queryAgvStatus request endpoint=%s robot=%s mapCode=%s mapShortName=%s payload=%s", endpoint, context["robot"] or "-", context["mapCode"] or "-", context["mapShortName"] or "-", _safe_payload(payload))
         try:
-            resp = self.session.post(
-                url,
+            resp = audited_post(self.session, url, operation="query",
                 data=json.dumps(payload),
                 headers=headers,
                 timeout=self.timeout,
@@ -384,7 +417,7 @@ class RcsClient:
             raise RcsError(f"Error de red consultando estado de AGV en el RCS: {e}") from e
         logger.info("RCS queryAgvStatus response endpoint=%s status=%s", endpoint, resp.status_code)
         if not (200 <= resp.status_code < 300):
-            logger.warning("RCS queryAgvStatus http error endpoint=%s status=%s body=%s", endpoint, resp.status_code, resp.text[:500])
+            logger.warning("RCS queryAgvStatus http error endpoint=%s status=%s body=%s", endpoint, resp.status_code, sanitize_text(resp.text)[:500])
             raise RcsHttpError(resp.status_code, resp.text)
         data = self._safe_json(resp)
         _log_empty_data("queryAgvStatus", endpoint, payload, data)
@@ -400,13 +433,23 @@ class RcsClient:
         context = _payload_context(payload)
         logger.info("RCS cancelTask request | endpoint=%s | robot=%s | task=%s | forceCancel=%s", endpoint, context["robot"] or "-", context["task"] or "-", payload.get("forceCancel", "-"))
         try:
-            resp = self.session.post(
-                url,
-                data=json.dumps(payload),
-                headers=headers,
-                timeout=self.timeout,
-                verify=self.verify_tls,
-            )
+            # cancelTask (including internal return) must not be replayed by the
+            # shared POST retry adapter or by a 307/308 redirect. Creation keeps
+            # its existing retry policy and Q1 semantics unchanged.
+            with requests.Session() as cancel_session:
+                cancel_session.mount("http://", _AuditHTTPAdapter())
+                cancel_session.mount("https://", _AuditHTTPAdapter())
+                cancel_session.headers.update(self.session.headers)
+                cancel_session.auth = self.session.auth
+                cancel_session.cookies.update(self.session.cookies)
+                cancel_session.proxies.update(self.session.proxies)
+                cancel_session.trust_env = self.session.trust_env
+                cancel_session.cert = self.session.cert
+                resp = audited_post(cancel_session, url, operation="cancel",
+                    data=json.dumps(payload), headers=headers,
+                    timeout=self.timeout, verify=self.verify_tls,
+                    allow_redirects=False,
+                )
         except requests.Timeout as e:
             logger.warning("RCS cancelTask timeout | endpoint=%s | robot=%s | task=%s", endpoint, context["robot"] or "-", context["task"] or "-")
             raise RcsTimeoutError("Timeout cancelando tarea en el RCS") from e
@@ -414,12 +457,16 @@ class RcsClient:
             logger.warning("RCS cancelTask network error | endpoint=%s | robot=%s | task=%s | error=%s", endpoint, context["robot"] or "-", context["task"] or "-", e)
             raise RcsError(f"Error de red cancelando tarea en el RCS: {e}") from e
         if not (200 <= resp.status_code < 300):
-            logger.warning("RCS cancelTask http error | endpoint=%s | status=%s | body=%s", endpoint, resp.status_code, resp.text[:500])
+            logger.warning("RCS cancelTask http error | endpoint=%s | status=%s | body=%s", endpoint, resp.status_code, sanitize_text(resp.text)[:500])
             raise RcsHttpError(resp.status_code, resp.text)
         data = self._safe_json(resp)
         _log_empty_data("cancelTask", endpoint, payload, data)
         logger.info("RCS request success | endpoint=%s | robot=%s | task=%s | status=%s | response_code=%s", endpoint, context["robot"] or "-", context["task"] or "-", resp.status_code, _response_code(data) or "-")
         try:
+            if not isinstance(data, dict) or "code" not in data:
+                raise ValueError("cancelTask sin código de resultado explícito")
+            if data.get("reqCode") and str(data["reqCode"]) != str(payload.get("reqCode", "")):
+                raise ValueError("cancelTask reqCode no coincide con la solicitud")
             return RcsSimpleResponse(
                 code=int(data.get("code", 0)),
                 message=str(data.get("message", "")),
@@ -432,7 +479,7 @@ class RcsClient:
 
     def cancel_task(self, task_code: str = "", agv_code: str = "", req_code: str = "", token_code: str = "", client_code: str = "", force_cancel: str = "0", matter_area: str = "") -> RcsSimpleResponse:
         payload = {
-            "reqCode": req_code or datetime.now().strftime("%Y%m%d%H%M%S%f")[:-3],
+            "reqCode": req_code or generate_request_code(),
             "reqTime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "clientCode": client_code or "",
             "tokenCode": token_code or "",
@@ -450,8 +497,7 @@ class RcsClient:
         context = _payload_context(payload)
         logger.info("RCS queryTaskStatus request | endpoint=%s | robot=%s | task=%s", endpoint, context["robot"] or "-", context["task"] or "-")
         try:
-            resp = self.session.post(
-                url,
+            resp = audited_post(self.session, url, operation="query",
                 data=json.dumps(payload),
                 headers=headers,
                 timeout=self.timeout,
@@ -464,7 +510,7 @@ class RcsClient:
             logger.warning("RCS queryTaskStatus network error | endpoint=%s | task=%s | error=%s", endpoint, context["task"] or "-", e)
             raise RcsError(f"Error de red consultando estado de tarea en el RCS: {e}") from e
         if not (200 <= resp.status_code < 300):
-            logger.warning("RCS queryTaskStatus http error | endpoint=%s | status=%s | body=%s", endpoint, resp.status_code, resp.text[:500])
+            logger.warning("RCS queryTaskStatus http error | endpoint=%s | status=%s | body=%s", endpoint, resp.status_code, sanitize_text(resp.text)[:500])
             raise RcsHttpError(resp.status_code, resp.text)
         data = self._safe_json(resp)
         _log_empty_data("queryTaskStatus", endpoint, payload, data)
@@ -493,7 +539,7 @@ class RcsClient:
 
     def query_task_status(self, task_code: str, req_code: str = "", token_code: str = "", client_code: str = "") -> RcsTaskStatusResponse:
         payload = {
-            "reqCode": req_code or uuid.uuid4().hex[:16],
+            "reqCode": req_code or generate_request_code(),
             "taskCodes": [task_code],
         }
         if client_code:
@@ -508,31 +554,47 @@ class RcsClient:
         payload = task.to_payload()
         endpoint = self.endpoint_create_task
         context = _payload_context(payload)
+        responses_seen = []
+        def observe_response(response, *args, **kwargs):
+            # requests handles redirects outside urllib3's individual retry history.
+            responses_seen.append(response.status_code)
+            return response
         logger.info("RCS createTask request | endpoint=%s | robot=%s | task=%s | mapCode=%s | mapShortName=%s", endpoint, context["robot"] or "-", context["task"] or "-", context["mapCode"] or "-", context["mapShortName"] or "-")
         try:
-            resp = self.session.post(
-                url,
+            resp = audited_post(self.session, url, operation="create",
                 data=json.dumps(payload),
                 headers=headers,
                 timeout=self.timeout,
                 verify=self.verify_tls,
+                hooks={"response": observe_response},
             )
         except requests.Timeout as e:
+            if not responses_seen and _confirmed_not_sent(e):
+                raise RcsNotSentError(f"No se pudo establecer conexión con RCS; tarea no enviada: {e}") from e
             logger.warning("RCS createTask timeout | endpoint=%s | robot=%s | task=%s", endpoint, context["robot"] or "-", context["task"] or "-")
             raise RcsTimeoutError("Timeout enviando tarea al RCS") from e
         except requests.RequestException as e:
+            if not responses_seen and _confirmed_not_sent(e):
+                raise RcsNotSentError(f"No se pudo establecer conexión con RCS; tarea no enviada: {e}") from e
             logger.warning("RCS createTask network error | endpoint=%s | robot=%s | task=%s | error=%s", endpoint, context["robot"] or "-", context["task"] or "-", e)
             raise RcsError(f"Error de red enviando tarea al RCS: {e}") from e
         if not (200 <= resp.status_code < 300):
-            logger.warning("RCS createTask http error | endpoint=%s | status=%s | body=%s", endpoint, resp.status_code, resp.text[:500])
+            logger.warning("RCS createTask http error | endpoint=%s | status=%s | body=%s", endpoint, resp.status_code, sanitize_text(resp.text)[:500])
             raise RcsHttpError(resp.status_code, resp.text)
         data = self._safe_json(resp)
         _log_empty_data("createTask", endpoint, payload, data)
         try:
-            task_code = str(data.get("taskCode") or data.get("taskcode") or data.get("task_code") or "").strip()
-            data_value = str(data.get("data", "") or "").strip()
+            task_identity = data.get("taskCode") or data.get("taskcode") or data.get("task_code")
+            task_code = task_identity.strip() if isinstance(task_identity, str) else ""
+            remote_data = data.get("data")
+            if isinstance(remote_data, dict):
+                remote_data = remote_data.get("taskCode") or remote_data.get("taskcode") or remote_data.get("task_code")
+            data_value = remote_data.strip() if isinstance(remote_data, str) else ""
             if not data_value and task_code:
                 data_value = task_code
+            elif task_code and data_value != task_code:
+                # Conflicting identities cannot safely identify the created task.
+                data_value = ""
             logger.info("RCS request success | endpoint=%s | robot=%s | task=%s | status=%s | response_code=%s | remote_task_code=%s", endpoint, context["robot"] or "-", context["task"] or "-", resp.status_code, _response_code(data) or "-", data_value or "-")
             return RcsTaskResponse(
                 code=int(data.get("code", 0)),
@@ -550,7 +612,7 @@ class RcsClient:
         try:
             j = resp.json()
         except ValueError as e:
-            raise RcsParseError(f"Respuesta no es JSON. body={resp.text[:500]}") from e
+            raise RcsParseError(f"Respuesta no es JSON. body={sanitize_text(resp.text)[:500]}") from e
         if not isinstance(j, dict):
             return {"data": j}
         return j

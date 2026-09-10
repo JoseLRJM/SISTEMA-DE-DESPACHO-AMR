@@ -30,16 +30,18 @@ from fastapi import FastAPI, File, Header, HTTPException, Query, Request, Respon
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select, func, delete, text, or_, event
+from sqlalchemy import select, func, delete, text, or_, event, update
 
 from logging_config import ensure_log_file, get_logger
+from rcs_observability import sanitize, sanitize_text, sensitive_key, trace_call, protect_payload, unprotect_payload, restore_redactions, install_persistence_sanitizer
+install_persistence_sanitizer()
 from db_diagnostics import EXPECTED_INDEXES, check_expected_indexes, open_read_only
 from performance_observability import metrics as performance_metrics
-from rcs_client import RcsClient, RcsError, RcsSimpleResponse, RcsTaskRequest, RcsTaskResponse, RcsTaskStatusResponse
-from monitor_service import TaskMonitor, build_auto_status_query_payload, generate_req_code_ms, apply_remote_status_to_order, _normalize_remote_status, _single_task_response_item, _task_code_from_error_message
-from scanner_service import ScanPreviewError, execute_scan, preview_scan, resolve_cancel_return_target, resolve_scan_terminal, terminal_preview_scan
+from rcs_client import RcsClient, RcsError, RcsNotSentError, RcsSimpleResponse, RcsTaskRequest, RcsTaskResponse, RcsTaskStatusResponse
+from monitor_service import TaskMonitor, build_auto_status_query_payload, generate_req_code_ms, apply_remote_status_to_order, _normalize_remote_status, _single_task_response_item, _task_code_from_error_message, local_reconciliation_pending, TERMINAL_LOCAL_STATUSES
+from scanner_service import ScanPreviewError, execute_scan, preview_scan, resolve_cancel_return_target, resolve_scan_terminal, terminal_preview_scan, _rule_matches, normalize_qr_value
 from qr_transition_service import apply_transition_for_completed_order, diagnose_transition_rule_payload, enforce_transition_rule_diagnostics, preview_transition_for_order, transition_match_metadata, transition_match_tier, transition_selection_reason, transition_specificity, validate_transition_rule_payload
-from fifo_chain_service import set_fifo_chain_default_dispatch_func
+from fifo_chain_service import set_fifo_chain_default_dispatch_func, recover_fifo_chains, stop_fifo_chain
 
 from fifo_service import (
     build_fifo_preview_payload,
@@ -623,6 +625,11 @@ class CleanupSelectionIn(BaseModel):
     rack_ids: List[int] = Field(default_factory=list)
     confirm_local_only: bool = False
     reason: Optional[str] = Field(default=None, max_length=256)
+
+
+class SimulateCompleteIn(BaseModel):
+    confirm_simulation: bool = False
+    reason: str = Field(default="", max_length=256)
 
 
 class RepairInconsistentLocationsIn(BaseModel):
@@ -1827,6 +1834,7 @@ class ScanTerminalConfigOut(BaseModel):
 
 
 class MovementOrderOut(BaseModel):
+    updated_at: Optional[datetime] = None
     order_id: int
     order_code: str
     order_type: str
@@ -1887,6 +1895,7 @@ class MovementOrderOut(BaseModel):
 
 
 class MovementOrderSummaryOut(BaseModel):
+    updated_at: Optional[datetime] = None
     order_id: int
     order_code: str
     order_type: str
@@ -2069,6 +2078,12 @@ def _audit_config_change(
     related_order_id = related_order_id if related_order_id is not None else context.get("related_order_id")
     related_qr_rule_id = related_qr_rule_id if related_qr_rule_id is not None else context.get("related_qr_rule_id")
     note = note if note is not None else context.get("note")
+    if sensitive_key(record_key) or sensitive_key(field_name):
+        sanitize({"secret": [old_value, new_value]})
+        old_value = "[REDACTED]" if old_value else old_value
+        new_value = "[REDACTED]" if new_value else new_value
+    else:
+        old_value, new_value = sanitize(old_value), sanitize(new_value)
     logger.info(
         "CONFIG_CHANGE table=%s key=%s field=%s old=%r new=%r source=%s endpoint=%s client_ip=%s request_id=%s related_order_id=%s related_qr_rule_id=%s note=%s",
         table_name,
@@ -2970,6 +2985,20 @@ def _apply_action_custom_fields_to_rack(rack: Rack, custom_rows: list) -> None:
             rack.quantity = rack.quantity or 0
 
 
+def _apply_pending_point_inventory(db, order):
+    changes = getattr(order, "_pending_point_inventory", None)
+    if changes is None:
+        return
+    rack = db.get(Rack, order.rack_id)
+    for name, value in changes.items():
+        setattr(rack, name, value)
+    rack.updated_at = datetime.utcnow()
+    order.material_group_id = rack.material_group_id
+    db.add(rack)
+    _append_status_query_log(db, order, kind="point_inventory_applied", request_payload=None,
+                             response_payload=changes, message="Inventario confirmado junto con aceptación RCS")
+
+
 def _rack_reservation_order(db, rack_id: Optional[int]):
     if not rack_id:
         return None
@@ -3289,6 +3318,7 @@ def _movement_order_out(
         except Exception:
             route_points = None
     return MovementOrderOut(
+        updated_at=row.updated_at,
         order_id=row.id,
         order_code=row.order_code,
         order_type=row.order_type,
@@ -3317,7 +3347,7 @@ def _movement_order_out(
         remote_task_code=row.remote_task_code,
         req_code=row.req_code,
         rcs_status=row.rcs_status,
-        rcs_message=row.rcs_message,
+        rcs_message=sanitize(row.rcs_message),
         cancel_source=row.cancel_source,
         cancel_reason=row.cancel_reason,
         closed_by=row.closed_by,
@@ -3327,9 +3357,9 @@ def _movement_order_out(
         rcs_last_update=row.rcs_last_update,
         status_query_checked_at=row.status_query_checked_at,
         rcs_status_changed_at=getattr(row, "rcs_status_changed_at", None),
-        status_query_request_payload=_safe_json_loads(row.status_query_request_json),
-        status_query_response_payload=_safe_json_loads(row.status_query_response_json),
-        status_query_log_entries=_safe_json_loads_any(row.status_query_log_json) or [],
+        status_query_request_payload=sanitize(_safe_json_loads(row.status_query_request_json)),
+        status_query_response_payload=sanitize(_safe_json_loads(row.status_query_response_json)),
+        status_query_log_entries=sanitize(_safe_json_loads_any(row.status_query_log_json) or []),
         route_mode=_normalize_route_mode(getattr(row, "route_mode", None)),
         route_points=route_points,
         trmx_group_id=getattr(row, "trmx_group_id", None),
@@ -3398,10 +3428,10 @@ def _movement_order_detail_out(db, row: MovementOrder) -> MovementOrderDetailOut
     base = _movement_order_out_read_optimized(db, row).model_dump()
     return MovementOrderDetailOut(
         **base,
-        dispatch_request_payload=_safe_json_loads(row.dispatch_request_json),
-        dispatch_response_payload=_safe_json_loads(row.dispatch_response_json),
-        rcs_response_payload=_safe_json_loads(row.rcs_response_json),
-        override_payload=_safe_json_loads(row.override_payload_json),
+        dispatch_request_payload=sanitize(_safe_json_loads(row.dispatch_request_json)),
+        dispatch_response_payload=sanitize(_safe_json_loads(row.dispatch_response_json)),
+        rcs_response_payload=sanitize(_safe_json_loads(row.rcs_response_json)),
+        override_payload=sanitize(unprotect_payload(row.override_payload_json)) if row.override_payload_json else None,
     )
 
 
@@ -4464,6 +4494,29 @@ def _validate_scanner_station_body(db, body: ScannerStationIn) -> tuple[str, str
     return station_type, default_action
 
 
+def _validate_qr_rule_unique(db, body, *, existing=None):
+    """The resolver's namespace is global, active and case-sensitive, not per scanner."""
+    if int(body.is_active or 0) != 1:
+        return
+    value = body.qr_value.strip()
+    match_type = (body.match_type or "exact").strip().lower()
+    # Keep historical ambiguities editable without silently creating new ones.
+    if existing is not None and int(existing.is_active or 0) == 1 and (
+        existing.qr_value == value and (existing.match_type or "exact").strip().lower() == match_type
+    ):
+        return
+    # SQLite writer arbitration makes validation + save atomic across requests.
+    db.execute(update(QrActionRule).where(QrActionRule.id == -1).values(updated_at=QrActionRule.updated_at))
+    rows = db.execute(select(QrActionRule).where(QrActionRule.is_active == 1, QrActionRule.qr_value == value)).scalars().all()
+    for row in rows:
+        if existing is not None and row.id == existing.id:
+            continue
+        if (row.match_type or "exact").strip().lower() == match_type or (
+            _rule_matches(row, normalize_qr_value(value)) and _rule_matches(body, normalize_qr_value(value))
+        ):
+            raise HTTPException(status_code=409, detail=f"Código QR duplicado: ya existe la regla activa {row.id} con el mismo valor y coincidencia operativa.")
+
+
 def _validate_qr_action_rule_body(db, body: QrActionRuleIn) -> tuple[str, str, str]:
     qr_type = _validate_choice(body.qr_type, VALID_QR_TYPES, "qr_type")
     match_type = _validate_choice(body.match_type, VALID_QR_MATCH_TYPES, "match_type")
@@ -4543,22 +4596,11 @@ _LOG_SENSITIVE_KEYWORDS = ("password", "token", "authorization", "auth_header", 
 
 
 def _is_log_sensitive_key(key: str) -> bool:
-    text = str(key or "").strip().lower()
-    return text == "key" or any(fragment in text for fragment in _LOG_SENSITIVE_KEYWORDS)
+    return sensitive_key(key)
 
 
 def _sanitize_log_payload(value):
-    if isinstance(value, dict):
-        sanitized = {}
-        for key, item in value.items():
-            if _is_log_sensitive_key(str(key or "")):
-                sanitized[key] = "[REDACTED]" if item not in (None, "") else item
-            else:
-                sanitized[key] = _sanitize_log_payload(item)
-        return sanitized
-    if isinstance(value, list):
-        return [_sanitize_log_payload(item) for item in value]
-    return value
+    return sanitize(value)
 
 
 def _append_status_query_log(db, row: MovementOrder, *, kind: str, request_payload: Optional[dict], response_payload, message: str = "", arrived_at: Optional[datetime] = None):
@@ -4569,11 +4611,17 @@ def _append_status_query_log(db, row: MovementOrder, *, kind: str, request_paylo
     logs.append({
         "kind": kind,
         "arrived_at": when.isoformat(),
-        "message": message or "",
+        "message": sanitize_text(message or ""),
         "request": _sanitize_log_payload(request_payload),
         "response": _sanitize_log_payload(response_payload),
+        "movement_order_id": row.id, "q1": row.req_code, "t1": row.remote_task_code,
+        "transport": getattr(row, "_rcs_audit_events", []),
     })
-    row.status_query_log_json = json.dumps(logs[-200:], ensure_ascii=False)
+    row._rcs_audit_events = []
+    lifecycle = [item for item in logs if item.get("kind") in {"create_task", "create_task_requested", "cancel_task", "cancel_task_requested"}][:20]
+    recent = [item for item in logs if item not in lifecycle][-180:]
+    logs = lifecycle + recent
+    row.status_query_log_json = json.dumps(sanitize(logs), ensure_ascii=False)
     row.updated_at = when
     db.add(row)
     return logs[-200:]
@@ -4600,7 +4648,7 @@ def _append_debug_console_event(db, *, direction: str, module: str, base_url: st
     if auto_commit:
         db.commit()
 
-    max_console_events = 20
+    max_console_events = 1000
     if not auto_commit:
         db.flush()
     total_events = db.execute(select(func.count()).select_from(DebugConsoleEvent)).scalar_one() or 0
@@ -4623,10 +4671,10 @@ def _debug_console_event_out(row: DebugConsoleEvent) -> DebugConsoleEventOut:
         id=row.id,
         direction=row.direction or "sent",
         module=row.module or "unknown",
-        base_url=row.base_url,
-        endpoint=row.endpoint,
-        payload=_safe_json_loads_any(row.payload_json),
-        message=row.message,
+        base_url=sanitize(row.base_url),
+        endpoint=sanitize(row.endpoint),
+        payload=sanitize(_safe_json_loads_any(row.payload_json)),
+        message=sanitize(row.message),
         created_at=row.created_at,
     )
 
@@ -4637,7 +4685,7 @@ def _active_orders_for_rack(db, rack_id: Optional[int], *, exclude_order_id: Opt
     if not rack_id:
         return []
     stmt = select(MovementOrder).where(
-        MovementOrder.rack_id == rack_id,
+        or_(MovementOrder.rack_id == rack_id, MovementOrder.pickup_rack_id == rack_id, MovementOrder.dropoff_rack_id == rack_id),
         MovementOrder.status.in_(RACK_RESERVATION_ACTIVE_STATUSES),
     )
     if exclude_order_id:
@@ -4647,6 +4695,8 @@ def _active_orders_for_rack(db, rack_id: Optional[int], *, exclude_order_id: Opt
 
 def _manual_release_rack_or_raise(db, rack: Rack, *, actor: str, reason: str, now: Optional[datetime] = None) -> List[dict]:
     now = now or datetime.utcnow()
+    db.execute(update(Rack).where(Rack.id == rack.id).values(updated_at=Rack.updated_at))
+    db.refresh(rack)
     closed_orders = []
     active_orders = _active_orders_for_rack(db, rack.id)
     cleanup_min_age_minutes = _cleanup_min_age_minutes(db)
@@ -5000,22 +5050,45 @@ def _resolve_rcs_target(db, *, base_url: Optional[str] = None, endpoint: Optiona
 
 
 def _current_movement_order_payload(row: MovementOrder, generated_payload: Optional[dict] = None) -> tuple[dict, str]:
-    override_payload = _safe_json_loads(row.override_payload_json)
+    override_payload = unprotect_payload(row.override_payload_json) if row.override_payload_json else None
     if override_payload:
         return override_payload, "edited"
     return (generated_payload or {}), "generated"
 
 
 def _save_movement_order_payload_override(db, row: MovementOrder, payload: dict):
-    row.override_payload_json = json.dumps(payload, ensure_ascii=False)
+    previous = unprotect_payload(row.override_payload_json) if row.override_payload_json else {}
+    payload = restore_redactions(payload, previous)
+    _validate_movement_payload(db, row, payload)
     req_code = str((payload or {}).get("reqCode") or "").strip()
+    try:
+        protected = protect_payload(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    values = {"override_payload_json": protected, "updated_at": datetime.utcnow()}
     if req_code:
-        row.req_code = req_code
-    row.updated_at = datetime.utcnow()
-    db.add(row)
+        values["req_code"] = req_code
+    changed = db.execute(update(MovementOrder).where(
+        MovementOrder.id == row.id, MovementOrder.dispatch_request_json.is_(None),
+        MovementOrder.remote_task_code.is_(None), MovementOrder.dispatch_status == "not_sent",
+    ).values(**values).execution_options(synchronize_session=False))
+    if changed.rowcount != 1:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="La identidad de una creación intentada no puede editarse.")
     db.commit()
     db.refresh(row)
     return row
+
+
+def _validate_movement_payload(db, row: MovementOrder, payload: dict):
+    expected = RcsTaskRequest.from_payload(_movement_order_json_payload(db, row)).to_payload()
+    candidate = RcsTaskRequest.from_payload(payload).to_payload()
+    for key in ("positionCodePath", "agvCode", "taskTyp", "taskCode", "podCode"):
+        if candidate.get(key) != expected.get(key):
+            raise HTTPException(status_code=409, detail=f"El payload no corresponde a la orden: {key}")
+    code = str(candidate.get("reqCode") or "").strip()
+    if not code or len(code) > 32 or (row.req_code and code != row.req_code):
+        raise HTTPException(status_code=409, detail="El payload no conserva la identidad Q1 de la orden")
 
 
 def _reset_movement_order_payload_override(db, row: MovementOrder):
@@ -5032,10 +5105,10 @@ def _movement_order_dispatch_out(row: MovementOrder) -> MovementOrderDispatchOut
         order_id=row.id,
         order_code=row.order_code,
         dispatch_status=row.dispatch_status or "not_sent",
-        request_payload=_safe_json_loads(row.dispatch_request_json),
-        response_payload=_safe_json_loads(row.dispatch_response_json),
+        request_payload=sanitize(_safe_json_loads(row.dispatch_request_json)),
+        response_payload=sanitize(_safe_json_loads(row.dispatch_response_json)),
         remote_task_code=row.remote_task_code,
-        rcs_message=row.rcs_message,
+        rcs_message=sanitize(row.rcs_message),
         dispatched_at=row.dispatched_at,
     )
 
@@ -5456,8 +5529,8 @@ def _rack_sync_event_out(row: RackSyncEvent) -> RackSyncEventOut:
         skipped_count=int(row.skipped_count or 0),
         active_tasks_count=int(row.active_tasks_count or 0),
         duration_ms=int(row.duration_ms or 0),
-        message=row.message or "",
-        payload=_safe_json_loads(row.payload_json) or {},
+        message=sanitize(row.message or ""),
+        payload=sanitize(_safe_json_loads(row.payload_json) or {}),
         created_at=row.created_at,
     )
 
@@ -5738,7 +5811,7 @@ def _query_rack_sync_comparison(db) -> RackSyncQueryOut:
             action=action,
             rcs_position_code=rcs_position_code,
             rcs_map_data_code=rcs_map_data_code,
-            response_payload=response_payload,
+            response_payload=sanitize(response_payload),
         ))
 
     db.commit()
@@ -5845,8 +5918,8 @@ def _bind_rack_sync_mismatches(db) -> RackSyncBindOut:
             items.append(RackSyncBindItem(
                 **item_data,
                 bind_status="bind_ok" if bind_ok else "bind_rejected",
-                bind_response_payload=response_payload,
-                bind_error=None if bind_ok else str(response_payload.get("message") or response_payload),
+                bind_response_payload=sanitize(response_payload),
+                bind_error=None if bind_ok else sanitize_text(response_payload.get("message") or response_payload),
             ))
         except RcsError as exc:
             _append_debug_console_event(
@@ -5980,7 +6053,8 @@ def _query_pod_position_from_rcs(db, rack: Rack, *, module: str = "query_pod_pos
     }
     try:
         _append_debug_console_event(db, direction="sent", module=module, base_url=debug_base_url, endpoint=debug_endpoint, payload=context_payload, message=f"Consulta posicion pod {pod_code}", auto_commit=False)
-        response_payload = client.post_json_payload(request_payload, endpoint_override=endpoint)
+        related = db.get(MovementOrder, related_order_id) if related_order_id else None
+        response_payload = trace_call("query", [related] if related else [], client.post_json_payload, request_payload, endpoint_override=endpoint)
         position_code = _extract_pod_position_code(response_payload)
         _append_debug_console_event(
             db,
@@ -6010,9 +6084,52 @@ def _location_by_position_code(db, position_code: str) -> Optional[Location]:
     ).scalar_one_or_none()
 
 
+def _reconcile_cancel_return_position(db, order: MovementOrder):
+    rack = db.get(Rack, order.rack_id)
+    if rack is None:
+        raise ValueError("Rack local inexistente")
+    result = _query_pod_position_from_rcs(db, rack, module="cancel_return_reconciliation", related_order_id=order.id)
+    response = result.get("response_payload") or {}
+    request = result.get("request_payload") or {}
+    if str(response.get("code")) != "0" or (response.get("reqCode") and response["reqCode"] != request.get("reqCode")):
+        raise ValueError("Respuesta de posición sin confirmación o correlación fiable")
+    nested = response.get("data")
+    records = nested if isinstance(nested, list) else [nested] if isinstance(nested, dict) else []
+    if len(records) > 1 or any(item.get("podCode") and item["podCode"] != rack.code for item in records if isinstance(item, dict)):
+        raise ValueError("Posición ambigua o correspondiente a otro rack")
+    if response.get("podCode") and response["podCode"] != rack.code:
+        raise ValueError("Respuesta de posición para otro rack")
+    db.execute(update(MovementOrder).where(MovementOrder.id == order.id).values(id=MovementOrder.id))
+    db.expire_all()
+    db.refresh(order)
+    if order.status != "cancel_requested_undo":
+        raise ValueError("La orden cambió durante la reconciliación")
+    position = result.get("position_code") or ""
+    target = _location_by_position_code(db, position)
+    if target is None or target.rack_id not in (None, rack.id):
+        raise ValueError("Posición final desconocida o ocupada por otro rack")
+    competing = db.execute(select(MovementOrder.id).where(
+        MovementOrder.id != order.id, MovementOrder.status.in_(RACK_RESERVATION_ACTIVE_STATUSES),
+        or_(MovementOrder.rack_id == rack.id, MovementOrder.destination_cell_id == target.id,
+            MovementOrder.source_cell_id == target.id),
+    )).first()
+    if competing:
+        raise ValueError("Posición final o rack protegido por otra orden")
+    previous_cells = db.execute(select(Location.id).where(Location.rack_id == rack.id)).scalars().all()
+    applied, message, _ = _apply_rcs_rack_position(db, rack, position, source="cancel_return_reconciliation", related_order_id=order.id)
+    if not applied:
+        raise ValueError(message)
+    return set(previous_cells) != {target.id}
+
+
 def _apply_rcs_rack_position(db, rack: Rack, position_code: str, *, source: str, related_order_id: Optional[int] = None, actor: str = "") -> tuple[bool, str, Optional[Location]]:
     if not _position_code_is_defined(position_code):
         return False, "posicion vacia", None
+    if related_order_id and source != "manual_pod_position_query":
+        db.execute(update(MovementOrder).where(MovementOrder.id == related_order_id).values(id=MovementOrder.id))
+        related = db.get(MovementOrder, related_order_id, populate_existing=True)
+        if related and related.status in TERMINAL_LOCAL_STATUSES:
+            return False, "Orden ya terminal; observación de posición descartada", None
     target_cell = _location_by_position_code(db, position_code)
     if not target_cell:
         _append_debug_console_event(
@@ -6026,7 +6143,17 @@ def _apply_rcs_rack_position(db, rack: Rack, position_code: str, *, source: str,
         return False, "posicion sin celda local", None
 
     now = datetime.utcnow()
+    related = db.get(MovementOrder, related_order_id) if related_order_id else None
+    if related and related.status == "cancel_requested_undo":
+        if target_cell.rack_id not in (None, rack.id):
+            raise HTTPException(status_code=409, detail="Retorno: posición ocupada por otro rack")
+        if local_reconciliation_pending(related) and source != "cancel_return_reconciliation":
+            raise HTTPException(status_code=409, detail="Retorno: requiere consulta final de reconciliación")
     old_cells = db.execute(select(Location).where(Location.rack_id == rack.id)).scalars().all()
+    if source == "manual_pod_position_query":
+        _guard_admin_inventory_edit(db, rack_ids=[rack.id, target_cell.rack_id], location_ids=[target_cell.id] + [loc.id for loc in old_cells])
+        if target_cell.rack_id not in (None, rack.id):
+            raise HTTPException(status_code=409, detail="La posición RCS contiene otro rack local; requiere reconciliación, no se sobrescribirá.")
     previous_cells = [{"id": loc.id, "x": loc.x, "y": loc.y, "code": loc.code} for loc in old_cells]
     displaced_rack_id = target_cell.rack_id if target_cell.rack_id and target_cell.rack_id != rack.id else None
 
@@ -6040,14 +6167,16 @@ def _apply_rcs_rack_position(db, rack: Rack, position_code: str, *, source: str,
 
     target_cell.rack_id = rack.id
     _sync_location_status(target_cell)
-    _release_rack_if_no_active_orders(
-        db,
-        rack.id,
-        related_order_id=related_order_id,
-        reason="rack_position_sync",
-        source=source,
-        actor=actor,
-    )
+    related_order = db.get(MovementOrder, related_order_id) if related_order_id else None
+    if not related_order or related_order.status not in CANCEL_REQUEST_STATUSES:
+        _release_rack_if_no_active_orders(
+            db,
+            rack.id,
+            related_order_id=related_order_id,
+            reason="rack_position_sync",
+            source=source,
+            actor=actor,
+        )
     rack.last_moved_at = now
     db.add(target_cell)
     db.add(rack)
@@ -6098,6 +6227,8 @@ def _rack_position_poll_worker(order_id: int, rack_id: int, *, source: str, acto
                     )
                     db.commit()
                     return
+                if order.status not in CANCEL_REQUEST_STATUSES:
+                    return
                 try:
                     result = _query_pod_position_from_rcs(db, rack, module="rack_position_poll", related_order_id=order_id, attempt=attempt)
                     position_code = result.get("position_code") or ""
@@ -6123,26 +6254,9 @@ def _rack_position_poll_worker(order_id: int, rack_id: int, *, source: str, acto
             now = datetime.utcnow()
             order = db.execute(select(MovementOrder).where(MovementOrder.id == order_id)).scalar_one_or_none()
             if order and (order.status or "") in CANCEL_REQUEST_STATUSES:
-                old_status = order.status or ""
-                new_status = "undone" if old_status == "cancel_requested_undo" else "cancelled"
-                order.status = new_status
-                order.forced_local_close = 1
-                order.forced_local_close_at = now
-                order.forced_local_close_reason = "rack_position_poll_timeout"
-                order.rcs_message = ((order.rcs_message or "").strip() + " | Timeout consultando posicion RCS del rack; cierre local automatico.").strip(" |")[:512]
+                # A position timeout is not confirmation of cancellation/return.
+                order.rcs_message = ((order.rcs_message or "").strip() + " | Timeout consultando posicion RCS; recursos retenidos hasta confirmacion terminal.").strip(" |")[:512]
                 order.updated_at = now
-                _audit_order_close(
-                    db,
-                    order,
-                    previous_status=old_status,
-                    new_status=new_status,
-                    source="rack_position_poll_timeout",
-                    reason="timeout_posicion_rcs_cancelacion",
-                    actor=actor or source,
-                    closed_at=now,
-                    auto_commit=False,
-                )
-                _release_rack_if_no_active_orders(db, rack_id, related_order_id=order_id, reason="rack_position_poll_timeout", source="rack_position_poll_timeout", actor=actor or source)
                 db.add(order)
             _append_debug_console_event(
                 db,
@@ -6187,36 +6301,73 @@ def _rcs_create_task_accepted(response: RcsTaskResponse) -> bool:
 
 
 def _dispatch_movement_order(db, row: MovementOrder) -> MovementOrderDispatchOut:
+    db.refresh(row)
+    if row.dispatch_request_json and row.dispatch_status == "not_sent" and row.status == "pending_dispatch":
+        # Un intento histórico interrumpido no es una nueva creación tras reinicio.
+        row.dispatch_status = "uncertain"
+        row.rcs_status = "dispatch_unknown"
+        row.rcs_message = "Intento previo sin confirmación; recursos retenidos, requiere revisión en RCS."
+        db.commit()
+    if row.dispatch_request_json or row.remote_task_code or row.dispatch_status != "not_sent" or row.status != "pending_dispatch":
+        return _movement_order_dispatch_out(row)
     logger.info("Dispatching movement order id=%s order_code=%s", row.id, row.order_code)
     previous_status = row.status or ""
     generated_payload = _movement_order_json_payload(db, row)
     payload, _payload_source = _current_movement_order_payload(row, generated_payload)
+    if _payload_source == "edited":
+        _validate_movement_payload(db, row, payload)
     client = _get_rcs_client_from_settings(db)
     debug_base_url, debug_endpoint = _resolve_rcs_target(db, mode="create")
     token_code = getattr(client, "_token_code", "")
     if token_code and not payload.get("tokenCode"):
         payload["tokenCode"] = token_code
-    row.dispatch_request_json = json.dumps(payload, ensure_ascii=False)
-    row.updated_at = datetime.utcnow()
-    db.add(row)
+    payload = RcsTaskRequest.from_payload(payload).to_payload()
+    if not payload["reqCode"] or len(payload["reqCode"]) > 32:
+        raise HTTPException(status_code=409, detail="reqCode de creación vacío o mayor de 32 caracteres")
+    other_creation = MovementOrder.__table__.alias("other_creation")
+    same_identity = select(other_creation.c.id).where(
+        other_creation.c.id != row.id, other_creation.c.req_code == payload["reqCode"],
+        other_creation.c.dispatch_request_json.is_not(None),
+    ).exists()
+    claim = db.execute(update(MovementOrder).where(
+        MovementOrder.id == row.id,
+        MovementOrder.status == "pending_dispatch",
+        MovementOrder.dispatch_status == "not_sent",
+        MovementOrder.dispatch_request_json.is_(None),
+        MovementOrder.remote_task_code.is_(None),
+        ~same_identity,
+    ).values(req_code=payload["reqCode"], dispatch_request_json=json.dumps(sanitize(payload), ensure_ascii=False),
+             dispatch_status="uncertain", rcs_status="dispatch_unknown",
+             rcs_message="Creación sin confirmar; conservar recursos y revisar en RCS antes de reenviar.",
+             updated_at=datetime.utcnow()).execution_options(synchronize_session=False))
     db.commit()
+    db.refresh(row)
+    if claim.rowcount != 1:
+        if row.dispatch_status == "not_sent":
+            raise HTTPException(status_code=409, detail="La orden cambió o el reqCode ya fue utilizado; no se envió la tarea")
+        return _movement_order_dispatch_out(row)
     logger.info("[CREATE TASK] order_id=%s order_code=%s source=api_internal status=%s rack_id=%s", row.id, row.order_code, row.status, row.rack_id)
     try:
         _append_debug_console_event(db, direction="sent", module="dispatch", base_url=debug_base_url, endpoint=debug_endpoint, payload=payload, message=f"Envío createTask para {row.order_code}")
-        response = client.create_task(RcsTaskRequest.from_payload(payload))
+        response = trace_call("create", [row], client.create_task, RcsTaskRequest.from_payload(payload))
         accepted = _rcs_create_task_accepted(response)
         _append_debug_console_event(db, direction="received", module="dispatch", base_url=debug_base_url, endpoint=debug_endpoint, payload=response.raw, message=response.message or f"Respuesta createTask para {row.order_code}")
-        row.dispatch_status = "success" if accepted else "error"
+        identity_matches = not response.reqCode or response.reqCode == payload["reqCode"]
+        task_code = response.data.strip() if isinstance(response.data, str) else ""
+        uncertain = not identity_matches or (accepted and not task_code) or (not accepted and bool(task_code))
+        row.dispatch_status = "uncertain" if uncertain else ("success" if accepted else "error")
         row.dispatch_response_json = json.dumps(response.raw, ensure_ascii=False)
         row.rcs_response_json = json.dumps(response.raw, ensure_ascii=False)
-        row.remote_task_code = response.data or None
-        row.req_code = response.reqCode or payload.get("reqCode") or None
-        row.rcs_status = "sent" if accepted else "error"
-        row.rcs_message = response.message or None
+        if identity_matches and task_code and not row.remote_task_code:
+            row.remote_task_code = task_code
+        _append_status_query_log(db, row, kind="create_task", request_payload=payload, response_payload=response.raw, message=response.message)
+        row.rcs_status = "dispatch_unknown" if uncertain else ("sent" if accepted else "error")
+        row.rcs_message = (f"Resultado incierto: {response.message or 'identidad remota insuficiente'}. Recursos retenidos; requiere reconciliación en RCS." if uncertain else response.message or None)
         row.dispatched_at = datetime.utcnow()
         row.rcs_last_update = row.dispatched_at
-        if accepted and row.status == "pending_dispatch":
+        if accepted and not uncertain and row.status == "pending_dispatch":
             row.status = "dispatched"
+            _apply_pending_point_inventory(db, row)
         row.updated_at = datetime.utcnow()
         db.add(row)
         db.commit()
@@ -6235,11 +6386,13 @@ def _dispatch_movement_order(db, row: MovementOrder) -> MovementOrderDispatchOut
         return _movement_order_dispatch_out(row)
     except RcsError as exc:
         _append_debug_console_event(db, direction="received", module="dispatch", base_url=debug_base_url, endpoint=debug_endpoint, payload={"error": str(exc)}, message=f"Error createTask para {row.order_code}: {exc}")
-        row.dispatch_status = "error"
-        row.dispatch_response_json = json.dumps({"error": str(exc)}, ensure_ascii=False)
-        row.rcs_response_json = json.dumps({"error": str(exc)}, ensure_ascii=False)
-        row.rcs_status = "error"
-        row.rcs_message = str(exc)
+        not_sent = isinstance(exc, RcsNotSentError)
+        row.dispatch_status = "error" if not_sent else "uncertain"
+        row.dispatch_response_json = json.dumps({"error": str(exc), "confirmed_not_sent": not_sent}, ensure_ascii=False)
+        row.rcs_response_json = row.dispatch_response_json
+        row.rcs_status = "error" if not_sent else "dispatch_unknown"
+        row.rcs_message = str(exc) if not_sent else f"Resultado incierto: {exc}. Recursos retenidos; requiere reconciliación en RCS."
+        _append_status_query_log(db, row, kind="create_task", request_payload=payload, response_payload={"error": str(exc)}, message=str(exc))
         row.dispatched_at = datetime.utcnow()
         row.rcs_last_update = row.dispatched_at
         row.updated_at = datetime.utcnow()
@@ -6247,6 +6400,8 @@ def _dispatch_movement_order(db, row: MovementOrder) -> MovementOrderDispatchOut
         db.commit()
         db.refresh(row)
         logger.exception("Task dispatch failed | task_id=%s | order_code=%s | rack_id=%s | agv=%s | error=%s", row.id, row.order_code, row.rack_id, row.agv_code or "-", exc)
+        if not_sent:
+            _rollback_unsuccessful_order_dispatch(db, row, row.rcs_message)
         return _movement_order_dispatch_out(row)
 
 
@@ -6263,7 +6418,18 @@ class NoCacheStaticFiles(StaticFiles):
         return response
 
 
+from runtime_single_worker import RuntimeLease, RuntimeLeaseMiddleware, validate_worker_configuration
+
+_runtime_lease = RuntimeLease(engine.url.database or os.path.join(_app_root(), "runtime"))
+
+
+def _acquire_runtime_lease():
+    validate_worker_configuration()
+    _runtime_lease.acquire()
+
+
 app = FastAPI(title="AGV Orders App")
+app.add_middleware(RuntimeLeaseMiddleware, lease=_runtime_lease)
 app.mount("/static", NoCacheStaticFiles(directory=os.path.join(_app_root(), "static")), name="static")
 app.state.task_monitor = TaskMonitor(interval_seconds=3)
 
@@ -6383,6 +6549,8 @@ async def performance_health(x_admin_token: Optional[str] = Header(default=None,
 
 @app.on_event("startup")
 def on_startup():
+    # Must precede migrations, recovery, monitors and schedulers.
+    _acquire_runtime_lease()
     ensure_log_file()
     logger.info("Application startup initiated")
     cleanup_legacy_schema()
@@ -6419,6 +6587,9 @@ def on_startup():
             )
         if reserved_orphans:
             db.commit()
+    # Completed parents are absent from the active-order monitor after restart.
+    with SessionLocal() as db:
+        recover_fifo_chains(db)
     try:
         app.state.task_monitor.start()
     except Exception:
@@ -6432,7 +6603,7 @@ def on_startup():
         app.state.robot_monitor_cache_thread = _start_robot_monitor_cache_updater()
     except Exception:
         logger.exception("Failed to start robot monitor cache updater")
-    logger.info("Application startup completed")
+    logger.info("Application startup completed | supported_workers=1 | runtime_owner_pid=%s", os.getpid())
 
 
 @app.on_event("startup")
@@ -6441,10 +6612,12 @@ async def on_startup_runtime_ws():
     _runtime_event_loop = asyncio.get_running_loop()
     _runtime_event_queue = asyncio.Queue(maxsize=2048)
     app.state.runtime_broadcast_task = asyncio.create_task(_runtime_broadcast_loop())
+    _runtime_lease.ready = True
 
 
 @app.on_event("shutdown")
 def on_shutdown():
+    _runtime_lease.ready = False
     logger.info("Application shutdown initiated")
     try:
         app.state.task_monitor.stop()
@@ -6462,6 +6635,7 @@ def on_shutdown():
     if task is not None:
         task.cancel()
     logger.info("Application shutdown completed")
+    # Keep the OS lease until process exit: background threads may still unwind.
     return None
 
 
@@ -6515,7 +6689,8 @@ def pda_terminal(terminal_code: str):
 
 
 @app.get("/api/logs/download")
-def download_logs():
+def download_logs(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
     log_path = ensure_log_file()
     log_dir = os.path.dirname(str(log_path))
     base_log_names = ("app.log", "error.log", "rcs.log", "programming.log", "io.log", "qr.log")
@@ -6529,7 +6704,8 @@ def download_logs():
             candidate = os.path.join(log_dir, log_name)
             if not os.path.isfile(candidate):
                 continue
-            zf.write(candidate, arcname=log_name)
+            with open(candidate, "r", encoding="utf-8", errors="replace") as source:
+                zf.writestr(log_name, sanitize_text(source.read()))
             included_logs.append(log_name)
     logger.info("Log download requested files=%s", ",".join(included_logs))
 
@@ -6575,8 +6751,8 @@ def admin_config_audit(
                 table_name=row.table_name,
                 record_key=row.record_key,
                 field_name=row.field_name,
-                old_value=row.old_value,
-                new_value=row.new_value,
+                old_value="[REDACTED]" if (sensitive_key(row.record_key) or sensitive_key(row.field_name)) and row.old_value else sanitize(row.old_value),
+                new_value="[REDACTED]" if (sensitive_key(row.record_key) or sensitive_key(row.field_name)) and row.new_value else sanitize(row.new_value),
                 source=row.source,
                 endpoint=row.endpoint,
                 client_ip=row.client_ip,
@@ -7817,7 +7993,12 @@ def query_pod_position(payload: PodPositionQueryIn, x_admin_token: Optional[str]
         matched_cell = _location_by_position_code(db, position_code) if _position_code_is_defined(position_code) else None
         applied = False
         if matched_cell:
-            applied, _apply_message, matched_cell = _apply_rcs_rack_position(db, rack, position_code, source="manual_pod_position_query", actor="admin")
+            try:
+                applied, _apply_message, matched_cell = _apply_rcs_rack_position(db, rack, position_code, source="manual_pod_position_query", actor="admin")
+            except HTTPException as exc:
+                _append_debug_console_event(db, direction="received", module="query_pod_position", payload={"action": "local_update_blocked", "rack_id": rack.id, "position_code": position_code}, message=str(exc.detail), auto_commit=False)
+                db.commit()
+                raise
         local_rack_cell = db.execute(select(Location).where(Location.rack_id == rack.id)).scalar_one_or_none()
         if position_code and applied and matched_cell:
             message = f"RCS reporta posicion {position_code}; se actualizo el rack en la matriz local ({matched_cell.x}, {matched_cell.y})."
@@ -8279,6 +8460,7 @@ def _list_locations_out(db) -> List[LocationOut]:
 
 
 MOVEMENT_ORDER_SUMMARY_COLUMNS = (
+    MovementOrder.updated_at,
     MovementOrder.id,
     MovementOrder.order_code,
     MovementOrder.order_type,
@@ -8342,6 +8524,7 @@ def _movement_order_summary_out(
     material = material_by_id.get(row.material_group_id) if row.material_group_id else None
     current_cell_row = current_location_by_rack_id.get(row.rack_id) if row.rack_id else None
     return MovementOrderSummaryOut(
+        updated_at=row.updated_at,
         order_id=row.id,
         order_code=row.order_code,
         order_type=row.order_type,
@@ -8370,7 +8553,7 @@ def _movement_order_summary_out(
         remote_task_code=row.remote_task_code,
         req_code=row.req_code,
         rcs_status=row.rcs_status,
-        rcs_message=row.rcs_message,
+        rcs_message=sanitize(row.rcs_message),
         cancel_source=row.cancel_source,
         cancel_reason=row.cancel_reason,
         closed_by=row.closed_by,
@@ -8500,7 +8683,7 @@ def _get_robot_status_monitor_response(db) -> RobotMonitorResponse:
         result = RobotMonitorResponse(
             ok=response_code == "0",
             code=response_code,
-            message=response_message,
+            message=sanitize_text(response_message),
             reqCode=str(response.get("reqCode", payload.get("reqCode", "")) or ""),
             robots=items,
         )
@@ -8650,13 +8833,16 @@ def _build_runtime_snapshot_payload(debug_limit: int = 200, include_robot_monito
 
 
 def _build_runtime_snapshot_message(client_locations_revision: Optional[int] = None) -> dict:
-    server_locations_revision = _locations_current_revision()
-    locations_match = (
-        client_locations_revision is not None
-        and int(client_locations_revision) == server_locations_revision
-    )
-    snapshot_revision = _runtime_current_revision()
-    payload = _build_runtime_snapshot_payload(300, 1, 0 if locations_match else 1)
+    for _attempt in range(3):
+        server_locations_revision = _locations_current_revision()
+        locations_match = client_locations_revision is not None and int(client_locations_revision) == server_locations_revision
+        snapshot_revision = _runtime_current_revision()
+        payload = _build_runtime_snapshot_payload(300, 1, 0 if locations_match else 1)
+        if server_locations_revision == _locations_current_revision():
+            break
+        client_locations_revision = None
+    else:
+        return {"type": "runtime_resync_required", "revision": _runtime_current_revision(), "reason": "locations changed during snapshot"}
     return {
         "type": "runtime_snapshot",
         "revision": snapshot_revision,
@@ -10157,6 +10343,7 @@ def admin_create_qr_action_rule(body: QrActionRuleIn, x_admin_token: Optional[st
     with SessionLocal() as db:
         qr_value = body.qr_value.strip()
         qr_type, match_type, action_type = _validate_qr_action_rule_body(db, body)
+        _validate_qr_rule_unique(db, body)
         step3_source_mode = _normalize_fifo_chain_step3_source_mode(body.fifo_chain_step3_source_mode)
         step4_source_mode = _normalize_fifo_chain_step4_source_mode(body.fifo_chain_step4_source_mode)
         step5_source_mode = _normalize_fifo_chain_step5_source_mode(body.fifo_chain_step5_source_mode)
@@ -10235,6 +10422,7 @@ def admin_update_qr_action_rule(qr_action_rule_id: int, body: QrActionRuleIn, x_
         audit_fields = [name for name in QrActionRuleIn.model_fields.keys() if hasattr(row, name)]
         old_values = _snapshot_fields(row, audit_fields)
         qr_type, match_type, action_type = _validate_qr_action_rule_body(db, body)
+        _validate_qr_rule_unique(db, body, existing=row)
         step3_source_mode = _normalize_fifo_chain_step3_source_mode(body.fifo_chain_step3_source_mode)
         step4_source_mode = _normalize_fifo_chain_step4_source_mode(body.fifo_chain_step4_source_mode)
         step5_source_mode = _normalize_fifo_chain_step5_source_mode(body.fifo_chain_step5_source_mode)
@@ -10353,6 +10541,7 @@ def admin_restore_qr_action_rule(qr_action_rule_id: int, x_admin_token: Optional
             return _qr_action_rule_out(db, row)
         if not (row.qr_value or "").strip():
             raise HTTPException(status_code=409, detail="No se puede restaurar la Regla QR porque qr_value está vacío.")
+        _validate_qr_rule_unique(db, QrActionRuleIn(qr_value=row.qr_value, match_type=row.match_type or "exact", is_active=1), existing=row)
         _require_existing_refs(db, row, [
             ("material_group_id", MaterialGroup, "material"), ("rack_id", Rack, "rack"),
             ("source_area_id", Area, "área origen"), ("destination_area_id", Area, "área destino"),
@@ -10719,6 +10908,8 @@ def create_fifo_movement(body: FifoRequestIn):
             _audit_rack_reservation_change(db, rack=rack, previous_status="available", new_status=rack.status, source="local_ui", related_order_id=order.id, reason="create_fifo_order", actor=body.created_by or "operador", auto_commit=False)
             db.commit()
         dispatch_result = _dispatch_movement_order(db, order)
+        if dispatch_result.dispatch_status == "uncertain":
+            raise HTTPException(status_code=409, detail=f"Orden {order.id}: creación incierta; recursos retenidos. Revisar en RCS antes de reenviar.")
         if dispatch_result.dispatch_status != "success":
             message = dispatch_result.rcs_message or "El RCS rechazó la creación de la tarea"
             _rollback_unsuccessful_order_dispatch(db, order, message)
@@ -10746,6 +10937,8 @@ def create_direct_move_movement(body: DirectMoveRequestIn):
             _audit_rack_reservation_change(db, rack=rack, previous_status="available", new_status=rack.status, source="local_ui", related_order_id=order.id, reason="create_direct_move_order", actor=body.created_by or "operador", auto_commit=False)
             db.commit()
         dispatch_result = _dispatch_movement_order(db, order)
+        if dispatch_result.dispatch_status == "uncertain":
+            raise HTTPException(status_code=409, detail=f"Orden {order.id}: creación incierta; recursos retenidos. Revisar en RCS antes de reenviar.")
         if dispatch_result.dispatch_status != "success":
             message = dispatch_result.rcs_message or "El RCS rechazó la creación de la tarea"
             _rollback_unsuccessful_order_dispatch(db, order, message)
@@ -10779,7 +10972,7 @@ def get_movement_order_json(order_id: int):
             raise HTTPException(status_code=404, detail="Orden no encontrada")
         generated_payload = _movement_order_json_payload(db, row)
         payload, source = _current_movement_order_payload(row, generated_payload)
-        return MovementOrderJsonOut(order_id=row.id, order_code=row.order_code, payload=payload, source=source)
+        return MovementOrderJsonOut(order_id=row.id, order_code=row.order_code, payload=sanitize(payload), source=source)
 
 
 @app.post("/api/movement-orders/{order_id}/json", response_model=MovementOrderJsonOut)
@@ -10790,7 +10983,7 @@ def save_movement_order_json(order_id: int, body: MovementOrderJsonIn):
             raise HTTPException(status_code=404, detail="Orden no encontrada")
         row = _save_movement_order_payload_override(db, row, body.payload)
         logger.info("Task JSON updated | task_id=%s | order_code=%s | status=%s | rack_id=%s", row.id, row.order_code, row.status, row.rack_id)
-        return MovementOrderJsonOut(order_id=row.id, order_code=row.order_code, payload=body.payload, source="edited")
+        return MovementOrderJsonOut(order_id=row.id, order_code=row.order_code, payload=sanitize(body.payload), source="edited")
 
 
 @app.post("/api/movement-orders/{order_id}/json/reset", response_model=MovementOrderJsonOut)
@@ -10821,7 +11014,10 @@ def dispatch_movement_order(order_id: int):
         if not row:
             raise HTTPException(status_code=404, detail="Orden no encontrada")
         logger.info("Manual dispatch requested order_id=%s order_code=%s", row.id, row.order_code)
-        return _dispatch_movement_order(db, row)
+        result = _dispatch_movement_order(db, row)
+        if result.dispatch_status == "error" and not row.remote_task_code:
+            _rollback_unsuccessful_order_dispatch(db, row, result.rcs_message)
+        return _movement_order_dispatch_out(row)
 
 
 @app.post("/api/movement-orders/monitor/run")
@@ -10876,7 +11072,7 @@ def run_manual_status_query(order_id: int, body: MovementOrderStatusQueryIn):
         req_code_from_request = str(request_payload.get("reqCode") or "").strip()
         try:
             _append_debug_console_event(db, direction="sent", module="status_query", base_url=debug_base_url, endpoint=debug_endpoint, payload=request_payload, message=f"Consulta manual para {row.order_code}")
-            response = client.query_task_status_with_payload(request_payload)
+            response = trace_call("query", [row], client.query_task_status_with_payload, request_payload)
             _append_debug_console_event(db, direction="received", module="status_query", base_url=debug_base_url, endpoint=debug_endpoint, payload=response.raw, message=response.message or f"Respuesta consulta para {row.order_code}")
             now = datetime.utcnow()
             remote_task_code = (row.remote_task_code or "").strip()
@@ -10890,33 +11086,37 @@ def run_manual_status_query(order_id: int, body: MovementOrderStatusQueryIn):
                 matched_item = _single_task_response_item(response, remote_task_code)
             response_task_code = str((matched_item or {}).get("taskCode") or (matched_item or {}).get("task_code") or "").strip()
             failed_task_code = "" if response.ok else _task_code_from_error_message(response.message, request_task_codes or ([request_task_code] if request_task_code else []))
-            response_matches_order = bool(remote_task_code and response_task_code == remote_task_code)
-            failed_message_matches_order = bool(
-                (failed_task_code and remote_task_code and failed_task_code == remote_task_code)
-                or (not response.ok and not failed_task_code and remote_task_code and len(request_task_codes) == 1 and request_task_codes[0] == remote_task_code)
-                or (not response.ok and not failed_task_code and remote_task_code and request_task_code == remote_task_code)
-            )
+            response_matches_order = bool(response.ok and remote_task_code and response_task_code == remote_task_code)
+            # Un error de observación nunca demuestra un fallo físico de la tarea.
+            failed_message_matches_order = False
             matched_response_payload = matched_item.get("raw") if isinstance(matched_item, dict) else response.raw
             matched_status = _normalize_remote_status(str((matched_item or {}).get("taskStatus") or (matched_item or {}).get("task_status") or "").strip())
+            if matched_status in {"not_found", "not found"}:
+                # Keep the actual success/identity envelope required by recovery;
+                # a detached task item cannot prove a successful query.
+                matched_response_payload = response.raw
+            db.execute(update(MovementOrder).where(MovementOrder.id == row.id).values(id=MovementOrder.id))
+            db.refresh(row)
+            if row.status in TERMINAL_LOCAL_STATUSES or (local_reconciliation_pending(row) and matched_status != row.rcs_status):
+                response_matches_order = False
             matched_message = str((matched_item or {}).get("message") or (response.message if response_matches_order or failed_message_matches_order else "") or "")
             row.status_query_request_json = json.dumps(request_payload, ensure_ascii=False)
             row.status_query_response_json = json.dumps(matched_response_payload, ensure_ascii=False)
             row.status_query_checked_at = now
             row.rcs_last_update = now
-            if req_code_from_request:
-                row.req_code = req_code_from_request
-            elif response.reqCode:
-                row.req_code = str(response.reqCode)
+            # La identidad de consulta se conserva únicamente en JSON/historial.
             if response_matches_order:
                 row.rcs_status = matched_status or row.rcs_status
             elif failed_message_matches_order:
                 row.rcs_status = "failed"
-            if response_matches_order or failed_message_matches_order:
+            if (response_matches_order or failed_message_matches_order) and not local_reconciliation_pending(row):
                 row.rcs_message = matched_message or row.rcs_message
             _append_status_query_log(db, row, kind="status_query", request_payload=request_payload, response_payload=matched_response_payload, message=matched_message or "", arrived_at=now)
             db.commit()
             db.refresh(row)
             if response_matches_order and matched_status:
+                if row.dispatch_status == "uncertain":
+                    row.dispatch_status = "success"
                 row = apply_remote_status_to_order(db, row, matched_status, source="rcs_callback")
             elif failed_message_matches_order:
                 row = apply_remote_status_to_order(db, row, "failed", source="rcs_callback")
@@ -10932,7 +11132,7 @@ def run_manual_status_query(order_id: int, body: MovementOrderStatusQueryIn):
                 row.rcs_status = matched_status or row.rcs_status
             elif failed_message_matches_order:
                 row.rcs_status = "failed"
-            if response_matches_order or failed_message_matches_order:
+            if (response_matches_order or failed_message_matches_order) and not local_reconciliation_pending(row):
                 row.rcs_message = matched_message or row.rcs_message
             row.updated_at = datetime.utcnow()
             db.add(row)
@@ -10947,9 +11147,9 @@ def run_manual_status_query(order_id: int, body: MovementOrderStatusQueryIn):
             row.status_query_response_json = json.dumps(error_payload, ensure_ascii=False)
             row.status_query_checked_at = now
             row.rcs_last_update = now
-            if req_code_from_request:
-                row.req_code = req_code_from_request
-            row.rcs_message = str(exc)
+            # No sobrescribir el reqCode de creación al fallar una consulta.
+            if not local_reconciliation_pending(row):
+                row.rcs_message = str(exc)
             _append_status_query_log(db, row, kind="status_query", request_payload=request_payload, response_payload=error_payload, message=str(exc), arrived_at=now)
             db.commit()
             db.refresh(row)
@@ -10966,7 +11166,8 @@ def get_rcs_debug_log(limit: int = 200):
 
 
 @app.post("/api/rcs/debug-send")
-def send_debug_console_json(body: DebugConsoleSendIn):
+def send_debug_console_json(body: DebugConsoleSendIn, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
     with SessionLocal() as db:
         payload = body.payload or {}
         if not isinstance(payload, dict):
@@ -10975,11 +11176,11 @@ def send_debug_console_json(body: DebugConsoleSendIn):
         if not base_url:
             raise HTTPException(status_code=400, detail="Configura la URL base del RCS o escríbela en la consola.")
         client = _get_rcs_client_with_overrides(db, base_url=base_url, query_endpoint=endpoint)
-        _append_debug_console_event(db, direction="sent", module="debug_console", base_url=base_url, endpoint=endpoint, payload=payload, message="Envío libre desde consola")
+        _append_debug_console_event(db, direction="sent", module="debug_console", base_url=base_url, endpoint=endpoint, payload=payload, message="Envío extraordinario autorizado por administrador; sin MovementOrder")
         try:
-            raw_response = client.post_json_payload(payload, endpoint_override=endpoint)
+            raw_response = trace_call("debug", [], client.post_json_payload, payload, endpoint_override=endpoint)
             _append_debug_console_event(db, direction="received", module="debug_console", base_url=base_url, endpoint=endpoint, payload=raw_response, message=str(raw_response.get("message") or "Respuesta recibida"))
-            return {"ok": True, "base_url": base_url, "endpoint": endpoint, "response": raw_response}
+            return sanitize({"ok": True, "base_url": base_url, "endpoint": endpoint, "response": raw_response})
         except RcsError as exc:
             error_payload = {"error": str(exc)}
             _append_debug_console_event(db, direction="received", module="debug_console", base_url=base_url, endpoint=endpoint, payload=error_payload, message=str(exc))
@@ -10987,13 +11188,26 @@ def send_debug_console_json(body: DebugConsoleSendIn):
 
 
 @app.post("/api/movement-orders/{order_id}/simulate-complete", response_model=MovementOrderOut)
-def simulate_complete_movement_order(order_id: int):
+def simulate_complete_movement_order(order_id: int, body: Optional[SimulateCompleteIn] = None, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    if not body or not body.confirm_simulation or not body.reason.strip():
+        raise HTTPException(status_code=409, detail="Simulación local: modifica inventario y libera recursos; no confirma RCS ni continúa FIFO Chain. Requiere confirm_simulation y motivo.")
     with SessionLocal() as db:
+        db.execute(update(MovementOrder).where(MovementOrder.id == order_id).values(updated_at=MovementOrder.updated_at))
         before_order = db.execute(select(MovementOrder).where(MovementOrder.id == order_id)).scalar_one_or_none()
+        if not before_order:
+            raise HTTPException(status_code=404, detail="Orden no encontrada")
+        if not _truthy_config_value(get_setting(db, "rcs_simulator_enabled", "0")):
+            raise HTTPException(status_code=409, detail="Simulate complete está disponible únicamente con el simulador explícitamente habilitado.")
+        creation = _safe_json_loads_any(before_order.dispatch_response_json)
+        if (before_order.remote_task_code or before_order.dispatch_request_json or before_order.dispatch_status != "not_sent") and not (isinstance(creation, dict) and creation.get("simulated") is True):
+            raise HTTPException(status_code=409, detail="La orden tiene un envío real o incierto; activar el simulador no permite finalizarla localmente.")
+        _append_status_query_log(db, before_order, kind="admin_simulate_complete", request_payload={"actor": "admin", "reason": body.reason.strip(), "confirmed": True, "reqCode": before_order.req_code, "taskCode": before_order.remote_task_code}, response_payload={"previous_local_status": before_order.status, "remote_status_preserved": before_order.rcs_status})
+        db.flush()
         before_rack_id = before_order.rack_id if before_order else None
         before_rack = db.execute(select(Rack).where(Rack.id == before_rack_id)).scalar_one_or_none() if before_rack_id else None
         old_rack_status = before_rack.status if before_rack else None
-        row = simulate_order_completed(db, order_id)
+        row = simulate_order_completed(db, order_id, local_simulation=True)
         logger.info("Task completed | task_id=%s | order_code=%s | rack_id=%s | status=%s | source=simulate_complete", row.id, row.order_code, row.rack_id, row.status)
         if before_rack_id and old_rack_status and not rack_status_is_available(old_rack_status):
             rack = db.execute(select(Rack).where(Rack.id == before_rack_id)).scalar_one_or_none()
@@ -11034,14 +11248,36 @@ def undo_selected_movement_order(order_id: int, body: Optional[MovementOrderUndo
 def admin_delete_movement_order(order_id: int, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
     require_admin(x_admin_token)
     with SessionLocal() as db:
+        db.execute(update(MovementOrder).where(MovementOrder.id == order_id).values(updated_at=MovementOrder.updated_at))
         row = db.execute(select(MovementOrder).where(MovementOrder.id == order_id)).scalar_one_or_none()
         if not row:
             raise HTTPException(status_code=404, detail="Orden no encontrada")
         order_code = row.order_code
+        if row.status in RACK_RESERVATION_ACTIVE_STATUSES or row.remote_task_code or row.req_code or row.dispatch_request_json or row.forced_local_close or row.fifo_chain_group_id:
+            raise HTTPException(status_code=409, detail="No se puede borrar una orden activa o con trazabilidad RCS/cierre local/cadena. Usa diagnóstico y conserva el historial.")
         db.delete(row)
         db.commit()
         logger.info("Movement order deleted by admin order_id=%s order_code=%s", order_id, order_code)
         return {"ok": True, "order_id": order_id, "order_code": order_code, "message": f"Orden {order_code} borrada permanentemente del historial y del monitoreo."}
+
+
+def _guard_admin_inventory_edit(db, *, rack_ids=(), location_ids=()) -> None:
+    rack_ids = [value for value in rack_ids if value]
+    location_ids = [value for value in location_ids if value]
+    # Keep validation and mutation in one writer transaction against dispatch.
+    if rack_ids:
+        db.execute(update(Rack).where(Rack.id.in_(rack_ids)).values(updated_at=Rack.updated_at))
+    if location_ids:
+        db.execute(update(Location).where(Location.id.in_(location_ids)).values(updated_at=Location.updated_at))
+    db.expire_all()
+    active = db.execute(select(MovementOrder.id).where(
+        MovementOrder.status.in_(RACK_RESERVATION_ACTIVE_STATUSES),
+        or_(MovementOrder.rack_id.in_(rack_ids), MovementOrder.pickup_rack_id.in_(rack_ids),
+            MovementOrder.dropoff_rack_id.in_(rack_ids), MovementOrder.source_cell_id.in_(location_ids),
+            MovementOrder.destination_cell_id.in_(location_ids)),
+    ).limit(1)).first()
+    if active:
+        raise HTTPException(status_code=409, detail=f"Inventario protegido por orden activa {active[0]}; usa recuperación con evidencia RCS o cierre extraordinario confirmado.")
 
 
 def _first_available_location_xy(db, max_cols: int = DB_GRID_W, max_rows: int = DB_GRID_H) -> tuple[int, int]:
@@ -11163,6 +11399,7 @@ def admin_patch_location(x: int, y: int, patch: LocationPatchAdmin, x_admin_toke
         r = db.execute(select(Location).where(Location.x == x, Location.y == y)).scalar_one_or_none()
         if not r:
             raise HTTPException(status_code=404, detail="Ubicación no encontrada")
+        _guard_admin_inventory_edit(db, location_ids=[r.id], rack_ids=[r.rack_id, patch.rack_id])
         if patch.status is not None and int(patch.status) == 0:
             _validate_location_can_mark_free(db, r)
         area_id = patch.area_id if patch.area_id is not None else r.area_id
@@ -11198,6 +11435,7 @@ def admin_save_location(x: int, y: int, body: CellDetailSave, x_admin_token: Opt
         r = db.execute(select(Location).where(Location.x == x, Location.y == y)).scalar_one_or_none()
         if not r:
             raise HTTPException(status_code=404, detail="Ubicación no encontrada")
+        _guard_admin_inventory_edit(db, location_ids=[r.id], rack_ids=[r.rack_id, body.rack_id])
         if int(body.status) == 0:
             _validate_location_can_mark_free(db, r)
         _validate_foreign_keys(db, body.area_id, body.rack_id, ignore_xy=(x, y))
@@ -11596,63 +11834,61 @@ def _robot_monitor_indicates_order_running(order: MovementOrder) -> bool:
     return False
 
 
-def _status_query_missing_task(order: MovementOrder) -> bool:
+def _fresh_recovery_status(order: MovementOrder, *, now: Optional[datetime] = None) -> str:
+    """Positive task-specific observation, never absence of cached activity."""
+    now = now or datetime.utcnow()
+    checked = order.status_query_checked_at
     task_code = str(order.remote_task_code or "").strip()
-    if not task_code or not order.status_query_checked_at:
-        return False
+    if not task_code or not checked or not 0 <= (now - checked).total_seconds() <= 60:
+        return ""
+    if order.dispatched_at and checked < order.dispatched_at:
+        return ""
+    if order.rcs_last_update and checked < order.rcs_last_update:
+        return ""
+    request = _safe_json_loads_any(order.status_query_request_json)
     payload = _safe_json_loads_any(order.status_query_response_json)
-    if not isinstance(payload, dict):
-        return False
-    text_payload = json.dumps(payload, ensure_ascii=False).lower()
-    if task_code.lower() in text_payload:
-        return False
+    if not isinstance(request, dict) or not isinstance(payload, dict) or payload.get("error"):
+        return ""
+    codes = request.get("taskCodes") or [request.get("taskCode")]
+    if not isinstance(codes, list) or task_code not in codes:
+        return ""
+    if "code" in payload and str(payload["code"]) != "0":
+        return ""
+    if payload.get("reqCode") and payload["reqCode"] != request.get("reqCode"):
+        return ""
     data = payload.get("data")
-    if isinstance(data, list) and not data:
-        return True
-    for key in ("taskStatus", "task_status", "status", "code"):
-        value = str(payload.get(key, "") or "").strip().lower()
-        if value in {"not_found", "not found", "missing", "none", "null", "404", "-1"}:
-            return True
-    message = str(payload.get("message", "") or payload.get("msg", "") or "").strip().lower()
-    return any(fragment in message for fragment in ("not found", "no existe", "inexistente", "not exist", "empty", "sin datos"))
+    items = data if isinstance(data, list) else [data] if isinstance(data, dict) else [payload]
+    for item in items:
+        if not isinstance(item, dict) or item.get("error") or str(item.get("taskCode") or item.get("task_code") or "") != task_code:
+            continue
+        if "code" in item and str(item["code"]) != "0":
+            continue
+        status = str(item.get("taskStatus") or item.get("task_status") or "").strip().lower()
+        if status in {"not_found", "not found"}:
+            # A successful task-scoped not-found, not a transport 404 or [] result.
+            return "not_found" if str(payload.get("code", item.get("code", ""))) == "0" else ""
+        return _normalized_cleanup_rcs_terminal_status(status)
+    return ""
+
+
+def _status_query_missing_task(order: MovementOrder) -> bool:
+    return _fresh_recovery_status(order) == "not_found"
+
+
+def _safe_local_release_evidence(order: MovementOrder, *, now: Optional[datetime] = None) -> bool:
+    if local_reconciliation_pending(order) or order.status == "cancel_requested_undo":
+        return False
+    return _fresh_recovery_status(order, now=now) in {"completed", "cancelled", "failed", "not_found"}
 
 
 def _cancel_undo_robot_recovery_reason(order: MovementOrder, *, now: datetime, min_age_minutes: int) -> tuple[bool, str]:
-    rcs_status = str(order.rcs_status or "").strip().lower()
-    if rcs_status in CANCEL_RETURN_RCS_TERMINAL_STATUSES:
-        return True, "SAFE_CANCEL_COMPLETED"
-    task_code = str(order.remote_task_code or "").strip().lower()
-    agv_code = str(order.agv_code or "").strip()
-    try:
-        monitor = _get_cached_robot_status_monitor_response(None, force=False, max_age_seconds=ROBOT_MONITOR_CACHE_MAX_AGE_SECONDS)
-    except Exception:
-        monitor = None
-    if monitor and getattr(monitor, "robots", None):
-        for robot in monitor.robots:
-            robot_code = str(robot.robotCode or robot.agvCode or "").strip()
-            same_agv = bool(agv_code and robot_code and agv_code == robot_code)
-            task_text = " ".join([
-                str(robot.taskStatus or ""),
-                str(robot.statusText or ""),
-                str(robot.podCode or ""),
-                str(robot.currentStation or ""),
-            ]).strip().lower()
-            mentions_task = bool(task_code and task_code in task_text)
-            running = str(robot.status or "").strip() in {"2", "3", "6", "8"} or any(word in task_text for word in ("execut", "running", "moving", "in_progress", "working"))
-            if mentions_task and running:
-                return False, "ROBOT_RUNNING_TASK"
-            if same_agv:
-                if str(robot.status or "").strip() == "4" or "idle" in task_text:
-                    return True, "SAFE_IDLE"
-                if not str(robot.taskStatus or "").strip() and not mentions_task:
-                    return True, "SAFE_NO_TASK"
-                if not running and not mentions_task:
-                    return True, "SAFE_NO_TASK"
-    if _status_query_missing_task(order):
+    if order.status == "cancel_requested_undo":
+        return False, "POSICION_FINAL_REQUIERE_RECONCILIACION"
+    observed = _fresh_recovery_status(order, now=now)
+    if observed == "not_found":
         return True, "SAFE_NOT_FOUND_IN_RCS"
-    if order.status_query_checked_at and order.status_query_checked_at < now - timedelta(minutes=min_age_minutes):
-        if not _robot_monitor_indicates_order_running(order):
-            return True, "SAFE_NO_ACTIVITY"
+    if observed in CANCEL_RETURN_RCS_TERMINAL_STATUSES and not local_reconciliation_pending(order):
+        return True, "SAFE_CANCEL_COMPLETED"
     return False, "SIN_EVIDENCIA_SEGURA"
 
 
@@ -11672,6 +11908,8 @@ def _cancel_undo_recovery_candidate(db, order: MovementOrder, *, now: datetime, 
 
 
 def _validate_cleanup_order_eligible(db, order: MovementOrder, *, now: datetime, min_age_minutes: int) -> tuple[bool, str]:
+    if not _safe_local_release_evidence(order, now=now):
+        return False, "Se requiere consulta RCS reciente y fiable de esta tarea; caché/timeout no confirma liberación"
     local_status = str(order.status or "").strip().lower()
     allowed_statuses = {"cancel_requested_undo", "cancel_requested_total", "dispatched"}
     rcs_status = str(order.rcs_status or "").strip().lower()
@@ -11794,6 +12032,8 @@ def _release_cleanup_rack_if_safe(db, rack_id: int, *, closed_order_id: int = 0,
 
 
 def _close_cleanup_order(db, order: MovementOrder, *, now: datetime, reason: str, admin_user: str) -> dict:
+    if not _safe_local_release_evidence(order, now=now):
+        raise HTTPException(status_code=409, detail="Recuperación sin evidencia RCS fiable; recursos retenidos.")
     old_status = order.status or ""
     if _normalized_cleanup_rcs_terminal_status(order.rcs_status) == "failed":
         return _force_close_old_active_order(db, order, now=now, admin_user=admin_user, reason=reason)
@@ -11826,8 +12066,8 @@ FORCE_RELEASE_ACTIVE_RCS_STATUSES = {
     "2", "dispatched", "in_progress", "executing", "running", "moving", "working", "canceling",
 }
 FORCE_RELEASE_RCS_ACTIVE_WARNING = (
-    "El RCS todavía reporta la tarea activa. Este cierre solo libera la orden y el rack "
-    "dentro de la aplicación; no detiene físicamente al robot ni cancela la tarea en RCS."
+    "RCS puede seguir ejecutando la tarea. Este cierre es solo local: no detiene al robot "
+    "ni cancela RCS y hará reutilizable el rack. Requiere confirm_local_only=true y un motivo explícito."
 )
 
 
@@ -11865,6 +12105,8 @@ def _normalized_cleanup_rcs_terminal_status(value) -> str:
 def _validate_force_release_order(order: MovementOrder, *, now: datetime, min_age_minutes: int) -> tuple[bool, str]:
     if (order.status or "") not in FORCE_RELEASE_ACTIVE_LOCAL_STATUSES:
         return False, f"orden no activa ID {order.id}"
+    if _safe_local_release_evidence(order, now=now):
+        return True, "Consulta RCS reciente y fiable: recuperación inmediata sin espera por antigüedad."
     age = _age_minutes(now, _order_age_anchor(order)) or 0
     if age < min_age_minutes:
         return False, (
@@ -11880,13 +12122,21 @@ def _validate_force_release_order(order: MovementOrder, *, now: datetime, min_ag
     return True, f"Orden activa desde hace {age} minutos; elegible para cierre local manual."
 
 
-def _force_close_old_active_order(db, order: MovementOrder, *, now: datetime, admin_user: str, reason: str = "") -> dict:
+def _force_close_old_active_order(db, order: MovementOrder, *, now: datetime, admin_user: str, reason: str = "", confirm_local_only: bool = False) -> dict:
+    evidence = _safe_local_release_evidence(order, now=now)
+    if not evidence and not (confirm_local_only and reason.strip()):
+        raise HTTPException(status_code=409, detail=FORCE_RELEASE_RCS_ACTIVE_WARNING)
     old_status = order.status or ""
+    remote_before = order.rcs_status
+    message_before = order.rcs_message
     rcs_status = str(order.rcs_status or "").strip().lower()
     normalized_rcs_terminal = _normalized_cleanup_rcs_terminal_status(rcs_status)
     is_confirmed_cancel_return = old_status == "cancel_requested_undo" and rcs_status in CANCEL_RETURN_RCS_TERMINAL_STATUSES
     is_confirmed_cancel_request = old_status == "cancel_requested_total" and rcs_status == "cancelled"
-    if is_confirmed_cancel_return:
+    if not evidence or normalized_rcs_terminal == "completed":
+        order.status = "forced_local_closed"
+        order.forced_local_close_reason = (reason or "admin_local_close_without_inventory_reconciliation")[:128]
+    elif is_confirmed_cancel_return:
         order.status = normalized_rcs_terminal
         order.rcs_status = normalized_rcs_terminal
         order.dispatch_status = order.dispatch_status or "success"
@@ -11918,10 +12168,13 @@ def _force_close_old_active_order(db, order: MovementOrder, *, now: datetime, ad
         order.rcs_message = ((order.rcs_message or "").strip() + " | Cierre local por recuperacion avanzada: RCS ya confirmo failed.").strip(" |")[:512]
     else:
         order.status = "forced_local_closed"
-        order.rcs_status = "unknown_or_not_found"
-        order.dispatch_status = "forced_closed"
         order.forced_local_close_reason = (reason or "admin_force_release_old_active_order")[:128]
-        order.rcs_message = "Cierre local forzado por admin: orden vieja no confirmada en RCS"
+    order.rcs_status = remote_before
+    order.rcs_message = ((message_before or "") + " | CIERRE LOCAL EXTRAORDINARIO: no cancela RCS ni confirma movimiento lógico.")[:512]
+    db.add(order)
+    db.flush()
+    stop_fifo_chain(db, order)
+    _append_status_query_log(db, order, kind="admin_force_local_close", request_payload={"reqCode": order.req_code, "taskCode": order.remote_task_code, "actor": admin_user, "reason": reason, "confirm_local_only": confirm_local_only}, response_payload={"previous_local_status": old_status, "remote_status_preserved": remote_before, "remote_message": message_before, "fresh_evidence": evidence})
     order.forced_local_close = 1
     order.forced_local_close_at = now
     order.updated_at = now
@@ -11936,6 +12189,7 @@ def _force_close_old_active_order(db, order: MovementOrder, *, now: datetime, ad
         closed_at=now,
         auto_commit=False,
     )
+    order.rcs_status = remote_before
     db.add(order)
     rack = db.execute(select(Rack).where(Rack.id == order.rack_id)).scalar_one_or_none() if order.rack_id else None
     if old_status == "cancel_requested_undo":
@@ -11993,7 +12247,7 @@ def _force_close_old_active_order(db, order: MovementOrder, *, now: datetime, ad
         created_at=now,
         auto_commit=False,
     )
-    return {"order_id": order.id, "order_code": order.order_code, "rack_id": order.rack_id, "old_status": old_status, "new_status": order.status, "order_age_minutes": age_minutes}
+    return {"order_id": order.id, "order_code": order.order_code, "rack_id": order.rack_id, "old_status": old_status, "new_status": order.status, "order_age_minutes": age_minutes, "local_only": True, "warning": FORCE_RELEASE_RCS_ACTIVE_WARNING, "remote_status": remote_before}
 
 
 def _auto_release_stuck_cancel_return_orders(db, *, now: datetime) -> int:
@@ -12010,6 +12264,9 @@ def _auto_release_stuck_cancel_return_orders(db, *, now: datetime) -> int:
     ).all()
     released_count = 0
     for order, rack in rows:
+        # Idle/not-found/age alone does not confirm cancelTask or its return.
+        if str(order.rcs_status or "").strip().lower() not in CANCEL_RETURN_RCS_TERMINAL_STATUSES:
+            continue
         age_source = order.closed_at or order.updated_at or order.created_at or now
         age_minutes = int(max(0, (now - age_source).total_seconds() // 60))
         eligible, reason = _cancel_undo_recovery_candidate(db, order, now=now, min_age_minutes=min_age_minutes)
@@ -12569,6 +12826,7 @@ def force_release_old_active_racks(body: CleanupSelectionIn, x_admin_token: Opti
 
     with SessionLocal() as db:
         min_age_minutes = _force_release_min_age_minutes(db)
+        db.execute(update(Rack).where(Rack.id.in_(rack_ids)).values(updated_at=Rack.updated_at))
         for rack_id in rack_ids:
             rack = db.execute(select(Rack).where(Rack.id == rack_id)).scalar_one_or_none()
             if not rack:
@@ -12585,7 +12843,8 @@ def force_release_old_active_racks(body: CleanupSelectionIn, x_admin_token: Opti
                 and not _robot_monitor_indicates_order_running(order)
                 and _validate_force_release_order(order, now=now, min_age_minutes=min_age_minutes)[0]
             ]
-            if len(active_orders) > 1 and confirmed_failed_orders:
+            reconciled_failed_orders = bool(len(active_orders) > 1 and confirmed_failed_orders)
+            if reconciled_failed_orders:
                 for order in confirmed_failed_orders:
                     closed_orders.append(_force_close_old_active_order(db, order, now=now, admin_user=admin_user, reason=(body.reason or "").strip()))
                 db.flush()
@@ -12593,10 +12852,10 @@ def force_release_old_active_racks(body: CleanupSelectionIn, x_admin_token: Opti
             if len(active_orders) > 1:
                 skipped.append({"rack_id": rack_id, "rack_code": rack.code, "reason": "No se puede liberar: existe otra orden activa asociada al mismo rack."})
                 continue
-            if active_orders and confirmed_failed_orders:
+            if active_orders and reconciled_failed_orders:
                 skipped.append({"rack_id": rack_id, "rack_code": rack.code, "reason": "Orden fallida reconciliada; el rack permanece reservado porque existe otra orden activa asociada."})
                 continue
-            if any(_rcs_status_still_active(order) for order in active_orders) and not body.confirm_local_only:
+            if any(not _safe_local_release_evidence(order, now=now) for order in active_orders) and not (body.confirm_local_only and (body.reason or "").strip()):
                 raise HTTPException(status_code=409, detail=FORCE_RELEASE_RCS_ACTIVE_WARNING)
 
             confirmed_cancel_requests = [
@@ -12620,7 +12879,7 @@ def force_release_old_active_racks(body: CleanupSelectionIn, x_admin_token: Opti
                 continue
 
             for order in active_orders:
-                closed_orders.append(_force_close_old_active_order(db, order, now=now, admin_user=admin_user, reason=(body.reason or "").strip()))
+                closed_orders.append(_force_close_old_active_order(db, order, now=now, admin_user=admin_user, reason=(body.reason or "").strip(), confirm_local_only=body.confirm_local_only))
 
             old_status = rack.status or ""
             related_order_id = active_orders[0].id if active_orders else None
@@ -12688,6 +12947,8 @@ def create_old_active_order_for_force_release_test(body: TestCreateOldActiveOrde
     with SessionLocal() as db:
         if not _dev_tools_enabled(db):
             raise HTTPException(status_code=404, detail="No encontrado")
+        if not _truthy_config_value(get_setting(db, "rcs_simulator_enabled", "0")):
+            raise HTTPException(status_code=409, detail="La creación de órdenes de prueba requiere el simulador habilitado.")
 
         rack = db.execute(select(Rack).where(Rack.id == body.rack_id)).scalar_one_or_none()
         if not rack:
@@ -12820,6 +13081,7 @@ def update_rack(rack_id: int, body: RackIn, x_admin_token: Optional[str] = Heade
             raise HTTPException(status_code=400, detail="Material no encontrado")
         if int(mat.is_active or 0) != 1:
             raise HTTPException(status_code=409, detail="El material está inactivo; restáuralo antes de asignarlo al rack")
+        _guard_admin_inventory_edit(db, rack_ids=[rack_id])
         requested_status = (body.status or "").strip()
         if rack_status_is_reserved(requested_status):
             requested_status = rack_status_from_reservation(True)
@@ -13276,12 +13538,27 @@ def _mark_order_cancelled_without_undo(db, order_row: MovementOrder, *, source: 
 
 
 def _execute_cancel_for_order(db, row: MovementOrder, force_cancel: str, matter_area: str = '', undo_on_accept: Optional[bool] = None, source: str = "local_ui", actor: str = "local_ui") -> MovementOrder:
+    db.refresh(row)
+    if row.status in CANCEL_REQUEST_STATUSES:
+        # Persisted claim: repeated requests must neither resend nor undo locally.
+        stop_fifo_chain(db, row)
+        db.commit()
+        return row
+    if row.dispatch_status == "uncertain" and not row.remote_task_code:
+        raise HTTPException(status_code=409, detail="Creación incierta sin taskCode: reconciliar en RCS antes de cancelar o deshacer localmente.")
     logger.info("Cancel requested order_id=%s order_code=%s force_cancel=%s undo_on_accept=%s", row.id, row.order_code, force_cancel, undo_on_accept)
     previous_status = row.status or ""
     remote_task_code = (row.remote_task_code or '').strip()
     force_cancel_value = str(force_cancel or '0')
-    should_undo_locally = bool(undo_on_accept) if undo_on_accept is not None else (force_cancel_value == '1')
+    # Compatibility argument retained for callers; forceCancel defines the RCS action.
+    should_undo_locally = force_cancel_value == '1'
     should_call_remote_cancel = bool(remote_task_code) and row.status in {'pending_dispatch', 'dispatched', 'in_progress'}
+    if not should_call_remote_cancel:
+        raise HTTPException(status_code=409, detail='Se requiere una tarea remota activa con taskCode; no se ejecutará un deshacer local.')
+    if force_cancel_value not in {'0', '1'}:
+        raise HTTPException(status_code=400, detail='forceCancel debe ser 0 o 1')
+    if should_undo_locally and not str(matter_area or '').strip():
+        raise HTTPException(status_code=400, detail='Cancel Return requiere un área de retorno (matterArea).')
 
     cancel_payload = {
         'reqCode': generate_req_code_ms(),
@@ -13289,12 +13566,32 @@ def _execute_cancel_for_order(db, row: MovementOrder, force_cancel: str, matter_
         'clientCode': '',
         'tokenCode': '',
         'forceCancel': force_cancel_value,
-        'matterArea': matter_area or '',
+        'matterArea': str(matter_area or '').strip() if should_undo_locally else '',
         'agvCode': '',
         'taskCode': remote_task_code,
     }
 
     if should_call_remote_cancel:
+        # Claim before network I/O, across sessions/processes. A crash or timeout
+        # leaves the claim and reservations intact, never an automatic resend.
+        pending_status = 'cancel_requested_undo' if force_cancel_value == '1' else 'cancel_requested_total'
+        claimed = db.execute(update(MovementOrder).where(
+            MovementOrder.id == row.id,
+            MovementOrder.status == previous_status,
+            MovementOrder.remote_task_code == remote_task_code,
+        ).values(status=pending_status, rcs_status='cancel_unknown', updated_at=datetime.utcnow())
+          .execution_options(synchronize_session=False)).rowcount
+        if not claimed:
+            db.rollback()
+            db.refresh(row)
+            if row.status in CANCEL_REQUEST_STATUSES:
+                return row
+            raise HTTPException(status_code=409, detail='La orden cambió durante la cancelación; actualiza su estado.')
+        db.refresh(row)
+        stop_fifo_chain(db, row)
+        _append_status_query_log(db, row, kind='cancel_task_requested', request_payload=cancel_payload,
+                                 response_payload=None, message='Cancelación pendiente de confirmación RCS')
+        db.commit()
         debug_base_url = ""
         debug_endpoint = "/rcms/services/rest/hikRpcService/cancelTask"
         try:
@@ -13304,31 +13601,34 @@ def _execute_cancel_for_order(db, row: MovementOrder, force_cancel: str, matter_
             cancel_payload['tokenCode'] = token_code or ''
             logger.info("[CANCEL TASK] order_id=%s order_code=%s source=%s admin=%s remote=1 force_cancel=%s reason=cancelTask", row.id, row.order_code, source, actor, force_cancel_value)
             _append_debug_console_event(db, direction="sent", module="cancel_task", base_url=debug_base_url, endpoint=debug_endpoint, payload={**cancel_payload, "source": source, "admin": actor}, message=f"Cancelación de {row.order_code}")
-            cancel_response = client.cancel_task_with_payload(cancel_payload)
+            cancel_response = trace_call("cancel", [row], client.cancel_task_with_payload, cancel_payload)
+            db.refresh(row)
             _append_debug_console_event(db, direction="received", module="cancel_task", base_url=debug_base_url, endpoint=debug_endpoint, payload=cancel_response.raw, message=cancel_response.message or f"Respuesta cancelTask para {row.order_code}")
             now = datetime.utcnow()
-            row.req_code = cancel_response.reqCode or cancel_payload['reqCode']
+            # El reqCode de cancelación queda en su JSON, no sustituye la creación.
             row.rcs_last_update = now
             row.rcs_message = cancel_response.message or row.rcs_message
             _append_status_query_log(db, row, kind='cancel_task', request_payload=cancel_payload, response_payload=cancel_response.raw, message=cancel_response.message or '', arrived_at=now)
         except Exception as exc:
+            db.rollback()
+            db.refresh(row)
             logger.exception("Cancel task failed | task_id=%s | order_code=%s | remote_task_code=%s | source=%s | actor=%s", row.id, row.order_code, remote_task_code or "-", source, actor)
             _append_debug_console_event(db, direction="received", module="cancel_task", base_url=debug_base_url, endpoint=debug_endpoint, payload={"error": str(exc)}, message=str(exc))
             now = datetime.utcnow()
             error_payload = {'error': str(exc)}
             row.rcs_last_update = now
             row.rcs_message = str(exc)
+            if row.status in CANCEL_REQUEST_STATUSES:
+                row.rcs_status = 'cancel_unknown'
             _append_status_query_log(db, row, kind='cancel_task', request_payload=cancel_payload, response_payload=error_payload, message=str(exc), arrived_at=now)
             db.commit()
             db.refresh(row)
             raise HTTPException(status_code=502, detail=f'Error cancelando tarea en RCS: {exc}')
-    elif not should_undo_locally:
-        # Cancelación total requiere taskCode remoto activo.
-        raise HTTPException(status_code=400, detail='La orden seleccionada ya no está activa en el RCS y no puede cancelarse de forma total')
 
     if should_call_remote_cancel:
         if not cancel_response.ok:
-            row.rcs_status = 'cancel_error'
+            if row.status in CANCEL_REQUEST_STATUSES:
+                row.rcs_status = 'cancel_error'
             row.rcs_status_changed_at = datetime.utcnow()
             row.rcs_message = cancel_response.message or 'El RCS rechazó la cancelación'
             row.updated_at = datetime.utcnow()
@@ -13346,7 +13646,10 @@ def _execute_cancel_for_order(db, row: MovementOrder, force_cancel: str, matter_
                     "suggested_action": "Revisar en Diagnóstico y limpieza.",
                 },
             })
-        row.status = 'cancel_requested_undo' if should_undo_locally else 'cancel_requested_total'
+        # A terminal query may have arrived while cancelTask was in flight.
+        if row.status not in CANCEL_REQUEST_STATUSES:
+            db.commit()
+            return row
         row.rcs_status = 'cancel_requested'
         row.rcs_status_changed_at = datetime.utcnow()
         _audit_order_close(db, row, previous_status=previous_status, new_status=row.status, source=source, reason="cancelTask enviado al RCS", actor=actor, closed_at=datetime.utcnow(), auto_commit=False)
@@ -13355,14 +13658,6 @@ def _execute_cancel_for_order(db, row: MovementOrder, force_cancel: str, matter_
             apply_rack_reservation_status(rack, True, updated_at=datetime.utcnow(), order_id=row.id, dispatch_status=row.status, source=source, reason="cancel_requested_waiting_remote_terminal")
             db.add(rack)
         note = 'Cancelación enviada al RCS. El rack permanece reservado mientras se espera la confirmación final de estatus.'
-    elif should_undo_locally:
-        logger.info("[UNDO TASK] order_id=%s order_code=%s source=%s admin=%s reason=local_undo", row.id, row.order_code, source, actor)
-        row = undo_movement_order(db, row.id)
-        _audit_order_close(db, row, previous_status=previous_status, new_status=row.status, source=source, reason="cancelación local con deshacer", actor=actor, closed_at=datetime.utcnow(), auto_commit=False)
-        note = 'Cancelación local con deshacer: el rack se regresó a la celda de origen en el sistema. No se llamó cancelTask porque la orden ya no estaba activa en el RCS.'
-    else:
-        row = _mark_order_cancelled_without_undo(db, row, source=source, actor=actor, reason="cancelación total local")
-        note = 'RCS cancelTask forceCancel=0 (cancelación total).'
 
     row.comment = ((row.comment or '').strip() + ' | ' + note).strip(' |')[:512]
     row.updated_at = datetime.utcnow()
@@ -13373,6 +13668,14 @@ def _execute_cancel_for_order(db, row: MovementOrder, force_cancel: str, matter_
         _start_rack_position_poll_after_cancel(row.id, row.rack_id, source=source, actor=actor)
     logger.info("Cancel processed order_id=%s order_code=%s status=%s", row.id, row.order_code, row.status)
     return row
+
+
+def _operator_direct_cell_ids(button_row, action_body):
+    # Explicit UI selection is a pair: never mix it with stale configured defaults.
+    if button_row.action_mode == 'direct_move_config' or (action_body is not None and
+            {'source_cell_id', 'destination_cell_id'} & action_body.model_fields_set):
+        return (action_body.source_cell_id, action_body.destination_cell_id) if action_body else (None, None)
+    return button_row.source_cell_id, button_row.destination_cell_id
 
 
 def _preview_window_button(db, window_row: OperatorWindow, button_row: OperatorWindowButton, action_body: Optional[OperatorWindowActionIn] = None) -> OperatorWindowPreviewOut:
@@ -13397,11 +13700,7 @@ def _preview_window_button(db, window_row: OperatorWindow, button_row: OperatorW
         }
         return OperatorWindowPreviewOut(ok=True, action_mode='fifo', message='Se generará una orden FIFO.', summary=summary, payload=payload)
     if button_row.action_mode in {'direct_move', 'direct_move_config'}:
-        source_cell_id = button_row.source_cell_id
-        destination_cell_id = button_row.destination_cell_id
-        if button_row.action_mode == 'direct_move_config':
-            source_cell_id = action_body.source_cell_id if action_body else None
-            destination_cell_id = action_body.destination_cell_id if action_body else None
+        source_cell_id, destination_cell_id = _operator_direct_cell_ids(button_row, action_body)
         if not source_cell_id or not destination_cell_id:
             raise HTTPException(status_code=400, detail='Debes seleccionar celda origen y celda destino para el movimiento directo')
         source_cell = db.execute(select(Location).where(Location.id == source_cell_id)).scalar_one_or_none()
@@ -13524,13 +13823,10 @@ def _execute_window_button(db, window_row: OperatorWindow, button_row: OperatorW
         )
         return order
     if button_row.action_mode in {'direct_move', 'direct_move_config'}:
-        source_cell_id = button_row.source_cell_id
-        destination_cell_id = button_row.destination_cell_id
+        source_cell_id, destination_cell_id = _operator_direct_cell_ids(button_row, action_body)
         agv_code = button_row.agv_code
         task_typ = button_row.task_typ
         if button_row.action_mode == 'direct_move_config':
-            source_cell_id = action_body.source_cell_id if action_body else None
-            destination_cell_id = action_body.destination_cell_id if action_body else None
             agv_code = (action_body.agv_code if action_body and action_body.agv_code else button_row.agv_code)
             task_typ = (action_body.task_typ if action_body and action_body.task_typ else button_row.task_typ)
         if not source_cell_id or not destination_cell_id:
@@ -13571,20 +13867,8 @@ def _execute_window_button(db, window_row: OperatorWindow, button_row: OperatorW
         if action_body:
             if visible_material_ids and action_body.material_group_id and action_body.material_group_id not in visible_material_ids:
                 raise HTTPException(status_code=400, detail='El material seleccionado no está habilitado para este botón')
-            material_for_rack = action_body.material_group_id if action_body.material_group_id else rack.material_group_id
-            if not material_for_rack:
-                material_for_rack = _ensure_no_material_group_in_db(db).id
-            rack.material_group_id = material_for_rack
-            rack.lot = (action_body.lot or '').strip() or None
-            rack.quantity = int(action_body.quantity or 0)
-            rack.manufacturer_code = (action_body.manufacturer_code or '').strip() or None
-            rack.comment = (action_body.comment or '').strip() or None
-            if action_body.custom_field_values:
-                _apply_action_custom_fields_to_rack(rack, action_body.custom_field_values)
-            rack.updated_at = datetime.utcnow()
-            db.add(rack)
-            db.commit()
-            db.refresh(rack)
+            if action_body.material_group_id and not db.get(MaterialGroup, action_body.material_group_id):
+                raise HTTPException(status_code=400, detail="Material inexistente")
         order = execute_direct_move_request(
             db,
             source_cell.id,
@@ -13596,6 +13880,25 @@ def _execute_window_button(db, window_row: OperatorWindow, button_row: OperatorW
             (action_body.task_typ if action_body and action_body.task_typ else button_row.task_typ),
             window_row.id,
         )
+        if action_body:
+            # Detached value object: no inventory mutation before confirmed dispatch.
+            fields = ("material_group_id", "lot", "quantity", "manufacturer_code", "comment", "rack_custom_fields_json")
+            proposal = Rack(**{name: getattr(rack, name) for name in fields})
+            proposal.material_group_id = proposal.material_group_id or order.material_group_id
+            for name in fields[:-1]:
+                if name in action_body.model_fields_set:
+                    value = getattr(action_body, name)
+                    if name == "material_group_id" and not value:
+                        continue
+                    if name == "quantity" and value is None:
+                        value = 0
+                    setattr(proposal, name, value.strip() or None if isinstance(value, str) else value)
+            if action_body.custom_field_values:
+                _apply_action_custom_fields_to_rack(proposal, action_body.custom_field_values)
+            order._pending_point_inventory = {name: getattr(proposal, name) for name in fields}
+            _append_status_query_log(db, order, kind="point_inventory_proposed", request_payload=order._pending_point_inventory,
+                                     response_payload=None, message="No aplicado hasta aceptación de creación RCS")
+            db.commit()
         return order
     raise HTTPException(status_code=400, detail='Modo de botón inválido')
 
@@ -13688,6 +13991,11 @@ def operator_preview_window_button(window_id: int, button_index: int, body: Oper
 
 
 def _rollback_unsuccessful_order_dispatch(db, order: MovementOrder, error_message: Optional[str] = None) -> dict:
+    db.refresh(order)
+    if order.status == "dispatch_error":
+        return {"executed": False, "movement_order_id": order.id, "reason": "already_compensated"}
+    if order.dispatch_status == "uncertain" or order.remote_task_code:
+        return {"executed": False, "movement_order_id": order.id, "reason": "remote_creation_not_safely_rejected"}
     now = datetime.utcnow()
     message = (error_message or order.rcs_message or "Dispatch error").strip()
     previous_status = order.status or ""
@@ -13779,12 +14087,17 @@ def operator_execute_window_button(window_id: int, button_index: int, body: Oper
         order = _execute_window_button(db, row, button_row, body)
         if order is None:
             raise HTTPException(status_code=400, detail='No se pudo generar la orden')
+        if button_row.action_mode == 'cancel_return':
+            # Return is managed by cancelTask in RCS, never by createTask.
+            return _movement_order_out_read_optimized(db, order)
         logger.info("Task created | task_id=%s | order_code=%s | source=operator_window | window_id=%s | button_index=%s | rack_id=%s | agv=%s | status=%s", order.id, order.order_code, window_id, button_index, order.rack_id, order.agv_code or "-", order.status)
         rack = db.execute(select(Rack).where(Rack.id == order.rack_id)).scalar_one_or_none()
         if rack:
             _audit_rack_reservation_change(db, rack=rack, previous_status="available", new_status=rack.status, source="operator_window", related_order_id=order.id, reason=f"operator_window:{button_row.action_mode}", actor=f"operator_window:{row.name}", auto_commit=False)
             db.commit()
         dispatch_result = _dispatch_movement_order(db, order)
+        if dispatch_result.dispatch_status == "uncertain":
+            raise HTTPException(status_code=409, detail=f"Orden {order.id}: creación incierta; recursos retenidos. Revisar en RCS antes de reenviar.")
         if dispatch_result.dispatch_status != "success":
             message = dispatch_result.rcs_message or 'El RCS rechazó la creación de la tarea'
             _rollback_unsuccessful_order_dispatch(db, order, message)

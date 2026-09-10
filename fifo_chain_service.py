@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 from typing import Callable, Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, update, or_
 
 from fifo_service import (
     ACTIVE_RACK_STATUSES,
@@ -15,6 +15,7 @@ from fifo_service import (
     _normalize_priority,
     _normalize_rack_status,
     _resolve_material_group_for_fifo,
+    _claim_movement_resources,
 )
 from logging_config import get_logger
 from models import Area, Location, MaterialGroup, MovementOrder, Rack, apply_rack_reservation_status
@@ -359,7 +360,103 @@ def _dispatch_next_order(db, order: MovementOrder, dispatch_func=_USE_DEFAULT_DI
     return resolved_dispatch_func(db, order)
 
 
+def stop_fifo_chain(db, order: MovementOrder) -> None:
+    """Persist intent in the caller's cancellation transaction, without RCS calls."""
+    if order.route_mode == "fifo_chain" and order.fifo_chain_group_id:
+        db.execute(update(MovementOrder).where(
+            MovementOrder.fifo_chain_group_id == order.fifo_chain_group_id,
+        ).values(fifo_chain_status="cancelled", updated_at=datetime.utcnow())
+          .execution_options(synchronize_session=False))
+        db.refresh(order)
+
+
+def _chain_stopped(db, group_id: str) -> bool:
+    return db.execute(select(MovementOrder.id).where(
+        MovementOrder.fifo_chain_group_id == group_id,
+        MovementOrder.fifo_chain_status.in_(("cancelled", "canceled")),
+    ).limit(1)).first() is not None
+
+
+def _lock_parent(db, order_id: int) -> MovementOrder:
+    # First write acquires SQLite's cross-process writer lock. Re-read only
+    # afterwards; hold through slot lookup, resource claim and child INSERT.
+    db.execute(update(MovementOrder).where(MovementOrder.id == order_id)
+               .values(fifo_chain_step=MovementOrder.fifo_chain_step)
+               .execution_options(synchronize_session=False))
+    return db.get(MovementOrder, order_id, populate_existing=True)
+
+
+def _validate_parent(db, order: MovementOrder) -> None:
+    if not order or order.route_mode != "fifo_chain" or not order.fifo_chain_group_id:
+        raise ValueError("Orden sin grupo FIFO Chain")
+    if order.status != "completed" or order.dispatch_status != "success":
+        raise ValueError("El paso padre no terminó correctamente")
+    if str(order.rcs_status or "").lower() != "completed":
+        raise ValueError("El padre no tiene confirmación completed")
+    if _chain_stopped(db, order.fifo_chain_group_id):
+        raise ValueError("Cadena cancelada; no crear siguientes pasos")
+
+
+def _existing_child(db, order: MovementOrder):
+    return db.execute(select(MovementOrder).where(
+        MovementOrder.fifo_chain_group_id == order.fifo_chain_group_id,
+        MovementOrder.fifo_chain_step == int(order.fifo_chain_step) + 1,
+    )).scalar_one_or_none()
+
+
+def _finish_chain_dispatch(db, order: MovementOrder, dispatch_func=_USE_DEFAULT_DISPATCH):
+    order_id = order.id
+    try:
+        # Serialize stop intent with the dispatcher's persisted send claim too,
+        # including a restart after child COMMIT but before the first POST.
+        _lock_parent(db, order.fifo_chain_parent_order_id or order_id)
+        db.refresh(order)
+        if _chain_stopped(db, order.fifo_chain_group_id):
+            db.commit()
+            return order
+        # Phase 1A's persisted dispatch claim prevents replay even if two recovery
+        # workers both find an already-created, never-sent child.
+        if order.status == "pending_dispatch" and order.dispatch_status == "not_sent":
+            _dispatch_next_order(db, order, dispatch_func)
+    except Exception as exc:
+        db.rollback()
+        order = db.get(MovementOrder, order_id, populate_existing=True)
+        # Never convert uncertain/identified remote creation into a safe rejection.
+        if not order.dispatch_request_json and not order.remote_task_code and order.dispatch_status == "not_sent":
+            order.dispatch_status = "error"
+        order.rcs_message = str(exc)[:512]
+        db.commit()
+        logger.exception("FIFO_CHAIN_DISPATCH_EXCEPTION next_order_id=%s", order_id)
+    db.refresh(order)
+    if order.dispatch_status in {"error", "dispatch_error"} and not order.remote_task_code:
+        from main import _rollback_unsuccessful_order_dispatch
+        _rollback_unsuccessful_order_dispatch(db, order, order.rcs_message)
+        chain_state = "dispatch_error"
+    elif order.dispatch_status == "uncertain":
+        chain_state = "dispatch_uncertain"
+    elif order.dispatch_status == "success":
+        chain_state = "advanced"
+    else:
+        chain_state = "waiting_dispatch"
+    # Conditional updates must not erase a concurrent stop intent.
+    db.execute(update(MovementOrder).where(
+        or_(MovementOrder.id == order.fifo_chain_parent_order_id,
+            (MovementOrder.id == order.id) & (MovementOrder.status != "completed")),
+        MovementOrder.fifo_chain_status.notin_(("cancelled", "canceled")),
+    ).values(fifo_chain_status=chain_state, updated_at=datetime.utcnow())
+      .execution_options(synchronize_session=False))
+    db.commit()
+    db.refresh(order)
+    return order
+
+
 def create_fifo_chain_next_step(db, completed_order: MovementOrder, config: dict, dispatch_func=_USE_DEFAULT_DISPATCH) -> MovementOrder:
+    completed_order = _lock_parent(db, completed_order.id)
+    _validate_parent(db, completed_order)
+    existing = _existing_child(db, completed_order)
+    if existing:
+        db.commit()
+        return _finish_chain_dispatch(db, existing, dispatch_func)
     if (completed_order.route_mode or "") != "fifo_chain":
         raise ValueError("La orden completada no pertenece a fifo_chain")
     current_step = int(completed_order.fifo_chain_step or 0)
@@ -426,6 +523,17 @@ def create_fifo_chain_next_step(db, completed_order: MovementOrder, config: dict
     if same_cell_move and not allow_same_cell_move:
         raise ValueError("La celda origen y destino no pueden ser la misma, salvo que se habilite Permitir movimiento en la misma celda.")
 
+    # Catalog helpers may commit while resolving SIN_MATERIAL. Reacquire and
+    # recheck the slot after selection, before any resource/child mutation.
+    completed_order = _lock_parent(db, completed_order.id)
+    _validate_parent(db, completed_order)
+    existing = _existing_child(db, completed_order)
+    if existing:
+        db.commit()
+        return _finish_chain_dispatch(db, existing, dispatch_func)
+    _claim_movement_resources(db, rack, source_cell, destination_cell,
+                              allow_same_cell_move=allow_same_cell_move)
+
     now = datetime.utcnow()
     order = MovementOrder(
         order_code=f"FIFOCHAIN-{now.strftime('%Y%m%d%H%M%S%f')}-{rack.id}",
@@ -470,6 +578,8 @@ def create_fifo_chain_next_step(db, completed_order: MovementOrder, config: dict
     db.add(source_cell)
     db.add(destination_cell)
     db.add(order)
+    completed_order.fifo_chain_status = "waiting_dispatch"
+    db.add(completed_order)
     db.flush()
     apply_rack_reservation_status(
         rack,
@@ -502,45 +612,7 @@ def create_fifo_chain_next_step(db, completed_order: MovementOrder, config: dict
         fifo_material_policy,
     )
 
-    try:
-        dispatch_result = _dispatch_next_order(db, order, dispatch_func)
-        if dispatch_result:
-            db.refresh(order)
-            logger.info(
-                "FIFO_CHAIN_NEXT_STEP_DISPATCHED fifo_chain_group_id=%s completed_order_id=%s next_order_id=%s dispatch_status=%s rcs_message=%s",
-                completed_order.fifo_chain_group_id,
-                completed_order.id,
-                order.id,
-                getattr(dispatch_result, "dispatch_status", None),
-                getattr(dispatch_result, "rcs_message", None),
-            )
-            if getattr(dispatch_result, "dispatch_status", None) != "success":
-                logger.error(
-                    "FIFO_CHAIN_NEXT_STEP_DISPATCH_FAILED fifo_chain_group_id=%s completed_order_id=%s next_order_id=%s dispatch_status=%s rcs_message=%s",
-                    completed_order.fifo_chain_group_id,
-                    completed_order.id,
-                    order.id,
-                    getattr(dispatch_result, "dispatch_status", None),
-                    getattr(dispatch_result, "rcs_message", None),
-                )
-    except Exception as exc:
-        db.rollback()
-        order = db.execute(select(MovementOrder).where(MovementOrder.id == order.id)).scalar_one()
-        order.dispatch_status = "error"
-        order.rcs_status = "error"
-        order.rcs_message = str(exc)[:512]
-        order.updated_at = datetime.utcnow()
-        db.add(order)
-        db.commit()
-        db.refresh(order)
-        logger.exception(
-            "FIFO_CHAIN_NEXT_STEP_DISPATCH_FAILED fifo_chain_group_id=%s completed_order_id=%s next_order_id=%s error=%s",
-            completed_order.fifo_chain_group_id,
-            completed_order.id,
-            order.id,
-            exc,
-        )
-    return order
+    return _finish_chain_dispatch(db, order, dispatch_func)
 
 
 def _result(status: str, reason: str, *, completed_order_id: Optional[int] = None, next_order: Optional[MovementOrder] = None, error: Optional[str] = None) -> dict:
@@ -555,7 +627,7 @@ def _result(status: str, reason: str, *, completed_order_id: Optional[int] = Non
 
 
 def trigger_fifo_chain_next_step_if_needed(db, completed_order_id: int, dispatch_func=_USE_DEFAULT_DISPATCH) -> dict:
-    order = db.execute(select(MovementOrder).where(MovementOrder.id == completed_order_id)).scalar_one_or_none()
+    order = db.get(MovementOrder, completed_order_id, populate_existing=True)
     if not order:
         logger.info("FIFO_CHAIN_NEXT_STEP_SKIP completed_order_id=%s reason=order_not_found", completed_order_id)
         return _result("skipped", "order_not_found", completed_order_id=completed_order_id)
@@ -573,16 +645,24 @@ def trigger_fifo_chain_next_step_if_needed(db, completed_order_id: int, dispatch
     if (order.route_mode or "") != "fifo_chain" or int(order.fifo_chain_step or 0) <= 0 or int(order.fifo_chain_total_steps or 0) <= 0:
         logger.info("FIFO_CHAIN_NEXT_STEP_SKIP fifo_chain_group_id=%s completed_order_id=%s reason=not_fifo_chain", order.fifo_chain_group_id, order.id)
         return _result("skipped", "not_fifo_chain", completed_order_id=order.id)
+    order = _lock_parent(db, completed_order_id)
+    if _chain_stopped(db, order.fifo_chain_group_id):
+        db.commit()
+        return _result("skipped", "chain_cancelled", completed_order_id=order.id)
     if (order.status or "") != "completed":
+        db.commit()
         logger.info("FIFO_CHAIN_NEXT_STEP_SKIP fifo_chain_group_id=%s completed_order_id=%s reason=not_completed", order.fifo_chain_group_id, order.id)
         return _result("skipped", "not_completed", completed_order_id=order.id)
-    if (order.dispatch_status or "") in {"error", "dispatch_error"}:
+    if (order.dispatch_status or "") != "success":
+        db.commit()
         logger.info("FIFO_CHAIN_NEXT_STEP_SKIP fifo_chain_group_id=%s completed_order_id=%s reason=dispatch_error", order.fifo_chain_group_id, order.id)
         return _result("skipped", "dispatch_error", completed_order_id=order.id)
-    if str(order.rcs_status or "").strip().lower() in {"error", "failed", "cancelled", "canceled"}:
+    if str(order.rcs_status or "").strip().lower() != "completed":
+        db.commit()
         logger.info("FIFO_CHAIN_NEXT_STEP_SKIP fifo_chain_group_id=%s completed_order_id=%s reason=rcs_terminal_error", order.fifo_chain_group_id, order.id)
         return _result("skipped", "rcs_terminal_error", completed_order_id=order.id)
     if not (order.fifo_chain_group_id or "").strip():
+        db.commit()
         logger.info("FIFO_CHAIN_NEXT_STEP_SKIP completed_order_id=%s reason=missing_group", order.id)
         return _result("skipped", "missing_group", completed_order_id=order.id)
     current_step = int(order.fifo_chain_step)
@@ -595,25 +675,17 @@ def trigger_fifo_chain_next_step_if_needed(db, completed_order_id: int, dispatch
         logger.info("FIFO_CHAIN_NEXT_STEP_SKIP fifo_chain_group_id=%s completed_order_id=%s reason=chain_completed", order.fifo_chain_group_id, order.id)
         return _result("skipped", "chain_completed", completed_order_id=order.id)
     if not (order.fifo_chain_next_config_json or "").strip():
+        db.commit()
         logger.info("FIFO_CHAIN_NEXT_STEP_SKIP fifo_chain_group_id=%s completed_order_id=%s reason=missing_next_config", order.fifo_chain_group_id, order.id)
         return _result("skipped", "missing_next_config", completed_order_id=order.id)
 
     next_step = current_step + 1
-    existing = db.execute(
-        select(MovementOrder)
-        .where(MovementOrder.fifo_chain_group_id == order.fifo_chain_group_id)
-        .where(MovementOrder.fifo_chain_step == next_step)
-    ).scalars().first()
+    existing = _existing_child(db, order)
     if existing:
-        order.fifo_chain_status = "completed"
-        order.updated_at = datetime.utcnow()
-        db.add(order)
         db.commit()
+        existing = _finish_chain_dispatch(db, existing, dispatch_func)
         logger.info("FIFO_CHAIN_NEXT_STEP_SKIP fifo_chain_group_id=%s completed_order_id=%s next_order_id=%s reason=next_step_exists", order.fifo_chain_group_id, order.id, existing.id)
         return _result("existing_next_step", "next_step_exists", completed_order_id=order.id, next_order=existing)
-    if str(order.fifo_chain_status or "").strip().lower() in {"completed", "failed", "cancelled", "canceled"}:
-        logger.info("FIFO_CHAIN_NEXT_STEP_SKIP fifo_chain_group_id=%s completed_order_id=%s reason=already_processed", order.fifo_chain_group_id, order.id)
-        return _result("skipped", "already_processed", completed_order_id=order.id)
 
     try:
         payload = json.loads(order.fifo_chain_next_config_json)
@@ -631,22 +703,43 @@ def trigger_fifo_chain_next_step_if_needed(db, completed_order_id: int, dispatch
             # Compatibilidad con ordenes existentes cuyo JSON era directamente el paso 2.
             config = payload
         next_order = create_fifo_chain_next_step(db, order, config, dispatch_func=dispatch_func)
-        order = db.execute(select(MovementOrder).where(MovementOrder.id == completed_order_id)).scalar_one()
-        order.fifo_chain_status = "completed"
-        order.updated_at = datetime.utcnow()
-        db.add(order)
-        db.commit()
-        logger.info("FIFO_CHAIN_NEXT_STEP_CREATED fifo_chain_group_id=%s completed_order_id=%s next_order_id=%s result=step1_marked_completed", order.fifo_chain_group_id, order.id, next_order.id)
-        return _result("created", "next_step_created", completed_order_id=order.id, next_order=next_order)
+        return _result("created", next_order.fifo_chain_status or "next_step_created", completed_order_id=completed_order_id, next_order=next_order)
     except Exception as exc:
         db.rollback()
         order = db.execute(select(MovementOrder).where(MovementOrder.id == completed_order_id)).scalar_one_or_none()
-        if order:
-            order.fifo_chain_status = "failed"
+        if order and not _chain_stopped(db, order.fifo_chain_group_id):
             failed_step = int(order.fifo_chain_step or 0) + 1
-            order.rcs_message = ((order.rcs_message or "").strip() + f" | Flujo FIFO paso {failed_step} fallido: {exc}").strip(" |")[:512]
-            order.updated_at = datetime.utcnow()
-            db.add(order)
+            message = ((order.rcs_message or "").strip() + f" | Flujo FIFO paso {failed_step} fallido: {exc}").strip(" |")[:512]
+            db.execute(update(MovementOrder).where(
+                MovementOrder.id == order.id,
+                or_(MovementOrder.fifo_chain_status.is_(None),
+                    MovementOrder.fifo_chain_status.notin_(("cancelled", "canceled"))),
+            ).values(fifo_chain_status="retry_needed", rcs_message=message,
+                     updated_at=datetime.utcnow()).execution_options(synchronize_session=False))
             db.commit()
         logger.exception("FIFO_CHAIN_NEXT_STEP_FAILED fifo_chain_group_id=%s completed_order_id=%s error=%s", getattr(order, "fifo_chain_group_id", None), completed_order_id, exc)
         return _result("failed", "next_step_failed", completed_order_id=completed_order_id, error=str(exc))
+
+
+def recover_fifo_chains(db, dispatch_func=_USE_DEFAULT_DISPATCH) -> list[dict]:
+    """Recover completed parents independently of the active-task monitor.
+
+    Re-read each durable slot under the SQLite writer lock. Missing children
+    are created once; not_sent children resume through the Phase 1A dispatcher;
+    rejected/uncertain creations are never automatically resent.
+    """
+    ids = db.execute(select(MovementOrder.id).where(
+        MovementOrder.route_mode == "fifo_chain",
+        MovementOrder.status == "completed",
+        MovementOrder.fifo_chain_group_id.is_not(None),
+    ).order_by(MovementOrder.id)).scalars().all()
+    db.commit()
+    results = []
+    for order_id in ids:
+        try:
+            results.append(trigger_fifo_chain_next_step_if_needed(db, order_id, dispatch_func))
+        except Exception as exc:
+            db.rollback()
+            logger.exception("FIFO_CHAIN_RECOVERY_FAILED completed_order_id=%s", order_id)
+            results.append(_result("failed", "recovery_failed", completed_order_id=order_id, error=str(exc)))
+    return results

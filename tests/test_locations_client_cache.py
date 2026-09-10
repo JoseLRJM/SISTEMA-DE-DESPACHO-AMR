@@ -56,7 +56,8 @@ assert.equal(locations[idx(1,2)], null); assert.equal(operationalLocations.lengt
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         handler = app_js[app_js.index("async function applyRuntimeIncrementalMessage") : app_js.index("function connectRuntimeSocket")]
         self.assertIn("case 'location_deleted': applyLocationDeleted(payload.id)", handler)
-        self.assertIn("updateLocationsCacheRecord(cacheLocation, locationsRevision, message.type === 'location_deleted')", handler)
+        self.assertIn("updateLocationsCacheRecord(cacheLocation, Number(payload.locations_revision), message.type === 'location_deleted')", handler)
+        self.assertIn("locationsRevision = null", handler)
 
 
 if __name__ == "__main__":

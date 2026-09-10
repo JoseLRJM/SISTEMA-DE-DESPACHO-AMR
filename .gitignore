@@ -13,3 +13,5 @@ agv.db
 *.sqlite3
 backups/
 static/uploads/
+PruebasEnRCS/
+*.runtime.lock

@@ -134,6 +134,7 @@ let locationByCode = new Map();
 let locationByRackId = new Map();
 let operationalLocations = [];
 let locationsRevision = null;
+let runtimeMessageChain = Promise.resolve();
 let locationsLoaded = false;
 let locationsCacheDbPromise = null;
 let areaById = new Map();
@@ -145,6 +146,18 @@ let multiSelectedLocationIds = new Set();
 let multiSelectMode = false;
 let multiSelectBox = null;
 let adminToken = null;
+document.getElementById('btnDownloadLogs')?.addEventListener('click', async (event) => {
+  event.preventDefault();
+  if (!adminToken) { window.alert('Se requiere sesión administrativa para descargar logs.'); return; }
+  try {
+    const response = await fetch('/api/logs/download', { headers: fetchHeaders() });
+    if (!response.ok) throw new Error(`Descarga de logs rechazada (${response.status})`);
+    const url = URL.createObjectURL(await response.blob());
+    const link = document.createElement('a');
+    link.href = url; link.download = 'logs-sanitizados.zip'; link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) { window.alert(String(error)); }
+});
 const ADMIN_TOKEN_STORAGE_KEY = "agvAdminToken";
 const ADMIN_EXPIRES_STORAGE_KEY = "agvAdminExpiresAt";
 let lastRackSyncData = null;
@@ -1709,6 +1722,9 @@ function applyRackUpdated(rack, options = {}) {
   if (!rack) return;
   const rackId = Number(rack.id);
   const index = (catalog.racks || []).findIndex(item => Number(item.id) === rackId);
+  const previous = index >= 0 ? catalog.racks[index] : rackById.get(rackId);
+  if (entityUpdateIsOlder(previous, rack)) return;
+  rack = { ...(previous || {}), ...rack };
   if (index >= 0) catalog.racks[index] = rack;
   else catalog.racks.push(rack);
   catalog.racks.sort((a, b) => String(a.code || '').localeCompare(String(b.code || '')));
@@ -1729,6 +1745,37 @@ function applyRackDeleted(rackId) {
   draw();
 }
 
+function entityUpdateIsOlder(previous, incoming) {
+  if (!previous || !incoming) return false;
+  const revision = value => value != null && Number.isFinite(Number(value)) ? Number(value) : null;
+  const beforeRevision = revision(previous.revision);
+  const nextRevision = revision(incoming.revision);
+  if (beforeRevision != null && nextRevision != null && beforeRevision !== nextRevision) {
+    return nextRevision < beforeRevision;
+  }
+  const timestamp = value => {
+    if (!value) return null;
+    let text = String(value);
+    if (!/(Z|[+-]\d\d:\d\d)$/i.test(text)) text += 'Z';
+    const milliseconds = Date.parse(text);
+    if (!Number.isFinite(milliseconds)) return null;
+    const fraction = (text.match(/\.(\d+)/)?.[1] || '').padEnd(6, '0');
+    return milliseconds * 1000 + Number(fraction.slice(3, 6));
+  };
+  const before = timestamp(previous.updated_at);
+  const next = timestamp(incoming.updated_at);
+  if (before != null && next != null && before !== next) return next < before;
+  if (before != null && next == null) return true;
+  if (beforeRevision != null && nextRevision == null) return true;
+  // Equal/absent versions do not justify reviving a terminal order.
+  const terminal = new Set(['completed', 'failed', 'cancelled', 'canceled', 'dispatch_error']);
+  return terminal.has(previous.status) && incoming.status != null && !terminal.has(incoming.status);
+}
+
+function mergeEntityUpdate(previous, incoming) {
+  return entityUpdateIsOlder(previous, incoming) ? previous : { ...(previous || {}), ...incoming };
+}
+
 function applyOrderUpdated(payload, created = false) {
   const order = payload?.order;
   if (!order) return;
@@ -1739,6 +1786,9 @@ function applyOrderUpdated(payload, created = false) {
     (orderId != null && Number(item.order_id ?? item.id) === orderId)
     || (orderCode && String(item.order_code || '').trim() === orderCode)
   ));
+  if (payload.rack) applyRackUpdated(payload.rack, { render: false });
+  if (payload.location) applyLocationUpdated(payload.location, { draw: false });
+  if (entityUpdateIsOlder(previous, order)) return;
   if (created && !previous) movementOrdersTotal += 1;
   const stableOrderId = orderId ?? Number(previous?.order_id ?? previous?.id);
   if (previous && Number.isInteger(stableOrderId) && String(previous.status_query_checked_at || '') !== String(order.status_query_checked_at || '')) {
@@ -1753,8 +1803,6 @@ function applyOrderUpdated(payload, created = false) {
     const byDate = new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime();
     return byDate || Number(b.order_id || 0) - Number(a.order_id || 0);
   });
-  if (payload.rack) applyRackUpdated(payload.rack, { render: false });
-  if (payload.location) applyLocationUpdated(payload.location, { draw: false });
   renderOrdersList();
   updateOlderOrdersButton();
 }
@@ -1806,20 +1854,22 @@ async function applyRuntimeIncrementalMessage(message) {
     default: throw new Error(`mensaje desconocido: ${message.type}`);
   }
   if ((message.type === 'location_updated' || message.type === 'location_deleted') && Number.isInteger(Number(payload.locations_revision))) {
-    locationsRevision = Number(payload.locations_revision);
-    locationsLoaded = true;
+    // An individual event is not a complete checkpoint for this global revision.
+    locationsRevision = null;
     const cacheLocation = message.type === 'location_deleted' ? { id: payload.id } : payload.location;
-    updateLocationsCacheRecord(cacheLocation, locationsRevision, message.type === 'location_deleted')
-      .then(updated => {
-        if (updated) logLocationsCacheMetric({ source: 'websocket', id: Number(cacheLocation?.id), revision: locationsRevision });
-      })
+    await updateLocationsCacheRecord(cacheLocation, Number(payload.locations_revision), message.type === 'location_deleted')
       .catch(error => console.warn('[locations-cache] no se pudo aplicar evento incremental', error));
   }
   runtimeRevision = revision;
+  if (locationsRevision === null && (message.type === 'location_updated' || message.type === 'location_deleted')) {
+    requestRuntimeResync('Locations parcial: se requiere snapshot completo');
+  }
 }
 
 function connectRuntimeSocket() {
+  let firstSnapshot = true;
   cleanupRuntimeSocket();
+  runtimeResyncPending = false;
   try {
     const params = new URLSearchParams();
     if (locationsLoaded && Number.isInteger(locationsRevision)) {
@@ -1838,7 +1888,10 @@ function connectRuntimeSocket() {
     setConn('Conectado (WebSocket)');
   });
 
-  runtimeSocket.addEventListener('message', async (event) => {
+  const connection = runtimeSocket;
+  runtimeSocket.addEventListener('message', (event) => {
+    runtimeMessageChain = runtimeMessageChain.catch(error => console.error('[runtime-ws] cola recuperada', error)).then(async () => {
+    if (runtimeSocket !== connection) return;
     const eventStarted = performance.now();
     let parseFinished = eventStarted;
     let messageType = 'invalid';
@@ -1847,14 +1900,23 @@ function connectRuntimeSocket() {
       parseFinished = performance.now();
       messageType = String(message?.type || 'unknown');
       if (message?.type === 'runtime_snapshot' && message.payload) {
+        if (!firstSnapshot && Number(message.revision) < runtimeRevision) return;
+        firstSnapshot = false;
         const locationsIncluded = message.locations_included !== false;
+        const checkpoint = Number(message.locations_revision);
+        if (!Number.isSafeInteger(checkpoint) || checkpoint <= 0 ||
+            (locationsIncluded && !locationsCacheRowsAreValid(message.payload.locations, message.payload.locations?.length)) ||
+            (!locationsIncluded && locationsRevision !== checkpoint)) {
+          runtimeResyncPending = false;
+          throw new Error('Snapshot sin checkpoint completo de Locations');
+        }
         applyRuntimeSnapshotData(message.payload, selectedOrderId, { preserveLocations: !locationsIncluded });
         if (Number.isInteger(Number(message.locations_revision))) {
           locationsRevision = Number(message.locations_revision);
           locationsLoaded = true;
         }
         if (locationsIncluded && locationsRevision) {
-          writeLocationsCache(message.payload.locations || [], locationsRevision)
+          await writeLocationsCache(message.payload.locations || [], locationsRevision)
             .catch(error => console.warn('[locations-cache] no se pudo reconstruir desde snapshot', error));
         }
         runtimeRevision = Number(message.revision) || 0;
@@ -1880,6 +1942,7 @@ function connectRuntimeSocket() {
         }));
       }
     }
+    });
   });
 
   runtimeSocket.addEventListener('close', () => {
@@ -4059,25 +4122,25 @@ function locationsCacheRowsAreValid(rows, expectedCount) {
 
 async function readLocationsCache(expectedRevision, expectedCount) {
   const db = await openLocationsCacheDb();
-  const metadataTransaction = db.transaction('metadata', 'readonly');
+  const metadataTransaction = db.transaction(['metadata', 'locations'], 'readonly');
   const metadata = await idbRequest(metadataTransaction.objectStore('metadata').get('state'));
   if (!metadata || Number(metadata.schemaVersion) !== LOCATIONS_CACHE_SCHEMA_VERSION
+      || metadata.complete !== true
       || Number(metadata.locationsRevision) !== Number(expectedRevision)
       || Number(metadata.count) !== Number(expectedCount)) return null;
-  const rowsTransaction = db.transaction('locations', 'readonly');
-  const rows = await idbRequest(rowsTransaction.objectStore('locations').getAll());
+  const rows = await idbRequest(metadataTransaction.objectStore('locations').getAll());
   if (!locationsCacheRowsAreValid(rows, expectedCount)) throw new Error('Caché de locations corrupta');
   return rows;
 }
 
 async function writeLocationsCache(rows, revision) {
-  if (!Array.isArray(rows) || !Number.isInteger(Number(revision)) || Number(revision) <= 0) return false;
+  if (!Array.isArray(rows) || !locationsCacheRowsAreValid(rows, rows.length) || !Number.isInteger(Number(revision)) || Number(revision) <= 0) return false;
   const db = await openLocationsCacheDb();
   const transaction = db.transaction(['locations', 'metadata'], 'readwrite');
   const locationsStore = transaction.objectStore('locations');
   const metadataStore = transaction.objectStore('metadata');
   const existingMetadata = await idbRequest(metadataStore.get('state'));
-  if (Number(existingMetadata?.locationsRevision || 0) > Number(revision)) {
+  if (Math.max(Number(existingMetadata?.locationsRevision || 0), Number(existingMetadata?.observedRevision || 0)) > Number(revision)) {
     transaction.abort();
     return false;
   }
@@ -4086,6 +4149,8 @@ async function writeLocationsCache(rows, revision) {
   metadataStore.put({
     schemaVersion: LOCATIONS_CACHE_SCHEMA_VERSION,
     locationsRevision: Number(revision),
+    observedRevision: Number(revision),
+    complete: true,
     count: rows.length,
     updatedAt: new Date().toISOString(),
   }, 'state');
@@ -4112,7 +4177,9 @@ async function updateLocationsCacheRecord(location, revision, deleted = false) {
   if (deleted) locationsStore.delete(Number(location?.id));
   else locationsStore.put(location);
   const nextCount = Number(metadata.count) + (deleted && previous ? -1 : (!deleted && !previous ? 1 : 0));
-  metadataStore.put({ ...metadata, locationsRevision: Number(revision), count: nextCount, updatedAt: new Date().toISOString() }, 'state');
+  metadataStore.put({ ...metadata, complete: false,
+    observedRevision: Math.max(Number(metadata.observedRevision || 0), Number(revision)),
+    count: nextCount, updatedAt: new Date().toISOString() }, 'state');
   await waitForIdbTransaction(transaction);
   return true;
 }
@@ -4137,12 +4204,15 @@ function rebuildLocationIndexes() {
   cellOptionsCache.clear();
 }
 function replaceLocations(rows) {
+  rows = (rows || []).map(loc => mergeEntityUpdate(locationById.get(Number(loc.id)), loc));
   locations = new Array(DB_W * DB_H).fill(null);
   for (const loc of rows || []) locations[idx(loc.x, loc.y)] = loc;
   rebuildLocationIndexes();
 }
 function upsertLocation(loc) {
   if (!loc) return;
+  if (entityUpdateIsOlder(locationById.get(Number(loc.id)), loc)) return;
+  loc = { ...(locationById.get(Number(loc.id)) || {}), ...loc };
   const gridIndex = idx(loc.x, loc.y);
   const previousById = locationById.get(Number(loc.id));
   if (previousById && idx(previousById.x, previousById.y) !== gridIndex && locations[idx(previousById.x, previousById.y)] === previousById) {
@@ -4182,6 +4252,7 @@ function renderLoadedLocationAndCatalogData() {
   renderQrCatalogOptions();
 }
 async function loadLocations(options = {}) {
+  const startedRevision = runtimeRevision;
   const started = performance.now();
   let responseRevision = null;
   const rows = await fetchJson(API.locations, {
@@ -4190,6 +4261,7 @@ async function loadLocations(options = {}) {
       responseRevision = Number.isInteger(parsed) && parsed > 0 ? parsed : null;
     },
   });
+  if (runtimeRevision !== startedRevision || (responseRevision != null && locationsRevision != null && responseRevision < locationsRevision)) return;
   replaceLocations(rows);
   locationsRevision = responseRevision;
   locationsLoaded = true;
@@ -4204,6 +4276,7 @@ async function loadLocations(options = {}) {
 }
 
 async function loadLocationsCached(options = {}) {
+  const startedRevision = runtimeRevision;
   const started = performance.now();
   let revisionInfo;
   try {
@@ -4214,6 +4287,7 @@ async function loadLocationsCached(options = {}) {
     try {
       const cachedRows = await readLocationsCache(revision, count);
       if (cachedRows) {
+        if (runtimeRevision !== startedRevision || (locationsRevision != null && revision < locationsRevision)) return;
         replaceLocations(cachedRows);
         locationsRevision = revision;
         locationsLoaded = true;
@@ -4234,7 +4308,11 @@ async function loadLocationsCached(options = {}) {
   await loadLocations(options);
 }
 async function loadCatalog(options = {}) {
-  catalog = await fetchJson(API.catalog);
+  const startedRevision = runtimeRevision;
+  const response = await fetchJson(API.catalog);
+  if (runtimeRevision !== startedRevision) return;
+  response.racks = (response.racks || []).map(rack => mergeEntityUpdate(rackById.get(Number(rack.id)), rack));
+  catalog = response;
   rebuildCatalogIndexes();
   if (options.render === false) {
     if (adminToken) await loadAdminAreaMaterialRecords();
@@ -4278,7 +4356,9 @@ function applyRuntimeSnapshotData(snapshot, preferredOrderId = null, options = {
   const recentLimit = Number(snapshot?.recent_order_limit || 100) || 100;
   movementOrdersNextOffset = Math.max(movementOrdersNextOffset, recentLimit);
   const mergedOrders = new Map(historicalOrderSummaries);
-  for (const order of runtimeOrders) mergedOrders.set(Number(order.order_id), order);
+  const currentOrders = new Map(movementOrders.map(order => [Number(order.order_id), order]));
+  for (const [id, order] of mergedOrders) mergedOrders.set(id, mergeEntityUpdate(currentOrders.get(id), order));
+  for (const order of runtimeOrders) mergedOrders.set(Number(order.order_id), mergeEntityUpdate(currentOrders.get(Number(order.order_id)), order));
   for (const [orderId, detail] of movementOrderDetailCache) {
     const summary = mergedOrders.get(Number(orderId));
     if (!summary) continue;
@@ -4286,7 +4366,7 @@ function applyRuntimeSnapshotData(snapshot, preferredOrderId = null, options = {
       movementOrderDetailCache.delete(Number(orderId));
       continue;
     }
-    mergedOrders.set(Number(orderId), { ...detail, ...summary });
+    mergedOrders.set(Number(orderId), mergeEntityUpdate(detail, summary));
   }
   movementOrders = Array.from(mergedOrders.values()).sort((a, b) => {
     const byDate = new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime();
@@ -8151,6 +8231,8 @@ function updateOlderOrdersButton() {
 
 function rememberMovementOrderDetail(orderId, detail) {
   const id = Number(orderId);
+  const current = movementOrders.find(order => Number(order.order_id) === id);
+  if (entityUpdateIsOlder(current, detail) || entityUpdateIsOlder(movementOrderDetailCache.get(id), detail)) return;
   if (movementOrderDetailCache.has(id)) movementOrderDetailCache.delete(id);
   movementOrderDetailCache.set(id, detail);
   while (movementOrderDetailCache.size > 20) {
@@ -8165,6 +8247,8 @@ async function loadMovementOrderDetail(orderId, options = {}) {
   if (movementOrderDetailRequests.has(id)) return movementOrderDetailRequests.get(id);
   const request = fetchJson(API.movementOrderDetail(id), { cache: 'no-store' })
     .then((detail) => {
+      const current = movementOrders.find(order => Number(order.order_id) === id);
+      if (entityUpdateIsOlder(current, detail)) return current;
       rememberMovementOrderDetail(id, detail);
       const index = movementOrders.findIndex(order => Number(order.order_id) === id);
       if (index >= 0) movementOrders[index] = { ...movementOrders[index], ...detail };
@@ -8189,11 +8273,11 @@ async function loadOlderMovementOrders() {
   if (btnLoadOlderOrders) btnLoadOlderOrders.disabled = true;
   const page = await fetchJson(`${API.movementOrders}?limit=100&offset=${movementOrdersNextOffset}`, { cache: 'no-store' });
   const items = Array.isArray(page?.items) ? page.items : [];
-  for (const order of items) historicalOrderSummaries.set(Number(order.order_id), order);
+  for (const order of items) historicalOrderSummaries.set(Number(order.order_id), mergeEntityUpdate(historicalOrderSummaries.get(Number(order.order_id)), order));
   movementOrdersTotal = Number(page?.total ?? movementOrdersTotal) || movementOrdersTotal;
   movementOrdersNextOffset = Number(page?.offset ?? movementOrdersNextOffset) + Number(page?.limit ?? items.length);
   const merged = new Map(movementOrders.map(order => [Number(order.order_id), order]));
-  for (const order of items) merged.set(Number(order.order_id), order);
+  for (const order of items) merged.set(Number(order.order_id), mergeEntityUpdate(merged.get(Number(order.order_id)), order));
   movementOrders = Array.from(merged.values()).sort((a, b) => {
     const byDate = new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime();
     return byDate || Number(b.order_id || 0) - Number(a.order_id || 0);
@@ -8529,6 +8613,8 @@ async function loadDebugConsoleLog() {
 }
 
 async function runMonitorNow() {
+  if (!adminToken) throw new Error('Se requiere sesión administrativa para enviar JSON libre a RCS.');
+  if (!window.confirm('Envío extraordinario a RCS sin MovementOrder. Puede ejecutar operaciones físicas. ¿Continuar?')) return;
   const textPayload = currentEditedStatusQueryText();
   if (!textPayload) throw new Error('Escribe un JSON para enviarlo desde la consola.');
   const payload = parseCurrentEditedStatusQueryJson();
@@ -8536,7 +8622,7 @@ async function runMonitorNow() {
   const endpoint = statusQueryEndpoint?.value?.trim() || '';
   const result = await fetchJson(API.rcsDebugSend, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: fetchHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ payload, base_url, endpoint }),
   });
   orderMsg.textContent = `JSON libre enviado a ${result.base_url || '-'}${result.endpoint || ''}.`;
@@ -8545,8 +8631,10 @@ async function runMonitorNow() {
 
 
 async function loadMovementOrders(preferredOrderId = null, skipMonitor = false, includeLocations = true) {
+  const startedRevision = runtimeRevision;
   const includeRobotMonitor = robotMonitorEnabled && !skipMonitor ? 1 : 0;
   const snapshot = await fetchJson(`${API.runtimeSnapshot}?debug_limit=300&include_robot_monitor=${includeRobotMonitor}&include_locations=${includeLocations ? 1 : 0}`, { cache: 'no-store' });
+  if (runtimeRevision !== startedRevision) return;
   applyRuntimeSnapshotData(snapshot, preferredOrderId, { preserveLocations: !includeLocations });
 }
 
@@ -8555,8 +8643,10 @@ async function autoRefreshRuntimeSections(preferredOrderId = null) {
   if (runtimeRefreshInFlight) return;
   runtimeRefreshInFlight = true;
   try {
+    const startedRevision = runtimeRevision;
     const includeRobotMonitor = robotMonitorEnabled ? 1 : 0;
     const snapshot = await fetchJson(`${API.runtimeSnapshot}?debug_limit=300&include_robot_monitor=${includeRobotMonitor}`, { cache: 'no-store' });
+    if (runtimeRevision !== startedRevision) return;
     applyRuntimeSnapshotData(snapshot, preferredOrderId);
   } finally {
     runtimeRefreshInFlight = false;
@@ -8566,10 +8656,17 @@ async function autoRefreshRuntimeSections(preferredOrderId = null) {
 
 async function simulateSelectedOrderComplete() {
   if (!selectedOrderId) throw new Error('Selecciona una tarea.');
+  if (!adminToken) throw new Error('La simulación requiere desbloquear Admin.');
   const order = movementOrders.find(x => x.order_id === selectedOrderId) || null;
   if (order && !order.can_simulate_complete) throw new Error(historyOrderUnavailableReason(order) || 'Esta orden no permite simulación desde historial.');
-  const result = await fetchJson(API.movementOrderSimulateComplete(selectedOrderId), { method: 'POST' });
-  orderMsg.textContent = `Orden ${result.order_code} finalizada de forma simulada.`;
+  if (!window.confirm('SIMULACIÓN LOCAL: modifica inventario y libera recursos de prueba. No confirma finalización RCS ni continúa FIFO Chain. Solo se permite para órdenes del simulador. ¿Continuar?')) return;
+  const reason = window.prompt('Motivo de la simulación local:')?.trim();
+  if (!reason) return;
+  const result = await fetchJson(API.movementOrderSimulateComplete(selectedOrderId), {
+    method: 'POST', headers: { 'Content-Type': 'application/json', ...fetchHeaders() },
+    body: JSON.stringify({ confirm_simulation: true, reason }),
+  });
+  orderMsg.textContent = `Orden ${result.order_code}: simulación local completada; no es una confirmación RCS.`;
   await loadLocations();
   await loadCatalog();
   await loadMovementOrders(result.order_id);
@@ -9661,10 +9758,6 @@ async function openOperatorActionModal(button) {
   if (operatorActionTaskTyp) operatorActionTaskTyp.value = button.task_typ || 'A01';
   renderOperatorActionMaterialOptions();
   renderOperatorActionCellLabels();
-  if (button.action_mode === 'direct_move' && (!operatorActionState.source_cell_id || !operatorActionState.destination_cell_id)) {
-    if (operatorWindowMsg) operatorWindowMsg.textContent = 'Este botón de movimiento directo no tiene configuradas la celda origen y la celda destino.';
-    return;
-  }
   if (showParameterPanel) {
     if (operatorWindowMsg) operatorWindowMsg.textContent = 'Selecciona los parámetros abajo y luego presiona Vista previa.';
     if (button.action_mode === 'point_to_area') applyOperatorPointDefaultsFromRack();

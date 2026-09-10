@@ -5,7 +5,8 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import HTTPException
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update, func
+from sqlalchemy.exc import OperationalError
 
 from logging_config import get_logger
 from models import Area, Location, MaterialGroup, MovementOrder, Rack, apply_rack_reservation_status
@@ -15,7 +16,7 @@ ACTIVE_RACK_STATUSES = {"available", "disponible"}
 INACTIVE_RACK_STATUSES = {"reserved", "moving", "error", "blocked", "reservado", "moviendo", "bloqueado"}
 VALID_PRIORITIES = {"normal", "alta", "urgente"}
 ORDER_STATUSES_WITH_DESTINATION_RESERVATION = {"pending_dispatch", "dispatched", "in_progress"}
-RACK_RESERVATION_ACTIVE_STATUSES = ("pending_dispatch", "dispatched", "in_progress", "cancel_requested_total", "cancel_requested_undo")
+RACK_RESERVATION_ACTIVE_STATUSES = ("pending_dispatch", "dispatched", "in_progress", "cancel_requested_total", "cancel_requested_undo", "cancel_error")
 NO_MATERIAL_CODE = "SIN_MATERIAL"
 NO_MATERIAL_CODE_NORMALIZED = "SINMATERIAL"
 logger = get_logger("app.fifo")
@@ -191,7 +192,7 @@ def _reserved_destination_cell_ids(db) -> set[int]:
     rows = (
         db.execute(
             select(MovementOrder.destination_cell_id)
-            .where(MovementOrder.status.in_(tuple(ORDER_STATUSES_WITH_DESTINATION_RESERVATION)))
+            .where(MovementOrder.status.in_(RACK_RESERVATION_ACTIVE_STATUSES))
         )
         .all()
     )
@@ -416,6 +417,10 @@ def _ensure_default_area(db, code: str = "SIN_AREA", name: str = "Sin área") ->
 
 def _ensure_default_material_group(db, code: str = "SIN_MATERIAL", name: str = "Sin material") -> MaterialGroup:
     material = db.execute(select(MaterialGroup).where(MaterialGroup.code == code)).scalar_one_or_none()
+    if db.info.get("qr_preview_read_only"):
+        # A detached projection describes execution without creating/reactivating a catalog row.
+        return MaterialGroup(id=material.id if material else None, code=code,
+                             name=(material.name if material else None) or name, is_active=1)
     if material:
         changed = False
         if int(getattr(material, "is_active", 0) or 0) != 1:
@@ -436,6 +441,37 @@ def _ensure_default_material_group(db, code: str = "SIN_MATERIAL", name: str = "
     db.commit()
     db.refresh(material)
     return material
+
+
+def _claim_movement_resources(db, rack, source_cell, destination_cell, *, allow_same_cell_move=False):
+    """Conditional first write serializes SQLite competitors until order commit."""
+    active = select(MovementOrder.id).where(
+        MovementOrder.status.in_(RACK_RESERVATION_ACTIVE_STATUSES),
+        or_(MovementOrder.rack_id == rack.id,
+            MovementOrder.pickup_rack_id == rack.id,
+            MovementOrder.dropoff_rack_id == rack.id),
+    ).exists()
+    try:
+        claimed = db.execute(update(Rack).where(
+            Rack.id == rack.id, func.lower(Rack.status).in_(ACTIVE_RACK_STATUSES), ~active,
+        ).values(status="reserved", updated_at=datetime.utcnow()).execution_options(synchronize_session=False))
+        if claimed.rowcount != 1:
+            raise HTTPException(status_code=409, detail="El rack ya está reservado por otra operación activa")
+        db.refresh(rack)
+        db.refresh(source_cell)
+        db.refresh(destination_cell)
+        same_cell = source_cell.id == destination_cell.id and allow_same_cell_move
+        if source_cell.rack_id != rack.id or not source_cell.enabled:
+            raise HTTPException(status_code=409, detail="La celda origen cambió durante la reserva")
+        if (not destination_cell.enabled or
+                (destination_cell.rack_id is not None and not (same_cell and destination_cell.rack_id == rack.id)) or
+                destination_cell.id in _reserved_destination_cell_ids(db)):
+            raise HTTPException(status_code=409, detail="La celda destino ya no está disponible")
+    except (HTTPException, OperationalError) as exc:
+        db.rollback()
+        if isinstance(exc, OperationalError):
+            raise HTTPException(status_code=409, detail="Reserva concurrente; vuelva a consultar disponibilidad") from exc
+        raise
 
 
 def execute_direct_move_request(
@@ -487,8 +523,9 @@ def execute_direct_move_request(
 
     now = datetime.utcnow()
 
+    _claim_movement_resources(db, rack, source_cell, destination_cell)
     order = MovementOrder(
-        order_code=f"DM-{now.strftime('%Y%m%d%H%M%S')}-{rack.id}",
+        order_code=f"DM-{now.strftime('%Y%m%d%H%M%S%f')}-{rack.id}",
         order_type="direct_move",
         source_area_id=source_area.id,
         destination_area_id=destination_area.id,
@@ -549,7 +586,8 @@ def execute_fifo_request(
 
     now = datetime.utcnow()
 
-    order_code = f"MO-{now.strftime('%Y%m%d%H%M%S')}-{rack.id}"
+    _claim_movement_resources(db, rack, source_cell, destination_cell, allow_same_cell_move=allow_same_cell_move)
+    order_code = f"MO-{now.strftime('%Y%m%d%H%M%S%f')}-{rack.id}"
     order = MovementOrder(
         order_code=order_code,
         order_type="material_request",
@@ -621,7 +659,8 @@ def execute_fifo_request_any_available(
         raise HTTPException(status_code=409, detail="La celda destino ya no esta disponible")
 
     now = datetime.utcnow()
-    order_code = f"MO-{now.strftime('%Y%m%d%H%M%S')}-{rack.id}"
+    _claim_movement_resources(db, rack, source_cell, destination_cell, allow_same_cell_move=allow_same_cell_move)
+    order_code = f"MO-{now.strftime('%Y%m%d%H%M%S%f')}-{rack.id}"
     order = MovementOrder(
         order_code=order_code,
         order_type="material_request",
@@ -663,10 +702,16 @@ def execute_fifo_request_any_available(
 
 
 
-def simulate_order_completed(db, order_id: int) -> MovementOrder:
+def simulate_order_completed(db, order_id: int, *, local_simulation: bool = False) -> MovementOrder:
+    # Serialize local reconciliation before reading inventory, including stale sessions.
+    db.execute(update(MovementOrder).where(
+        MovementOrder.id == order_id,
+        MovementOrder.status.in_(tuple(ORDER_STATUSES_WITH_DESTINATION_RESERVATION)),
+    ).values(updated_at=MovementOrder.updated_at).execution_options(synchronize_session=False))
     order = db.execute(select(MovementOrder).where(MovementOrder.id == order_id)).scalar_one_or_none()
     if not order:
         raise HTTPException(status_code=404, detail="Orden no encontrada")
+    db.refresh(order)
     if order.status == "completed":
         raise HTTPException(status_code=409, detail="La orden ya fue finalizada")
     if order.status not in ORDER_STATUSES_WITH_DESTINATION_RESERVATION:
@@ -675,10 +720,15 @@ def simulate_order_completed(db, order_id: int) -> MovementOrder:
     rack = db.execute(select(Rack).where(Rack.id == order.rack_id)).scalar_one()
     source_cell = db.execute(select(Location).where(Location.id == order.source_cell_id)).scalar_one()
     destination_cell = db.execute(select(Location).where(Location.id == order.destination_cell_id)).scalar_one()
+    db.refresh(rack)
+    db.refresh(source_cell)
+    db.refresh(destination_cell)
 
-    if source_cell.rack_id != rack.id:
+    same_cell = source_cell.id == destination_cell.id
+    already_reconciled = not same_cell and source_cell.rack_id is None and destination_cell.rack_id == rack.id
+    if source_cell.rack_id != rack.id and not already_reconciled:
         raise HTTPException(status_code=409, detail="La celda origen ya no contiene el rack de la orden")
-    if destination_cell.rack_id is not None:
+    if destination_cell.rack_id is not None and not ((same_cell or already_reconciled) and destination_cell.rack_id == rack.id):
         raise HTTPException(status_code=409, detail="La celda destino ya no está libre")
 
     now = datetime.utcnow()
@@ -686,11 +736,12 @@ def simulate_order_completed(db, order_id: int) -> MovementOrder:
     # al destino. En SQLite, si ambos UPDATE se mandan juntos, puede intentar escribir
     # primero el destino mientras el origen todavía conserva el mismo rack_id, lo que
     # dispara UNIQUE constraint failed: locations.rack_id.
-    source_cell.rack_id = None
-    source_cell.status = 0
-    source_cell.updated_at = now
-    db.add(source_cell)
-    db.flush()
+    if not same_cell:
+        source_cell.rack_id = None
+        source_cell.status = 0
+        source_cell.updated_at = now
+        db.add(source_cell)
+        db.flush()
 
     destination_cell.rack_id = rack.id
     destination_cell.status = 1
@@ -728,8 +779,13 @@ def simulate_order_completed(db, order_id: int) -> MovementOrder:
         apply_rack_reservation_status(rack, False, updated_at=now, order_id=order.id, dispatch_status=order.status, source="fifo_service", reason="movement_order_completed")
     rack.last_moved_at = now
 
-    order.status = "completed"
-    order.rcs_status = "completed"
+    order.status = "simulated_completed" if local_simulation else "completed"
+    if not local_simulation:
+        order.rcs_status = "completed"
+    else:
+        order.forced_local_close = 1
+        order.forced_local_close_at = now
+        order.forced_local_close_reason = "admin_simulate_complete"
     order.closed_by = "fifo_service"
     order.closed_at = now
     order.release_source = "fifo_service"
@@ -743,6 +799,11 @@ def simulate_order_completed(db, order_id: int) -> MovementOrder:
     # dentro de la transaccion permite que el motor de transiciones lea el estado real
     # antes de seleccionar el siguiente tramo fifo_chain.
     db.flush()
+    if local_simulation:
+        # No remote evidence, material transition or continuation is fabricated.
+        db.commit()
+        db.refresh(order)
+        return order
     try:
         transition_result = apply_transition_for_completed_order(db, order.id, reason="movement_completed")
         logger.info(

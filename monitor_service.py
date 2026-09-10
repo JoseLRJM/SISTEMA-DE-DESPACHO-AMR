@@ -7,20 +7,34 @@ import threading
 import time
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from fifo_service import simulate_order_completed
 from logging_config import get_logger
 from models import DebugConsoleEvent, MovementOrder, Rack, SessionLocal, apply_rack_reservation_status
+from rcs_client import generate_request_code
+from rcs_observability import trace_call
 
 ACTIVE_REMOTE_QUERY_STATUSES = {"pending_dispatch", "dispatched", "in_progress", "cancel_requested_total", "cancel_requested_undo", "cancel_error"}
 RACK_RESERVATION_ACTIVE_STATUSES = ("pending_dispatch", "dispatched", "in_progress", "cancel_requested_total", "cancel_requested_undo", "cancel_error")
 _MONITOR_RUN_LOCK = threading.Lock()
 logger = get_logger("app.monitor")
+LOCAL_RECONCILIATION_PREFIX = "LOCAL_RECONCILIATION_REQUIRED:"
+TERMINAL_LOCAL_STATUSES = {"completed", "cancelled", "failed", "undone", "dispatch_error", "forced_local_closed", "simulated_completed"}
+
+
+def local_reconciliation_pending(row: MovementOrder) -> bool:
+    return (row.status in {"pending_dispatch", "dispatched", "in_progress", "cancel_requested_undo"}
+            and row.rcs_status in {"completed", "cancelled"}
+            and str(row.rcs_message or "").startswith(LOCAL_RECONCILIATION_PREFIX))
 
 
 def _set_rcs_status(row: MovementOrder, value: str, *, changed_at: datetime) -> None:
     normalized = str(value or "").strip().lower()
+    if row.status in TERMINAL_LOCAL_STATUSES:
+        return
+    if local_reconciliation_pending(row) and normalized != row.rcs_status:
+        return
     previous = str(row.rcs_status or "").strip().lower()
     if normalized and normalized != previous:
         row.rcs_status_changed_at = changed_at
@@ -109,7 +123,28 @@ def _ensure_rack_available(db, order: MovementOrder, *, source: str = "monitor_r
 
 
 def _finalize_cancel_return_undo(db, row: MovementOrder, *, previous_status: str, remote_terminal_status: str, source: str, auto_commit: bool = True) -> MovementOrder:
-    # A terminal cancel-return response does not prove the rack's physical cell, so close without moving local cells.
+    # Persist remote completion before querying position; an old poll is not proof.
+    from main import _reconcile_cancel_return_position
+    row.rcs_status = remote_terminal_status
+    row.rcs_message = f"{LOCAL_RECONCILIATION_PREFIX} Retorno RCS terminado; posición final pendiente."
+    rack = db.get(Rack, row.rack_id)
+    if rack is not None:
+        apply_rack_reservation_status(rack, True, updated_at=datetime.utcnow(), order_id=row.id,
+                                      source=source, reason="cancel_return_reconciliation")
+    db.add(row)
+    db.commit()
+    try:
+        cells_modified = _reconcile_cancel_return_position(db, row)
+    except Exception as exc:
+        db.rollback()
+        db.refresh(row)
+        if row.status != "cancel_requested_undo":
+            return row
+        row.rcs_message = f"{LOCAL_RECONCILIATION_PREFIX} Retorno RCS {remote_terminal_status}; {getattr(exc, 'detail', None) or str(exc)}"[:512]
+        db.add(row)
+        db.commit()
+        return row
+    row.rcs_message = "Retorno RCS terminado; posición final reconciliada."
     now = datetime.utcnow()
 
     if remote_terminal_status == "completed":
@@ -130,7 +165,7 @@ def _finalize_cancel_return_undo(db, row: MovementOrder, *, previous_status: str
     rack = db.execute(select(Rack).where(Rack.id == row.rack_id)).scalar_one_or_none() if row.rack_id else None
 
     logger.info(
-        "CANCEL_UNDO_TERMINAL_CLOSE order_id=%s rack_id=%s rack_code=%s robot_code=%s previous_dispatch_status=%s new_dispatch_status=%s rcs_status=%s source=%s reason=%s cells_modified=false",
+        "CANCEL_UNDO_TERMINAL_CLOSE order_id=%s rack_id=%s rack_code=%s robot_code=%s previous_dispatch_status=%s new_dispatch_status=%s rcs_status=%s source=%s reason=%s cells_modified=%s",
         row.id,
         row.rack_id,
         rack.code if rack else None,
@@ -140,6 +175,7 @@ def _finalize_cancel_return_undo(db, row: MovementOrder, *, previous_status: str
         row.rcs_status,
         source,
         f"remote_status:{remote_terminal_status}",
+        cells_modified,
     )
     logger.info(
         "[CANCEL ORDER] order_id=%s order_code=%s previous_status=%s new_status=%s source=%s admin=%s reason=%s",
@@ -153,8 +189,8 @@ def _finalize_cancel_return_undo(db, row: MovementOrder, *, previous_status: str
     )
     _append_monitor_debug_event(
         db,
-        payload={"action": "cancel_order", "source": source, "order_id": row.id, "order_code": row.order_code, "previous_status": previous_status, "new_status": row.status, "admin": source, "reason": f"remote_status:{remote_terminal_status}", "cells_modified": False, "at": now.isoformat()},
-        message=f"[CANCEL ORDER] order_id={row.id} source={source} reason=remote_status:{remote_terminal_status} cells_modified=false",
+        payload={"action": "cancel_order", "source": source, "order_id": row.id, "order_code": row.order_code, "previous_status": previous_status, "new_status": row.status, "admin": source, "reason": f"remote_status:{remote_terminal_status}", "cells_modified": cells_modified, "at": now.isoformat()},
+        message=f"[CANCEL ORDER] order_id={row.id} source={source} reason=remote_status:{remote_terminal_status} cells_modified={cells_modified}",
         created_at=now,
     )
     if auto_commit:
@@ -163,7 +199,8 @@ def _finalize_cancel_return_undo(db, row: MovementOrder, *, previous_status: str
 
 
 def generate_req_code_ms() -> str:
-    return datetime.utcnow().strftime("%Y%m%d%H%M%S%f")[:-3]
+    # Retain the public helper name for existing callers; identity is not time.
+    return generate_request_code()
 
 
 def build_auto_status_query_payload(task_codes: list[str], req_time: str | None = None) -> dict:
@@ -256,21 +293,7 @@ def _single_task_response_item(response, task_code: str) -> dict | None:
     items_by_code = _task_status_items_by_code(response)
     if code in items_by_code:
         return items_by_code[code]
-    if len(response.task_statuses or []) == 1:
-        item = dict((response.task_statuses or [])[0])
-        response_code = str(item.get("taskCode") or "").strip()
-        if not response_code:
-            item["taskCode"] = code
-            return item
-        if response_code == code:
-            return item
-    if response.task_status:
-        return {
-            "taskCode": code,
-            "taskStatus": response.task_status,
-            "message": response.message,
-            "raw": response.raw,
-        }
+    logger.warning("TASK_STATUS_SKIP_MISMATCH requested=%s received=%s reason=no explicit matching taskCode", code, list(items_by_code))
     return None
 
 
@@ -308,8 +331,19 @@ def _mark_order_terminal_without_move(db, order: MovementOrder, terminal_status:
 
 
 def apply_remote_status_to_order(db, row: MovementOrder, task_status: str, *, source: str = "monitor_remote", auto_commit: bool = True):
+    # Read the latest durable state under the SQLite writer lock, not a stale ORM row.
+    db.execute(update(MovementOrder).where(MovementOrder.id == row.id).values(id=MovementOrder.id))
+    db.refresh(row)
+    if row.status in TERMINAL_LOCAL_STATUSES:
+        return row
+    if row.forced_local_close or row.status == "simulated_completed":
+        # Queries may retain remote evidence, but never disguise a local override
+        # as a normal remote completion or trigger logical movement afterwards.
+        return row
     normalized = _normalize_remote_status(task_status)
     if not normalized:
+        return row
+    if local_reconciliation_pending(row) and normalized != row.rcs_status:
         return row
     logger.info("Applying remote status order_id=%s order_code=%s remote_status=%s raw_status=%s", row.id, row.order_code, normalized, task_status)
 
@@ -319,21 +353,44 @@ def apply_remote_status_to_order(db, row: MovementOrder, task_status: str, *, so
             return _finalize_cancel_return_undo(db, row, previous_status=previous_status, remote_terminal_status="completed", source=source, auto_commit=auto_commit)
         order_id = row.id
         if row.status in {"pending_dispatch", "dispatched", "in_progress"}:
+            # Persist remote evidence and keep resources held before local SQL work.
+            _set_rcs_status(row, "completed", changed_at=datetime.utcnow())
+            row.rcs_message = f"{LOCAL_RECONCILIATION_PREFIX} RCS completed; conciliación local pendiente."
+            row.updated_at = datetime.utcnow()
+            rack = db.get(Rack, row.rack_id) if row.rack_id else None
+            if rack is not None:
+                apply_rack_reservation_status(rack, True, updated_at=datetime.utcnow(), order_id=row.id,
+                                              dispatch_status=row.status, source=source, reason="local_reconciliation_pending")
+            db.add(row)
+            db.commit()
             try:
                 simulate_order_completed(db, order_id)
                 row = db.execute(select(MovementOrder).where(MovementOrder.id == order_id)).scalar_one()
             except Exception as exc:
                 db.rollback()
                 row = db.execute(select(MovementOrder).where(MovementOrder.id == order_id)).scalar_one()
+                if row.status == "completed":
+                    # Another reconciler (or the durable commit) already succeeded.
+                    _ensure_rack_available(db, row, source=source)
+                    if str(row.rcs_message or "").startswith(LOCAL_RECONCILIATION_PREFIX):
+                        row.rcs_message = "RCS completed; reconciliación local completada."
+                    db.commit()
+                    return row
                 now = datetime.utcnow()
-                row.status = "completed"
+                row.status = "in_progress"
                 row.rcs_status = "completed"
-                row.closed_by = source
-                row.closed_at = now
-                row.release_source = source
+                error = getattr(exc, "detail", None) or str(exc)
+                row.rcs_message = f"{LOCAL_RECONCILIATION_PREFIX} RCS completed; {error}"[:512]
                 row.updated_at = now
-                _ensure_rack_available(db, row, source=source)
+                rack = db.get(Rack, row.rack_id) if row.rack_id else None
+                if rack is not None:
+                    apply_rack_reservation_status(rack, True, updated_at=now, order_id=row.id,
+                                                  dispatch_status=row.status, source=source, reason="local_reconciliation_failed")
                 db.add(row)
+                _append_monitor_debug_event(db, payload={"action": "local_reconciliation_required", "order_id": row.id,
+                    "remote_status": "completed", "remote_task_code": row.remote_task_code, "req_code": row.req_code,
+                    "source_cell_id": row.source_cell_id, "destination_cell_id": row.destination_cell_id,
+                    "error": str(error)}, message=row.rcs_message, created_at=now)
                 logger.warning(
                     "RCS_COMPLETED_WITHOUT_LOCAL_CELL_MOVE order_id=%s order_code=%s rack_id=%s source=%s cells_modified=false error=%s",
                     row.id,
@@ -342,13 +399,15 @@ def apply_remote_status_to_order(db, row: MovementOrder, task_status: str, *, so
                     source,
                     exc,
                 )
-                if auto_commit:
-                    db.commit()
+                # A later row's rollback in a monitor batch must not erase this hold.
+                db.commit()
                 return row
         _ensure_rack_available(db, row, source=source)
         now = datetime.utcnow()
         row.status = "completed"
         row.rcs_status = "completed"
+        if str(row.rcs_message or "").startswith(LOCAL_RECONCILIATION_PREFIX):
+            row.rcs_message = "RCS completed; reconciliación local completada."
         row.closed_by = source
         row.closed_at = now
         row.release_source = source
@@ -394,6 +453,14 @@ def apply_remote_status_to_order(db, row: MovementOrder, task_status: str, *, so
         return row
 
     if normalized == "failed":
+        if row.status in {"cancel_requested_undo", "cancel_requested_total"}:
+            # A failed cancel/return is not successful release confirmation.
+            row.rcs_status = "failed"
+            row.updated_at = datetime.utcnow()
+            db.add(row)
+            if auto_commit:
+                db.commit()
+            return row
         _mark_order_terminal_without_move(db, row, "failed", source=source, auto_commit=auto_commit)
         row = db.execute(select(MovementOrder).where(MovementOrder.id == row.id)).scalar_one()
         return row
@@ -415,14 +482,18 @@ def _record_status_query_for_order(
 ):
     from main import _append_status_query_log
 
-    row.req_code = req_code or row.req_code
+    db.execute(update(MovementOrder).where(MovementOrder.id == row.id).values(id=MovementOrder.id))
+    db.refresh(row)
+    if normalized_status and row.dispatch_status == "uncertain" and row.status not in TERMINAL_LOCAL_STATUSES:
+        row.dispatch_status = "success"
+    # Query identity belongs to the query JSON/history, never the creation field.
     row.status_query_request_json = json.dumps(request_payload, ensure_ascii=False)
     row.status_query_response_json = json.dumps(response_payload or {}, ensure_ascii=False)
     row.status_query_checked_at = now
     row.rcs_last_update = now
     if normalized_status:
         _set_rcs_status(row, normalized_status, changed_at=now)
-    if update_message and message:
+    if update_message and message and not local_reconciliation_pending(row):
         row.rcs_message = message
     row.updated_at = now
     _append_status_query_log(db, row, kind="status_query", request_payload=request_payload, response_payload=response_payload or {}, message=message or "", arrived_at=now)
@@ -443,7 +514,7 @@ def _apply_matched_task_status(db, row: MovementOrder, *, item: dict, request_pa
         item.get("agvCode") or item.get("agv_code") or "",
         item.get("taskTyp") or item.get("task_type") or "",
     )
-    if response_task_code != order_task_code:
+    if not response.ok or not order_task_code or response_task_code != order_task_code:
         logger.warning(
             "TASK_STATUS_SKIP_MISMATCH movement_order_id=%s order_remote_task_code=%s response_taskCode=%s reason=taskCode mismatch",
             row.id,
@@ -460,7 +531,11 @@ def _apply_matched_task_status(db, row: MovementOrder, *, item: dict, request_pa
         normalized_status,
     )
     response_payload = item.get("raw") if isinstance(item.get("raw"), dict) else (response.raw or {})
+    if normalized_status in {"not_found", "not found"}:
+        response_payload = response.raw or {}
     message = str(item.get("message") or response.message or "")
+    if normalized_status and row.dispatch_status == "uncertain":
+        row.dispatch_status = "success"
     _record_status_query_for_order(
         db,
         row,
@@ -490,7 +565,7 @@ def _run_single_status_query(db, *, client, task_code: str, rows_for_code: list[
     touched_rows: list[tuple[int, str]] = []
     try:
         logger.info("QUERY_TASK_STATUS_FALLBACK_SINGLE taskCode=%s", task_code)
-        single_response = client.query_task_status_with_payload(single_payload)
+        single_response = trace_call("query", rows_for_code, client.query_task_status_with_payload, single_payload)
         single_item = _single_task_response_item(single_response, task_code)
         raw_single_status = str((single_item or {}).get("taskStatus") or (single_item or {}).get("task_status") or "").strip()
         logger.info(
@@ -516,7 +591,7 @@ def _run_single_status_query(db, *, client, task_code: str, rows_for_code: list[
                     req_code=single_response.reqCode or single_payload.get("reqCode") or "",
                     message=single_response.message or "",
                     now=single_now,
-                    normalized_status="failed",
+                    normalized_status="",
                     update_message=True,
                 )
     except Exception as single_exc:
@@ -531,7 +606,7 @@ def _run_single_status_query(db, *, client, task_code: str, rows_for_code: list[
                 req_code=single_payload.get("reqCode") or "",
                 message=str(single_exc),
                 now=single_now,
-                normalized_status="failed",
+                normalized_status="",
                 update_message=True,
             )
     return touched_rows
@@ -560,7 +635,7 @@ def _run_status_query_batch_safely(
             task_codes,
         )
         _append_debug_console_event(db, direction="sent", module="task_monitor", base_url=debug_base_url, endpoint=debug_endpoint, payload=request_payload, message=f"Consulta automatica de {len(task_codes)} tareas activas")
-        response = client.query_task_status_with_payload(request_payload)
+        response = trace_call("query", [row for rows in task_map.values() for row in rows], client.query_task_status_with_payload, request_payload)
         _append_debug_console_event(db, direction="received", module="task_monitor", base_url=debug_base_url, endpoint=debug_endpoint, payload=response.raw, message=response.message or "Respuesta del monitor")
         items_by_code = _task_status_items_by_code(response)
         logger.info(
@@ -617,7 +692,7 @@ def _run_status_query_batch_safely(
                             req_code=response.reqCode or request_payload.get("reqCode") or "",
                             message=response.message or "",
                             now=now,
-                            normalized_status="failed",
+                            normalized_status="",
                             update_message=True,
                         )
                     continue
@@ -663,7 +738,7 @@ def check_active_tasks(
                         row.remote_task_code,
                         [],
                     )
-            target_rows = [row for row in rows if row.remote_task_code and (row.dispatch_status or "") == "success"]
+            target_rows = [row for row in rows if row.remote_task_code and (row.dispatch_status or "") in {"success", "uncertain"}]
             if not target_rows:
                 return 0
 
@@ -717,7 +792,7 @@ def check_active_tasks(
                     response_payload = raw_item if isinstance(raw_item, dict) else (response.raw or {})
 
                     for row in rows_for_code:
-                        row.req_code = response.reqCode or request_payload.get("reqCode") or row.req_code
+                        # Keep creation req_code; query identity is stored below.
                         row.status_query_request_json = json.dumps(request_payload, ensure_ascii=False)
                         row.status_query_response_json = json.dumps(response_payload, ensure_ascii=False)
                         row.status_query_checked_at = now
@@ -756,7 +831,7 @@ def check_active_tasks(
                 _append_debug_console_event(db, direction="received", module="task_monitor", base_url=debug_base_url, endpoint=debug_endpoint, payload={"error": str(exc)}, message=str(exc))
                 error_payload = {"error": str(exc)}
                 for row in target_rows:
-                    row.req_code = request_payload.get("reqCode") or row.req_code
+                    # Keep creation req_code; query identity is stored below.
                     row.status_query_request_json = json.dumps(request_payload, ensure_ascii=False)
                     row.status_query_response_json = json.dumps(error_payload, ensure_ascii=False)
                     row.status_query_checked_at = now

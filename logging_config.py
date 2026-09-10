@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from sqlalchemy import event, inspect
+from rcs_observability import SecretFilter, sanitize, sanitize_text, sensitive_key
 
 BASE_DIR = Path(__file__).resolve().parent
 LOG_DIR = BASE_DIR / "logs"
@@ -71,6 +72,7 @@ def _make_rotating_handler(log_path: Path, level: int, formatter: logging.Format
     )
     handler.setLevel(level)
     handler.setFormatter(formatter)
+    handler.addFilter(SecretFilter())
     return handler
 
 
@@ -137,17 +139,20 @@ def configure_logging() -> Path:
 
 def get_logger(name: str) -> logging.Logger:
     configure_logging()
-    return logging.getLogger(name)
+    logger = logging.getLogger(name)
+    if not any(isinstance(item, SecretFilter) for item in logger.filters):
+        logger.addFilter(SecretFilter())
+    return logger
 
 
 def _is_sensitive(value: Any) -> bool:
-    text = str(value or "").strip().lower()
-    return any(word in text for word in _SENSITIVE_KEYWORDS)
+    return sensitive_key(value)
 
 
 def _safe_value(column_name: str, value: Any) -> Any:
     if _is_sensitive(column_name):
         return "[REDACTED]"
+    value = sanitize(value)
     if isinstance(value, str) and len(value) > 120:
         return value[:117] + "..."
     return value

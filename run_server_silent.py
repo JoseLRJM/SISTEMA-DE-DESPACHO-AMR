@@ -78,6 +78,8 @@ def main():
             log_level="info",
             log_config=None,
             access_log=False,
+            workers=1,
+            lifespan="on",
         )
         server = uvicorn.Server(config)
         server.run()

@@ -121,16 +121,16 @@ class DispatchBackendBaselineTests(unittest.TestCase):
         result, stub, counters = self._run_endpoint(lambda: main.create_fifo_movement(body))
         self._assert_success_state(result, stub, "material_request")
         self.assertEqual(counters["commits"], 6)
-        self.assertEqual(counters["flushes"], 7)
-        self.assertEqual(counters["refreshes"], 2)
+        self.assertEqual(counters["flushes"], 6)
+        self.assertEqual(counters["refreshes"], 7)
 
     def test_direct_move_success_payload_and_persistence_baseline(self):
         body = main.DirectMoveRequestIn(source_cell_id=self.ids["source"], destination_cell_id=self.ids["destination"], priority="alta", agv_code="AGV-7", task_typ="A01", created_by="baseline")
         result, stub, counters = self._run_endpoint(lambda: main.create_direct_move_movement(body))
         self._assert_success_state(result, stub, "direct_move")
         self.assertEqual(counters["commits"], 6)
-        self.assertEqual(counters["flushes"], 7)
-        self.assertEqual(counters["refreshes"], 2)
+        self.assertEqual(counters["flushes"], 6)
+        self.assertEqual(counters["refreshes"], 7)
 
     def test_operator_window_success_delegates_without_payload_change(self):
         with self.factory() as db:
@@ -144,8 +144,8 @@ class DispatchBackendBaselineTests(unittest.TestCase):
         with self.factory() as db:
             self.assertEqual(db.get(MovementOrder, result.order_id).created_window_id, window_id)
         self.assertEqual(counters["commits"], 6)
-        self.assertEqual(counters["flushes"], 7)
-        self.assertEqual(counters["refreshes"], 2)
+        self.assertEqual(counters["flushes"], 6)
+        self.assertEqual(counters["refreshes"], 7)
 
     def test_fifo_selection_is_deterministic_with_reserved_destination_and_ineligible_rack(self):
         now = datetime(2024, 1, 1)
@@ -168,7 +168,7 @@ class DispatchBackendBaselineTests(unittest.TestCase):
                 observed.append((selection.rack.code, selection.source_cell.code, selection.destination_cell.code, selection.material_group.code))
         self.assertEqual(observed, [("RACK-001", "SRC-01", "DST-01", "MAT")] * 3)
 
-    def test_rejected_timeout_and_transport_all_rollback_without_moving_physical_rack(self):
+    def test_rejection_releases_but_uncertain_transport_keeps_resources(self):
         for outcome in ("rejected", "timeout", "transport"):
             with self.subTest(outcome=outcome):
                 # Each subcase gets a fresh instance because rollback intentionally persists terminal state.
@@ -177,14 +177,15 @@ class DispatchBackendBaselineTests(unittest.TestCase):
                 body = main.DirectMoveRequestIn(source_cell_id=self.ids["source"], destination_cell_id=self.ids["destination"], priority="alta", agv_code="AGV-7", task_typ="A01")
                 with self.assertRaises(HTTPException) as raised:
                     self._run_endpoint(lambda: main.create_direct_move_movement(body), outcome)
-                self.assertEqual(raised.exception.status_code, 400)
+                self.assertEqual(raised.exception.status_code, 400 if outcome == "rejected" else 409)
                 with self.factory() as db:
                     order = db.execute(select(MovementOrder).order_by(MovementOrder.id.desc())).scalars().first()
                     rack = db.get(Rack, self.ids["rack"]); source = db.get(Location, self.ids["source"]); destination = db.get(Location, self.ids["destination"])
-                    self.assertEqual(order.status, "dispatch_error")
-                    self.assertEqual(order.dispatch_status, "error")
-                    self.assertEqual(order.rcs_status, "error")
-                    self.assertEqual(rack.status, "available")
+                    rejected = outcome == "rejected"
+                    self.assertEqual(order.status, "dispatch_error" if rejected else "pending_dispatch")
+                    self.assertEqual(order.dispatch_status, "error" if rejected else "uncertain")
+                    self.assertEqual(order.rcs_status, "error" if rejected else "dispatch_unknown")
+                    self.assertEqual(rack.status, "available" if rejected else "reserved")
                     self.assertEqual(source.rack_id, rack.id)
                     self.assertIsNone(destination.rack_id)
 

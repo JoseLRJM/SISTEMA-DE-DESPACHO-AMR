@@ -2,12 +2,13 @@
 title AGV App
 
 echo ================================
-echo Iniciando AGV App (5 workers)...
+echo Iniciando AGV App (1 worker - unico modo soportado)...
 echo ================================
 
 cd /d %~dp0agv-app
 
-REM Ejecutar servidor con 5 workers
-..\python\python.exe -m uvicorn main:app --host 0.0.0.0 --port 8000
+REM Un runtime por base local. No usar workers ni replicas adicionales.
+set WEB_CONCURRENCY=1
+..\python\python.exe -m uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1 --lifespan on
 
 pause
