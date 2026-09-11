@@ -668,7 +668,8 @@ const qrSecondSourceCell = $("qrSecondSourceCell");
 const qrSecondDestinationCell = $("qrSecondDestinationCell");
 const qrSecondSourceCellSummary = $("qrSecondSourceCellSummary");
 const qrSecondDestinationCellSummary = $("qrSecondDestinationCellSummary");
-const qrPriority = $("qrPriority");
+const qrAutomaticPriority = $("qrAutomaticPriority");
+let qrLegacyPriority = null;
 const qrAgvCode = $("qrAgvCode");
 const qrTaskTyp = $("qrTaskTyp");
 const qrRequiresScanner = $("qrRequiresScanner");
@@ -1429,7 +1430,19 @@ function translateRobotStatusToSpanish(robot) {
   return byCode[code] || raw || 'Sin estado';
 }
 
-function renderRobotMonitorItems(items, message = '') {
+function robotCanCharge(robot, fresh) {
+  const text = String(robot?.statusText || '').trim().toLowerCase();
+  return !!fresh && !!String(robot?.agvCode || robot?.robotCode || '').trim()
+    && !['offline', 'disconnected', 'sin conexión', 'desconectado'].includes(text)
+    && /^[1-9]$/.test(String(robot?.agvStatus || robot?.status || '').trim());
+}
+
+let chargeVisibilityTimer;
+function renderRobotMonitorItems(items, message = '', chargeFresh = false) {
+  clearTimeout(chargeVisibilityTimer);
+  chargeVisibilityTimer = setTimeout(() => {
+    robotMonitorBody?.querySelectorAll('[data-robot-charge]').forEach(button => button.hidden = true);
+  }, 10000);
   if (!robotMonitorBody) return;
   if (!Array.isArray(items) || !items.length) {
     robotMonitorBody.innerHTML = `<div class="robot-monitor-empty">${escapeHtml(message || 'No hay robots reportados por el RCS.')}</div>`;
@@ -1465,6 +1478,7 @@ function renderRobotMonitorItems(items, message = '') {
         <div class="robot-monitor-controls">
           <button class="btn robot-monitor-action-btn warn" type="button" data-robot-action="stop" data-robot-code="${escapeHtml(robotCode)}">Pausa</button>
           <button class="btn robot-monitor-action-btn primary" type="button" data-robot-action="resume" data-robot-code="${escapeHtml(robotCode)}">Continuar</button>
+          ${robotCanCharge(robot, chargeFresh) ? `<button class="btn" type="button" data-robot-charge="${escapeHtml(robotCode)}">Charge</button>` : ''}
         </div>
       </div>`;
   }).join('');
@@ -1643,7 +1657,7 @@ async function refreshRobotMonitor(options = {}) {
     robotMonitorSubtitle.textContent = data.stale
       ? (data.message || 'Mostrando el último estado conocido.')
       : (count > 0 ? '' : (data.message || (data.ok ? 'Consulta exitosa sin robots.' : 'Sin datos todavía')));
-    renderRobotMonitorItems(latestRobotMonitorItems, data.message || 'Sin datos todavía.');
+    renderRobotMonitorItems(latestRobotMonitorItems, data.message || 'Sin datos todavía.', data.ok && !data.stale);
     draw();
   } catch (err) {
     draw();
@@ -1696,7 +1710,7 @@ function applyRobotMonitorUpdated(data) {
       ? (data?.message || 'Mostrando el último estado conocido.')
       : (robots.length ? '' : (data?.message || (data?.ok ? 'Consulta exitosa sin robots.' : 'Sin conexión')));
   }
-  renderRobotMonitorItems(latestRobotMonitorItems, data?.message || 'Sin datos todavía.');
+  renderRobotMonitorItems(latestRobotMonitorItems, data?.message || 'Sin datos todavía.', data?.ok && !data?.stale);
 }
 
 function applyLocationUpdated(location, options = {}) {
@@ -1964,6 +1978,26 @@ function connectRuntimeSocket() {
 
 
 document.addEventListener('click', async (ev) => {
+  const chargeButton = ev.target?.closest?.('[data-robot-charge]');
+  if (chargeButton) {
+    const code = chargeButton.getAttribute('data-robot-charge');
+    if (chargeButton.hidden || chargeButton.disabled || !confirm(`¿Enviar AMR ${code} a carga?\n\nCharge Code: 1`)) return;
+    chargeButton.disabled = true;
+    try {
+      const result = await fetchJson('/api/robot-control/charge', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({robot_code: code}),
+      });
+      if (robotMonitorSubtitle) robotMonitorSubtitle.textContent = result.message;
+      if (!result.ok) alert(result.message);
+      // Do not synthesize charging state; subsequent monitor observations own it.
+    } catch (err) {
+      alert(String(err?.message || 'Charge no confirmado; consultar RCS antes de repetir.'));
+    } finally {
+      chargeButton.hidden = true;
+    }
+    return;
+  }
   const btn = ev.target?.closest?.('[data-robot-action]');
   if (!btn) return;
   const action = btn.getAttribute('data-robot-action');
@@ -5647,7 +5681,8 @@ function clearQrRuleForm() {
   if (qrSecondDestinationArea) qrSecondDestinationArea.value = "";
   if (qrSecondSourceCell) qrSecondSourceCell.value = "";
   if (qrSecondDestinationCell) qrSecondDestinationCell.value = "";
-  qrPriority.value = "";
+  qrAutomaticPriority.value = "0";
+  qrLegacyPriority = null;
   qrAgvCode.value = "";
   qrTaskTyp.value = "";
   qrRequiresScanner.value = "1";
@@ -5732,7 +5767,8 @@ function loadQrRuleForm(id) {
   loadFifoChainFlexibleControls("qr", item);
   renderQrCellSummaries();
   syncRouteModeSections();
-  qrPriority.value = item.priority ?? "";
+  qrAutomaticPriority.value = item.automatic_priority ? "1" : "0";
+  qrLegacyPriority = item.priority ?? null;
   qrAgvCode.value = item.agv_code || "";
   qrTaskTyp.value = item.task_typ || "";
   qrRequiresScanner.value = String(item.requires_scanner_station ?? 1);
@@ -5784,7 +5820,8 @@ function qrRulePayload() {
     second_destination_area_id: qrSecondDestinationArea?.value ? Number(qrSecondDestinationArea.value) : null,
     second_source_cell_id: qrSecondSourceCell?.value ? Number(qrSecondSourceCell.value) : null,
     second_destination_cell_id: qrSecondDestinationCell?.value ? Number(qrSecondDestinationCell.value) : null,
-    priority: qrPriority.value === "" ? null : Number(qrPriority.value || 0),
+    priority: qrLegacyPriority,
+    automatic_priority: qrAutomaticPriority.value === "1",
     task_typ: qrTaskTyp.value.trim() || null,
     agv_code: qrAgvCode.value.trim() || null,
     requires_scanner_station: Number(qrRequiresScanner.value || 0),
@@ -7102,6 +7139,8 @@ function renderScanQrPreviewResult(result) {
     <div class="scan-preview-grid">
       ${previewDetailRow("Status", ok ? "preview_ok" : "error")}
       ${previewDetailRow("Mensaje", result?.message || "-")}
+      ${result?.automatic_priority ? previewDetailRow("Prioridad automática", "Activada — Envío: inmediato") +
+        (result.priority_plan || []).map(p => previewDetailRow(`Tramo ${p.step}`, String(p.priority))).join('') : ''}
       ${previewDetailRow("Diagnostico", operatorDiagnosisMessage(result?.operator_diagnosis || result?.diagnosis))}
       ${previewDetailRow("Misma celda", sameCellMoveMessageFromResult(result))}
       ${previewDetailRow("Sugerencia", sameCellBlockedSuggestion(result))}
@@ -7459,6 +7498,11 @@ async function adminLoadRcsConfig() {
   const data = await fetchJson(API.adminRcsConfigGet, { headers: fetchHeaders() });
   if (rcsSimulatorEnabled) rcsSimulatorEnabled.checked = Number(data.simulator_enabled ?? 0) === 1;
   rcsBaseUrl.value = data.base_url || '';
+  $('rcsWebBase').value = data.web_base_url || '';
+  $('rcsWebLogin').value = data.web_login_endpoint || '/rcms/web/login/login.action';
+  $('rcsWebCharge').value = data.web_charge_endpoint || '/rcms/web/agvControl/agvChargeTask.action';
+  $('rcsWebUser').value = data.web_username || '';
+  $('rcsWebPassword').value = '';
   rcsEndpoint.value = data.create_task_endpoint || '/rcs/task/create';
   if (rcsQueryEndpoint) rcsQueryEndpoint.value = data.query_task_status_endpoint || '/rcms/services/rest/hikRpcService/queryTaskStatus';
   if (rcsCancelEndpoint) rcsCancelEndpoint.value = data.cancel_task_endpoint || '/rcms/services/rest/hikRpcService/cancelTask';
@@ -7492,6 +7536,11 @@ async function adminLoadRcsConfig() {
 
 async function adminSaveRcsConfig() {
   const payload = {
+    web_base_url: $('rcsWebBase').value.trim(),
+    web_login_endpoint: $('rcsWebLogin').value.trim(),
+    web_charge_endpoint: $('rcsWebCharge').value.trim(),
+    web_username: $('rcsWebUser').value.trim(),
+    web_ecs_password: $('rcsWebPassword').value,
     simulator_enabled: rcsSimulatorEnabled?.checked ? 1 : 0,
     base_url: rcsBaseUrl.value.trim() || '',
     create_task_endpoint: rcsEndpoint.value.trim() || '/rcs/task/create',
@@ -7526,6 +7575,7 @@ async function adminSaveRcsConfig() {
   rcsTokenCode.value = '';
   rcsAuthHeader.value = '';
   rcsConfigMsg.textContent = 'Configuración RCS guardada.';
+  $('rcsWebPassword').value = '';
 }
 
 async function adminTestRcsConfig() {

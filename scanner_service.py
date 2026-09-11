@@ -27,7 +27,7 @@ from qr_transition_service import transition_match_metadata, transition_match_ti
 
 logger = get_logger("app.scanner")
 SCAN_DEDUP_SECONDS = 7
-SCAN_EXECUTE_RECENT_STATUSES = {"success", "created", "dispatched", "pending"}
+SCAN_EXECUTE_RECENT_STATUSES = {"success", "created", "dispatched", "pending", "batch_sent", "batch_partial", "batch_uncertain"}
 
 QR_ERROR_PATTERNS = (
     ("parsing the task template failed", "RCS_TEMPLATE_PARSE_ERROR"),
@@ -2926,12 +2926,21 @@ def _preview_scan_read_only(db, scanner_code, qr_value, created_by=None, termina
     parsed = None
     action = None
     entities = {}
+    priority_metadata = {}
     _qr_trace("QR_SCAN_RECEIVED", execution_id, stage="received", mode="preview", scanner_code=scanner_code, terminal_id=getattr(terminal, "id", None), terminal_code=getattr(terminal, "terminal_code", None), qr_value=normalized_qr)
     try:
         if not normalized_qr:
             raise ScanPreviewError("qr_value requerido", "rejected")
         station = resolve_scanner_station(db, scanner_code)
         qr_rule = resolve_qr_action_rule(db, normalized_qr)
+        # Preserve the saved flag even when preflight raises before returning
+        # entities. Error responses must not inherit the schema's OFF defaults.
+        if bool(getattr(qr_rule, "automatic_priority", False)):
+            from automatic_priority_service import priority_preview
+            priority_metadata = priority_preview(qr_rule, {
+                "route_mode": _route_mode_value(station, qr_rule),
+                "fifo_chain_total_steps": _fifo_chain_total_steps_value(station, qr_rule),
+            })
         parsed = parse_qr_value(normalized_qr)
         action = resolve_scan_action(db, station, qr_rule, parsed)
         _qr_trace("QR_RULE_RESOLVED", execution_id, stage="rule_resolved", scanner_station_id=station.id, scanner_code=station.scanner_code, qr_action_rule_id=getattr(qr_rule, "id", None), qr_alias=getattr(qr_rule, "qr_alias", None), qr_value=normalized_qr, action=action)
@@ -3001,6 +3010,8 @@ def _preview_scan_read_only(db, scanner_code, qr_value, created_by=None, termina
             "fifo_chain_preflight_checklist": (entities.get("fifo_chain_projection") or {}).get("fifo_chain_preflight_checklist") or {},
             "message": "Preview correcto. No se creo orden.",
         }
+        from automatic_priority_service import priority_preview
+        result.update(priority_preview(qr_rule, entities))
         if terminal:
             result["terminal"] = {"id": terminal.id, "terminal_code": terminal.terminal_code, "name": terminal.name, "last_seen_at": getattr(terminal, "last_seen_at", None), "last_ip": getattr(terminal, "last_ip", None)}
             request_payload["terminal_code"] = terminal.terminal_code
@@ -3020,6 +3031,7 @@ def _preview_scan_read_only(db, scanner_code, qr_value, created_by=None, termina
             "message": diagnosis["operator_message"],
         }
         result.update(exc.details)
+        result.update(priority_metadata)
         result.update({"error_code": diagnosis["error_code"], "operator_message": diagnosis["operator_message"], "suggested_action": diagnosis["suggested_action"], "step": diagnosis["step"]})
         result["error_code"] = _qr_error_code(exc.message, result["error_code"])
         result["operator_diagnosis"] = diagnosis
@@ -3037,6 +3049,7 @@ def _preview_scan_read_only(db, scanner_code, qr_value, created_by=None, termina
         diagnosis = _build_operator_diagnosis(db, message=message, details=details, qr_value=normalized_qr, station=station, qr_rule=qr_rule, entities=entities)
         result = {"ok": False, "execution_id": execution_id, "mode": "preview", "scanner": {"scanner_code": str(scanner_code or "").strip()}, "qr": {"qr_value": normalized_qr}, "action": action, "message": diagnosis["operator_message"]}
         result.update(details)
+        result.update(priority_metadata)
         result.update({"error_code": diagnosis["error_code"], "operator_message": diagnosis["operator_message"], "suggested_action": diagnosis["suggested_action"], "step": diagnosis["step"]})
         result["error_code"] = _qr_error_code(message, result["error_code"])
         result["operator_diagnosis"] = diagnosis
@@ -3052,6 +3065,7 @@ def _preview_scan_read_only(db, scanner_code, qr_value, created_by=None, termina
         error_code = _qr_error_code(exc, "UNEXPECTED_QR_ERROR")
         logger.exception("QR_EXECUTION_FAILED execution_id=%s mode=preview stage=unexpected error_code=%s", execution_id, error_code)
         result = {"ok": False, "execution_id": execution_id, "mode": "preview", "scanner": {"scanner_code": str(scanner_code or "").strip()}, "qr": {"qr_value": normalized_qr}, "action": action, "error_code": error_code, "operator_message": "No se pudo completar el Preview QR.", "message": "No se pudo completar el Preview QR."}
+        result.update(priority_metadata)
         event = _save_scan_event(db, scanner_code=scanner_code, qr_value=normalized_qr, created_by=created_by, station=station, qr_rule=qr_rule, parsed=parsed, action=action, entities=entities, status="error", error_message=str(exc)[:512], request_payload=request_payload, result_payload=result, terminal=terminal)
         result["scan_event_id"] = event.id
         _qr_trace("QR_EXECUTION_FAILED", execution_id, stage="unexpected", mode="preview", scan_event_id=event.id, error_code=error_code, operator_message=result["operator_message"], raw_error=str(exc), total_duration_ms=round((time.perf_counter() - started_at) * 1000, 2))
@@ -3326,6 +3340,27 @@ def _execute_scan_locked(db, scanner_code, qr_value, created_by=None, terminal=N
         if route_mode == "fifo_chain":
             preflight_entities = _resolve_entities(db, station, qr_rule, parsed, action)
             entities = preflight_entities
+            if bool(getattr(qr_rule, "automatic_priority", False)):
+                from automatic_priority_service import prepare_group, execute_group, priority_preview
+                try:
+                    rows = prepare_group(db, qr_rule, entities, created_by=created_by or "qr", agv_code=agv_code)
+                except Exception:
+                    db.rollback()
+                    raise
+                result = execute_group(db, rows, dispatch_func)
+                result.update(priority_preview(qr_rule, entities))
+                result.update({"execution_id":execution_id, "mode":"execute", "action":action,
+                    "route_mode":"fifo_chain", "scanner":{"id":station.id, "scanner_code":station.scanner_code},
+                    "scanner_code":station.scanner_code, "qr":{"qr_value":normalized_qr}, "qr_value":normalized_qr,
+                    "movement_order":_movement_order_payload(rows[0])})
+                event = _save_scan_event(db, scanner_code=station.scanner_code, qr_value=normalized_qr,
+                    created_by=created_by, station=station, qr_rule=qr_rule, parsed=parsed, action=action,
+                    entities=entities, status=result["status"], request_payload=request_payload,
+                    result_payload=result, terminal=terminal, mode="execute")
+                event.movement_order_id = rows[0].id
+                db.add(event); db.commit()
+                result["scan_event_id"] = event.id
+                return result
         preflight_duration_ms = round((time.perf_counter() - (preflight_started_at or started_at)) * 1000, 2)
         _qr_trace("QR_PREFLIGHT_OK", execution_id, stage="preflight", route_mode=route_mode, taskTyp=step1_task_typ, preflight_duration_ms=preflight_duration_ms, source_area_id=source_area_id, source_cell_id=source_cell_id, destination_area_id=destination_area_id, destination_cell_id=destination_cell_id)
         comment = f"QR execute {normalized_qr}"
@@ -3369,6 +3404,9 @@ def _execute_scan_locked(db, scanner_code, qr_value, created_by=None, terminal=N
         else:
             order, selection = execute_fifo_request(db, source_area_id, destination_area_id, material_id, priority, comment, created_by or "qr", agv_code, step1_task_typ, allow_same_cell_move=_allow_same_cell_move_value(station, qr_rule))
         created_order = order
+        if bool(getattr(qr_rule, "automatic_priority", False)):
+            order.priority = "127"
+            order.fifo_chain_select_policy = "automatic_priority"
         order_creation_duration_ms = round((time.perf_counter() - order_started_at) * 1000, 2)
         _qr_trace("QR_ORDER_CREATED", execution_id, stage="order_created", movement_order_id=order.id, order_code=order.order_code, route_mode=route_mode, fifo_chain_group_id=getattr(order, "fifo_chain_group_id", None), fifo_chain_step=getattr(order, "fifo_chain_step", None), rack_id=selection.rack.id, rack_code=selection.rack.code, source_area_id=selection.source_area.id, source_cell_id=selection.source_cell.id, destination_area_id=selection.destination_area.id, destination_cell_id=selection.destination_cell.id, taskTyp=step1_task_typ, order_creation_duration_ms=order_creation_duration_ms)
         entities = {

@@ -487,6 +487,7 @@ class QrActionRule(Base):
     second_source_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
     second_destination_cell_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
     priority = Column(Integer, nullable=True)
+    automatic_priority = Column(Boolean, nullable=False, default=False, server_default="0")
     task_typ = Column(String(64), nullable=True)
     agv_code = Column(String(128), nullable=True)
     requires_scanner_station = Column(Integer, nullable=False, default=1)

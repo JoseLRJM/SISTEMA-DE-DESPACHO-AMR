@@ -691,7 +691,7 @@
 </div>
 <div class="row two-col">
 <div data-fifo-chain-general="qr"><label>Rack asociado</label><select disabled="" id="qrRack"><option value="">Sin rack</option></select></div>
-<div><label>Prioridad</label><input disabled="" id="qrPriority" min="0" type="number"/></div>
+<div><label for="qrAutomaticPriority">Prioridad automática</label><select disabled="" id="qrAutomaticPriority"><option value="0">OFF</option><option value="1">ON — envío inmediato</option></select></div>
 </div>
 <div class="row two-col">
 <div><label>Modo de ruta</label><select disabled="" id="qrRouteMode"><option value="simple_area">Simple por origen/destino</option><option value="double_area">Doble &aacute;rea / multipunto</option><option value="fifo_chain">Flujo doble FIFO / tareas encadenadas</option></select></div>
@@ -1082,6 +1082,14 @@
 <label>Endpoint resume robot</label>
 <input disabled="" id="rcsResumeEndpoint" placeholder="/rcms/services/rest/hikRpcService/resumeRobot" type="text"/>
 </div>
+<fieldset><legend>RCS Web / Charge — separado de API REST</legend>
+<div class="row"><label>URL base RCS Web</label><input id="rcsWebBase" placeholder="http://IP_RCS:8181" type="url"/></div>
+<div class="row"><label>Endpoint login Web</label><input id="rcsWebLogin" value="/rcms/web/login/login.action"/></div>
+<div class="row"><label>Endpoint Charge</label><input id="rcsWebCharge" value="/rcms/web/agvControl/agvChargeTask.action"/></div>
+<div class="row"><label>Usuario RCS Web</label><input id="rcsWebUser" autocomplete="off"/></div>
+<div class="row"><label>ecsPassword</label><input id="rcsWebPassword" type="password" autocomplete="new-password" placeholder="Vacío conserva el valor guardado"/></div>
+<div class="row"><label>Charge Code</label><input value="1" readonly/></div>
+</fieldset>
 <div class="row">
 <label>Endpoint estado AMR</label>
 <input disabled="" id="rcsAgvStatusEndpoint" placeholder="/rcms-dps/rest/queryAgvStatus" type="text"/>

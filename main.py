@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 import asyncio
 import contextlib
 import contextvars
@@ -509,6 +509,12 @@ class ClientIPIn(BaseModel):
 
 
 class RcsConfigIn(BaseModel):
+    web_base_url: str = Field(default="", max_length=512)
+    web_login_endpoint: str = Field(default="/rcms/web/login/login.action", max_length=256)
+    web_charge_endpoint: str = Field(default="/rcms/web/agvControl/agvChargeTask.action", max_length=256)
+    web_username: str = Field(default="", max_length=128)
+    web_ecs_password: str = Field(default="", max_length=2048)
+    web_charge_code: Literal["1"] = "1"
     base_url: str = Field(default="", max_length=512)
     simulator_enabled: int = Field(default=0, ge=0, le=1)
     create_task_endpoint: str = Field(default="/rcs/task/create", max_length=256)
@@ -1057,6 +1063,10 @@ class ScanTerminalRequestIn(BaseModel):
 
 class ScanPreviewOut(BaseModel):
     ok: bool
+    automatic_priority: bool = False
+    priority_plan: list[dict] = Field(default_factory=list)
+    movement_orders: list[dict] = Field(default_factory=list)
+    send_mode: Optional[str] = None
     mode: str
     status: Optional[str] = None
     scanner: dict
@@ -1505,6 +1515,7 @@ class ScannerStationOut(ScannerStationIn):
 
 class QrActionRuleIn(BaseModel):
     qr_value: str = Field(min_length=1, max_length=256)
+    automatic_priority: bool = False
     qr_alias: Optional[str] = Field(default=None, max_length=128)
     description: Optional[str] = Field(default=None, max_length=512)
     qr_type: str = Field(default="generic", min_length=1, max_length=64)
@@ -2333,6 +2344,7 @@ def cleanup_legacy_schema():
             try:
                 qr_action_rule_cols = [c[1] for c in conn.exec_driver_sql("PRAGMA table_info(qr_action_rules);").fetchall()]
                 qr_route_missing_sql = {
+                    "automatic_priority": "ALTER TABLE qr_action_rules ADD COLUMN automatic_priority BOOLEAN NOT NULL DEFAULT 0;",
                     "route_mode": "ALTER TABLE qr_action_rules ADD COLUMN route_mode VARCHAR(32) NOT NULL DEFAULT 'simple_area';",
                     "fifo_material_policy": "ALTER TABLE qr_action_rules ADD COLUMN fifo_material_policy VARCHAR(32) NOT NULL DEFAULT 'specific_material';",
                     "fifo_chain_total_steps": "ALTER TABLE qr_action_rules ADD COLUMN fifo_chain_total_steps INTEGER NOT NULL DEFAULT 2;",
@@ -3569,6 +3581,8 @@ def _movement_order_json_payload(db, row: MovementOrder) -> dict:
         priority_value = "1"
     elif normalized_priority == "urgente":
         priority_value = "2"
+    if row.fifo_chain_select_policy == "automatic_priority":
+        priority_value = str(max(1, 128 - int(row.fifo_chain_step or 1)))
 
     payload = {
         "agvCode": (row.agv_code or "").strip(),
@@ -4158,6 +4172,7 @@ def _qr_action_rule_out(db, row: QrActionRule) -> QrActionRuleOut:
         priority=row.priority,
         task_typ=row.task_typ,
         agv_code=row.agv_code,
+        automatic_priority=bool(getattr(row, "automatic_priority", False)),
         requires_scanner_station=int(row.requires_scanner_station or 0),
         allow_same_cell_move=int(bool(getattr(row, "allow_same_cell_move", False))),
         is_active=int(row.is_active or 0),
@@ -5083,6 +5098,8 @@ def _save_movement_order_payload_override(db, row: MovementOrder, payload: dict)
 def _validate_movement_payload(db, row: MovementOrder, payload: dict):
     expected = RcsTaskRequest.from_payload(_movement_order_json_payload(db, row)).to_payload()
     candidate = RcsTaskRequest.from_payload(payload).to_payload()
+    if row.fifo_chain_select_policy == "automatic_priority" and candidate["priority"] != expected["priority"]:
+        raise HTTPException(status_code=409, detail="El payload no conserva la prioridad automática del tramo")
     for key in ("positionCodePath", "agvCode", "taskTyp", "taskCode", "podCode"):
         if candidate.get(key) != expected.get(key):
             raise HTTPException(status_code=409, detail=f"El payload no corresponde a la orden: {key}")
@@ -5273,6 +5290,11 @@ def _get_rcs_config(db) -> RcsConfigOut:
     resolved_auth_header = auth_header or os.getenv("RCS_AUTH_HEADER", "").strip()
 
     return RcsConfigOut(
+        web_base_url=get_setting(db, "rcs_web_base_url", ""),
+        web_login_endpoint=get_setting(db, "rcs_web_login_endpoint", "/rcms/web/login/login.action"),
+        web_charge_endpoint=get_setting(db, "rcs_web_charge_endpoint", "/rcms/web/agvControl/agvChargeTask.action"),
+        web_username=get_setting(db, "rcs_web_username", ""),
+        web_ecs_password="",
         base_url=base_url,
         simulator_enabled=simulator_enabled,
         create_task_endpoint=endpoint,
@@ -5309,6 +5331,15 @@ def _get_rcs_config(db) -> RcsConfigOut:
 
 
 def _save_rcs_config(db, payload: RcsConfigIn) -> RcsConfigOut:
+    from rcs_charge_service import web_url
+    web_base = payload.web_base_url if "web_base_url" in payload.model_fields_set else get_setting(db, "rcs_web_base_url", "")
+    if web_base:
+        try:
+            for field, default in (("web_login_endpoint", "/rcms/web/login/login.action"), ("web_charge_endpoint", "/rcms/web/agvControl/agvChargeTask.action")):
+                endpoint = getattr(payload, field) if field in payload.model_fields_set else get_setting(db, "rcs_" + field, default)
+                web_url(web_base.strip(), endpoint.strip())
+        except ValueError:
+            raise HTTPException(400, "URL o endpoint RCS Web inválido; no incluir credenciales en la URL")
     simulator_enabled = 1 if int(payload.simulator_enabled or 0) else 0
     endpoint = (payload.create_task_endpoint or "/rcs/task/create").strip() or "/rcs/task/create"
     query_endpoint = (payload.query_task_status_endpoint or "/rcms/services/rest/hikRpcService/queryTaskStatus").strip() or "/rcms/services/rest/hikRpcService/queryTaskStatus"
@@ -5351,6 +5382,11 @@ def _save_rcs_config(db, payload: RcsConfigIn) -> RcsConfigOut:
     if not rack_sync_bind_endpoint.startswith("/"):
         rack_sync_bind_endpoint = "/" + rack_sync_bind_endpoint
     source = "admin_rcs_config"
+    for field in ("web_base_url", "web_login_endpoint", "web_charge_endpoint", "web_username"):
+        if field in payload.model_fields_set:
+            set_setting(db, "rcs_" + field, getattr(payload, field).strip(), source=source)
+    if payload.web_ecs_password:
+        set_setting(db, "rcs_web_ecs_password", payload.web_ecs_password, source=source)
     set_setting(db, "rcs_simulator_enabled", "1" if simulator_enabled else "0", source=source)
     set_setting(db, "rcs_base_url", (payload.base_url or "").strip(), source=source)
     set_setting(db, "rcs_create_task_endpoint", endpoint, source=source)
@@ -6310,6 +6346,8 @@ def _dispatch_movement_order(db, row: MovementOrder) -> MovementOrderDispatchOut
         db.commit()
     if row.dispatch_request_json or row.remote_task_code or row.dispatch_status != "not_sent" or row.status != "pending_dispatch":
         return _movement_order_dispatch_out(row)
+    if row.fifo_chain_select_policy == "automatic_priority" and row.fifo_chain_group_id and db.info.get("automatic_priority_order_id") != row.id:
+        raise HTTPException(status_code=409, detail="Este tramo solo puede enviarse en el proceso inicial de su grupo QR.")
     logger.info("Dispatching movement order id=%s order_code=%s", row.id, row.order_code)
     previous_status = row.status or ""
     generated_payload = _movement_order_json_payload(db, row)
@@ -6589,6 +6627,8 @@ def on_startup():
             db.commit()
     # Completed parents are absent from the active-order monitor after restart.
     with SessionLocal() as db:
+        from automatic_priority_service import recover_interrupted_groups
+        recover_interrupted_groups(db)
         recover_fifo_chains(db)
     try:
         app.state.task_monitor.start()
@@ -8293,6 +8333,35 @@ def get_rcs_config_public():
 def stop_robot_control(payload: RobotControlIn):
     with SessionLocal() as db:
         return _send_robot_control(db, "stop", payload.robot_code.strip())
+
+
+@app.post("/api/robot-control/charge")
+def charge_robot_control(payload: RobotControlIn):
+    from rcs_charge_service import connected, send_charge
+    code = payload.robot_code.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", code):
+        raise HTTPException(400, "Código AMR inválido")
+    with SessionLocal() as db:
+        # Direct query, deliberately not the monitor cache or simulator.
+        cfg = _get_rcs_config(db)
+        if cfg.simulator_enabled:
+            raise HTTPException(409, "Charge Web no disponible en modo simulado")
+        state = _get_robot_status_monitor_response(db)
+        robot = next((r for r in state.robots if (r.agvCode or r.robotCode).strip() == code), None)
+        if not state.ok or state.stale or robot is None or not connected(robot):
+            raise HTTPException(409, "AMR desconectado o estado actual no confirmado")
+        try:
+            result = send_charge(base_url=cfg.web_base_url, login_endpoint=cfg.web_login_endpoint,
+                charge_endpoint=cfg.web_charge_endpoint, username=cfg.web_username,
+                password=get_setting(db, "rcs_web_ecs_password", ""), agv_code=code,
+                verify_tls=bool(cfg.verify_tls))
+        except ValueError:
+            raise HTTPException(400, "Configuración RCS Web inválida")
+        _append_debug_console_event(db, direction="received", module="charge",
+            base_url=cfg.web_base_url, endpoint=cfg.web_charge_endpoint,
+            payload={"action": "charge", "agvCode": code, "result": result["result"]},
+            message=result["message"])
+        return {**result, "action": "charge", "robot_code": code}
 
 
 @app.post("/api/robot-control/resume", response_model=RobotControlResponse)
@@ -10393,6 +10462,7 @@ def admin_create_qr_action_rule(body: QrActionRuleIn, x_admin_token: Optional[st
             second_destination_cell_id=body.second_destination_cell_id,
             priority=body.priority,
             task_typ=(body.task_typ or "").strip() or None,
+            automatic_priority=body.automatic_priority,
             agv_code=(body.agv_code or "").strip() or None,
             requires_scanner_station=int(body.requires_scanner_station or 0),
             allow_same_cell_move=bool(int(body.allow_same_cell_move or 0)),
@@ -10428,6 +10498,7 @@ def admin_update_qr_action_rule(qr_action_rule_id: int, body: QrActionRuleIn, x_
         step5_source_mode = _normalize_fifo_chain_step5_source_mode(body.fifo_chain_step5_source_mode)
         route_mode = _normalize_route_mode(body.route_mode)
         row.qr_value = body.qr_value.strip()
+        row.automatic_priority = body.automatic_priority
         row.qr_alias = (body.qr_alias or "").strip() or None
         row.description = (body.description or "").strip() or None
         row.qr_type = qr_type

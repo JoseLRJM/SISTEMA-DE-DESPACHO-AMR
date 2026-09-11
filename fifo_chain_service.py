@@ -631,6 +631,9 @@ def trigger_fifo_chain_next_step_if_needed(db, completed_order_id: int, dispatch
     if not order:
         logger.info("FIFO_CHAIN_NEXT_STEP_SKIP completed_order_id=%s reason=order_not_found", completed_order_id)
         return _result("skipped", "order_not_found", completed_order_id=completed_order_id)
+    if order.fifo_chain_select_policy == "automatic_priority":
+        # All slots belong to the initial batch, never to completion/restart continuation.
+        return _result("skipped", "automatic_priority_batch", completed_order_id=order.id)
 
     logger.info(
         "FIFO_CHAIN_NEXT_STEP_CHECK fifo_chain_group_id=%s completed_order_id=%s route_mode=%s step=%s status=%s fifo_chain_status=%s",

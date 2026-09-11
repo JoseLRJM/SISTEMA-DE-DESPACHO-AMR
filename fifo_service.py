@@ -716,6 +716,17 @@ def simulate_order_completed(db, order_id: int, *, local_simulation: bool = Fals
         raise HTTPException(status_code=409, detail="La orden ya fue finalizada")
     if order.status not in ORDER_STATUSES_WITH_DESTINATION_RESERVATION:
         raise HTTPException(status_code=409, detail=f"La orden no puede finalizarse en estado {order.status}")
+    if order.fifo_chain_select_policy == "automatic_priority" and order.fifo_chain_group_id:
+        previous = db.scalars(select(MovementOrder).where(
+            MovementOrder.fifo_chain_group_id == order.fifo_chain_group_id,
+            MovementOrder.rack_id == order.rack_id,
+            MovementOrder.fifo_chain_step < order.fifo_chain_step,
+            MovementOrder.status != "completed",
+        )).first()
+        if previous:
+            # Cyclic routes can revisit the same source. Matching cells alone must
+            # not make a later completion bypass unreconciled movements of this rack.
+            raise HTTPException(status_code=409, detail="Prioridad automática: tramo anterior del rack pendiente de reconciliación")
 
     rack = db.execute(select(Rack).where(Rack.id == order.rack_id)).scalar_one()
     source_cell = db.execute(select(Location).where(Location.id == order.source_cell_id)).scalar_one()
@@ -804,6 +815,17 @@ def simulate_order_completed(db, order_id: int, *, local_simulation: bool = Fals
         db.commit()
         db.refresh(order)
         return order
+    # Immediate batches reserve future steps before this completion. Evaluate the
+    # existing transition as in sequential execution (released after this step),
+    # but never commit that intermediate availability while the batch owns it.
+    batch_transition = bool(
+        active_other
+        and order.fifo_chain_select_policy == "automatic_priority"
+        and order.fifo_chain_group_id
+        and active_other.fifo_chain_group_id == order.fifo_chain_group_id
+    )
+    if batch_transition:
+        rack.status = "available"
     try:
         transition_result = apply_transition_for_completed_order(db, order.id, reason="movement_completed")
         logger.info(
@@ -814,6 +836,12 @@ def simulate_order_completed(db, order_id: int, *, local_simulation: bool = Fals
         )
     except Exception as exc:
         logger.exception("QR_TRANSITION_COMPLETION_HOOK_ERROR movement_order_id=%s error=%s", order.id, exc)
+    finally:
+        if batch_transition:
+            apply_rack_reservation_status(rack, True, updated_at=now,
+                order_id=active_other.id, dispatch_status=active_other.status,
+                source="fifo_service", reason="automatic_priority_remaining_steps")
+            db.add(rack)
     db.commit()
     db.refresh(order)
     logger.info("Movement order completed order_id=%s order_code=%s rack_id=%s destination_cell_id=%s", order.id, order.order_code, rack.id, destination_cell.id)
