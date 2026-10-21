@@ -922,3 +922,18 @@ textarea[disabled], select[disabled]{opacity:.6}
   .qr-admin-modal-card { padding: 1rem; }
   .qr-admin-modal-actions { flex-wrap: wrap; }
 }
+/* A single native dialog keeps keyboard focus inside the contextual editor. */
+#contextCellDialog { width: min(780px, calc(100vw - 32px)); max-height: calc(100vh - 40px); overflow: auto; padding: 22px; border: 1px solid #64748b; border-radius: 14px; background: var(--panel, #172033); color: var(--text, #f1f5f9); }
+#contextCellDialog::backdrop { background: rgba(0, 0, 0, .65); }
+#contextCellDialog fieldset { margin: 14px 0; padding: 12px; border: 1px solid #64748b; border-radius: 8px; }
+.context-cell-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.context-cell-grid label { display: flex; flex-direction: column; gap: 5px; }
+.context-cell-wide { grid-column: 1 / -1; }
+.context-cell-offer { position: fixed; z-index: 50; box-shadow: 0 3px 12px #0008; }
+.context-cell-offer[hidden] { display: none; }
+#contextCellError { white-space: pre-wrap; overflow-wrap: anywhere; }
+#contextCellDialog [hidden] { display: none !important; }
+.context-cell-views { flex-wrap: wrap; }
+.context-cell-views [aria-pressed="true"] { border-color: var(--sel, #ffd166); }
+#contextCellReference { white-space: pre-line; }
+@media (max-width: 540px) { .context-cell-grid { grid-template-columns: 1fr; } }

@@ -29,7 +29,7 @@ from types import SimpleNamespace
 from fastapi import FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 from sqlalchemy import select, func, delete, text, or_, event, update
 
 from logging_config import ensure_log_file, get_logger
@@ -2862,7 +2862,7 @@ def ensure_special_materials():
             db.commit()
 
 
-def _ensure_no_material_group_in_db(db) -> MaterialGroup:
+def _ensure_no_material_group_in_db(db, *, commit: bool = True) -> MaterialGroup:
     row = db.execute(select(MaterialGroup).where(MaterialGroup.code == NO_MATERIAL_CODE)).scalar_one_or_none()
     if row is None:
         now = datetime.utcnow()
@@ -2875,8 +2875,11 @@ def _ensure_no_material_group_in_db(db) -> MaterialGroup:
             updated_at=now,
         )
         db.add(row)
-        db.commit()
-        db.refresh(row)
+        if commit:
+            db.commit()
+            db.refresh(row)
+        else:
+            db.flush()
         return row
     changed = False
     if int(getattr(row, "is_active", 0) or 0) != 1:
@@ -2888,8 +2891,11 @@ def _ensure_no_material_group_in_db(db) -> MaterialGroup:
     if changed:
         row.updated_at = datetime.utcnow()
         db.add(row)
-        db.commit()
-        db.refresh(row)
+        if commit:
+            db.commit()
+            db.refresh(row)
+        else:
+            db.flush()
     return row
 
 
@@ -11351,6 +11357,169 @@ def _guard_admin_inventory_edit(db, *, rack_ids=(), location_ids=()) -> None:
         raise HTTPException(status_code=409, detail=f"Inventario protegido por orden activa {active[0]}; usa recuperación con evidencia RCS o cierre extraordinario confirmado.")
 
 
+class ContextCellSave(BaseModel):
+    model_config = {"extra": "forbid"}
+    expected_location: str
+    expected_racks: Dict[int, str] = Field(default_factory=dict)
+    location: Dict[str, Any] = Field(default_factory=dict)
+    rack_id: Optional[int] = None
+    rack: Dict[str, Any] = Field(default_factory=dict)
+    reserved: Optional[int] = Field(default=None, ge=0, le=1)
+
+
+def _inventory_fingerprint(row) -> str:
+    # Compare every persisted column, including changes made outside our handlers.
+    values = {col.name: getattr(row, col.name) for col in row.__table__.columns}
+    return hashlib.sha256(json.dumps(values, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _context_rack_fingerprint(db, rack) -> str:
+    assigned_id = db.execute(select(Location.id).where(Location.rack_id == rack.id)).scalar_one_or_none()
+    return hashlib.sha256(f"{_inventory_fingerprint(rack)}:{assigned_id}".encode()).hexdigest()
+
+
+def _context_validate(model, values):
+    try:
+        return model(**values)
+    except ValidationError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+def _context_cell_payload(db, location, racks) -> dict:
+    return {
+        "location": _location_out(db, location).model_dump(mode="json"),
+        "racks": [_rack_out(db, row).model_dump(mode="json") for row in racks],
+        "expected_location": _inventory_fingerprint(location),
+        "expected_racks": {row.id: _context_rack_fingerprint(db, row) for row in racks},
+    }
+
+
+@app.get("/api/cell-editor/{location_id}")
+def get_context_cell(location_id: int, rack_id: Optional[int] = None):
+    # Same public inventory data as /api/catalog; no administrative secrets.
+    with SessionLocal() as db:
+        db.execute(text("BEGIN"))
+        location = db.get(Location, location_id)
+        if not location:
+            raise HTTPException(404, "Ubicación no encontrada")
+        ids = {value for value in (location.rack_id, rack_id) if value is not None}
+        racks = list(db.execute(select(Rack).where(Rack.id.in_(ids))).scalars()) if ids else []
+        if len(racks) != len(ids):
+            raise HTTPException(404, "Rack no encontrado")
+        return _context_cell_payload(db, location, racks)
+
+
+def _validated_rack_values(db, rack_id: int, body: RackIn, *, fields=None) -> dict:
+    code = body.code.strip()
+    if not code:
+        raise HTTPException(400, "El código del rack no puede estar vacío")
+    if db.execute(select(Rack.id).where(Rack.code == code, Rack.id != rack_id)).first():
+        raise HTTPException(400, "Ya existe un rack con ese código")
+    material_id = body.material_group_id
+    if not material_id and (fields is None or "material_group_id" in fields):
+        if fields is None:
+            material_id = _ensure_no_material_group_in_db(db, commit=False).id
+        else:
+            no_material = db.execute(select(MaterialGroup).where(MaterialGroup.code == NO_MATERIAL_CODE)).scalar_one_or_none()
+            material_id = (no_material or _ensure_no_material_group_in_db(db, commit=False)).id
+    if material_id:
+        material = db.get(MaterialGroup, material_id)
+        if not material:
+            raise HTTPException(400, "Material no encontrado")
+        if int(material.is_active or 0) != 1:
+            raise HTTPException(409, "El material está inactivo; restáuralo antes de asignarlo al rack")
+    values = body.model_dump(exclude={"status", "custom_fields"})
+    for key in ("code", "name", "lot", "manufacturer_code", "comment"):
+        values[key] = (values[key] or "").strip() or None
+    values["material_group_id"] = material_id
+    values["rack_custom_fields_json"] = json.dumps(_normalize_rack_custom_fields(body.custom_fields))
+    return values
+
+
+@app.put("/api/admin/cell-editor/{location_id}")
+def save_context_cell(location_id: int, body: ContextCellSave, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    require_admin(x_admin_token)
+    with SessionLocal() as db:
+        # Acquire SQLite's writer lock BEFORE reading/checking any baseline.
+        # Other writers cannot pass validation against the same stale state.
+        db.execute(text("BEGIN IMMEDIATE"))
+        location = db.get(Location, location_id)
+        if not location:
+            raise HTTPException(404, "Ubicación no encontrada")
+        if _inventory_fingerprint(location) != body.expected_location:
+            raise HTTPException(409, "La casilla cambió. Conserva tu borrador y recarga para revisar.")
+        location_fields = set(LocationPatchAdmin.model_fields)
+        rack_fields = set(RackIn.model_fields) - {"status"}
+        if set(body.location) - location_fields or set(body.rack) - rack_fields:
+            raise HTTPException(422, "Campos de edición no permitidos")
+        requested_location = _context_validate(LocationPatchAdmin, body.location).model_dump(exclude_unset=True)
+        target_id = requested_location.get("rack_id", location.rack_id)
+        if (body.rack or body.reserved is not None) and (not body.rack_id or body.rack_id != target_id):
+            raise HTTPException(422, "El rack editado debe ser el asignado a la casilla")
+        ids = {value for value in (location.rack_id, target_id, body.rack_id) if value is not None}
+        racks = list(db.execute(select(Rack).where(Rack.id.in_(ids))).scalars()) if ids else []
+        if len(racks) != len(ids):
+            raise HTTPException(404, "Rack no encontrado")
+        for row in racks:
+            if body.expected_racks.get(row.id) != _context_rack_fingerprint(db, row):
+                raise HTTPException(409, "El rack cambió. Conserva tu borrador y recarga para revisar.")
+        values = requested_location
+        for key in ("status", "enabled", "is_visible"):
+            if key in values and (values[key] is None or values[key] not in (0, 1)):
+                raise HTTPException(422, f"{key} debe ser 0 o 1")
+        for key in ("code", "note"):
+            if key in values:
+                values[key] = (values[key] or "").strip() or None
+        values = {key: value for key, value in values.items() if getattr(location, key) != value}
+        rack = next((row for row in racks if row.id == body.rack_id), None)
+        rack_values = {}
+        if body.rack:
+            original = _rack_out(db, rack).model_dump(include=set(RackIn.model_fields))
+            merged = _context_validate(RackIn, {**original, **body.rack})
+            validated = _validated_rack_values(db, rack.id, merged, fields=set(body.rack))
+            for key in body.rack:
+                column = "rack_custom_fields_json" if key == "custom_fields" else key
+                if getattr(rack, column) != validated[column]:
+                    rack_values[column] = validated[column]
+        reservation_changed = rack is not None and body.reserved is not None and bool(body.reserved) != rack_status_is_reserved(rack.status)
+        if values or rack_values or reservation_changed:
+            _guard_admin_inventory_edit(db, location_ids=[location.id], rack_ids=ids)
+            _validate_foreign_keys(db, values.get("area_id", location.area_id), target_id, ignore_xy=(location.x, location.y))
+            if target_id != location.rack_id and any(rack_status_is_reserved(row.status) for row in racks):
+                raise HTTPException(409, "No se puede reasignar un rack reservado. Revisa Diagnóstico y limpieza.")
+            # Validate the final state, allowing an atomic detach + mark free.
+            if values.get("status") == 0 and target_id is not None:
+                raise HTTPException(409, "No se puede marcar libre una casilla con rack")
+            now = datetime.utcnow()
+            for key, value in values.items():
+                setattr(location, key, value)
+            if ("rack_id" in values or "status" in values) and location.rack_id is not None:
+                location.status = 1
+            elif "rack_id" in values and "status" not in values:
+                location.status = 0
+            if values:
+                location.updated_at = now
+            if "rack_id" in values or "area_id" in values:
+                # Assignment/area are derived fields in RackOut. Version both the
+                # previous and new rack so HTTP and other sessions converge too.
+                for affected in racks:
+                    affected.updated_at = now
+            for key, value in rack_values.items():
+                setattr(rack, key, value)
+            if reservation_changed:
+                previous = rack.status
+                # The guard already rejects ALL active orders. No cleanup or RCS call.
+                apply_rack_reservation_status(rack, bool(body.reserved), updated_at=now, source="context_cell", reason="admin_context_save")
+                _audit_rack_reservation_change(db, rack=rack, previous_status=previous, new_status=rack.status, source="local_ui", reason="admin_context_save", actor="admin", at=now, auto_commit=False)
+            if rack_values:
+                rack.updated_at = now
+            db.flush()
+            result = _context_cell_payload(db, location, racks)
+            db.commit()  # Existing hooks publish incremental events only after success.
+            return result
+        return _context_cell_payload(db, location, racks)
+
+
 def _first_available_location_xy(db, max_cols: int = DB_GRID_W, max_rows: int = DB_GRID_H) -> tuple[int, int]:
     used = {
         (int(row.x), int(row.y))
@@ -13143,15 +13312,7 @@ def update_rack(rack_id: int, body: RackIn, x_admin_token: Optional[str] = Heade
             raise HTTPException(status_code=404, detail="Rack no encontrado")
         previous_code = row.code
         previous_status = row.status or ""
-        dup = db.execute(select(Rack).where(Rack.code == body.code.strip(), Rack.id != rack_id)).scalar_one_or_none()
-        if dup:
-            raise HTTPException(status_code=400, detail="Ya existe un rack con ese código")
-        normalized_material_group_id = body.material_group_id if body.material_group_id else _ensure_no_material_group_in_db(db).id
-        mat = db.execute(select(MaterialGroup).where(MaterialGroup.id == normalized_material_group_id)).scalar_one_or_none()
-        if not mat:
-            raise HTTPException(status_code=400, detail="Material no encontrado")
-        if int(mat.is_active or 0) != 1:
-            raise HTTPException(status_code=409, detail="El material está inactivo; restáuralo antes de asignarlo al rack")
+        validated_values = _validated_rack_values(db, rack_id, body)
         _guard_admin_inventory_edit(db, rack_ids=[rack_id])
         requested_status = (body.status or "").strip()
         if rack_status_is_reserved(requested_status):
@@ -13188,20 +13349,12 @@ def update_rack(rack_id: int, body: RackIn, x_admin_token: Optional[str] = Heade
                 previous_status,
                 rack_status_is_reserved(previous_status),
             )
-        row.code = body.code.strip()
-        row.name = (body.name or "").strip() or None
+        for key, value in validated_values.items():
+            setattr(row, key, value)
         if (row.status or "") != requested_status:
             apply_rack_reservation_status(row, rack_status_is_reserved(requested_status), updated_at=datetime.utcnow(), source="admin_racks_manual", reason="admin_rack_save_status")
         else:
             row.status = requested_status
-        row.material_group_id = normalized_material_group_id
-        row.lot = (body.lot or "").strip() or None
-        row.manufacturer_code = (body.manufacturer_code or "").strip() or None
-        row.quantity = body.quantity
-        row.comment = (body.comment or "").strip() or None
-        row.fifo_entered_at = body.fifo_entered_at
-        row.last_moved_at = body.last_moved_at
-        row.rack_custom_fields_json = json.dumps(_normalize_rack_custom_fields(body.custom_fields))
         row.updated_at = datetime.utcnow()
         db.add(row)
         db.commit()

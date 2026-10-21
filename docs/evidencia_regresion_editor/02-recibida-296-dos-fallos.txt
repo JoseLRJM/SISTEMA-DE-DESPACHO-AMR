@@ -1,0 +1,45 @@
+....................................................................................................................................................................................................F.F.................................................................................................
+======================================================================
+FAIL: test_multiple_deletions_need_complete_snapshot (test_phase2b_runtime.CacheCheckpointTests.test_multiple_deletions_need_complete_snapshot)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\DEV2_\AppData\Local\Temp\amr-regression-0a1e1e03dfb241a18f61c22998788980\current\tests\test_phase2b_runtime.py", line 222, in test_multiple_deletions_need_complete_snapshot
+    self.run_js("""
+  File "C:\Users\DEV2_\AppData\Local\Temp\amr-regression-0a1e1e03dfb241a18f61c22998788980\current\tests\test_phase2b_runtime.py", line 194, in run_js
+    self.assertEqual(result.returncode, 0, result.stderr)
+AssertionError: 1 != 0 : AssertionError [ERR_ASSERTION]: 0 == 1
+    at [stdin]:261:8
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5) {
+  generatedMessage: true,
+  code: 'ERR_ASSERTION',
+  actual: 0,
+  expected: 1,
+  operator: '==',
+  diff: 'simple'
+}
+
+
+======================================================================
+FAIL: test_partial_event_never_confirms_global_revision (test_phase2b_runtime.CacheCheckpointTests.test_partial_event_never_confirms_global_revision)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\DEV2_\AppData\Local\Temp\amr-regression-0a1e1e03dfb241a18f61c22998788980\current\tests\test_phase2b_runtime.py", line 197, in test_partial_event_never_confirms_global_revision
+    self.run_js("""
+  File "C:\Users\DEV2_\AppData\Local\Temp\amr-regression-0a1e1e03dfb241a18f61c22998788980\current\tests\test_phase2b_runtime.py", line 194, in run_js
+    self.assertEqual(result.returncode, 0, result.stderr)
+AssertionError: 1 != 0 : AssertionError [ERR_ASSERTION]: 0 == 1
+    at [stdin]:261:8
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5) {
+  generatedMessage: true,
+  code: 'ERR_ASSERTION',
+  actual: 0,
+  expected: 1,
+  operator: '==',
+  diff: 'simple'
+}
+
+
+----------------------------------------------------------------------
+Ran 296 tests in 111.200s
+
+FAILED (failures=2)

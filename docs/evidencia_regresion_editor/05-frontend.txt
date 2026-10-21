@@ -1,0 +1,1 @@
+PASS: existing editor regressions + User/Admin defaults, four editable fields, payload allowlist, Admin capabilities, selective discard, session loss/recovery, no requests on switching, empty cell and rack-specific baselines

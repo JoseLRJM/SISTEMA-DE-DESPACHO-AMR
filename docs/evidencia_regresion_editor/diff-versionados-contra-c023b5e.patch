@@ -1,0 +1,370 @@
+diff --git a/main.py b/main.py
+index d267b17..2989c15 100644
+--- a/main.py
++++ b/main.py
+@@ -29,7 +29,7 @@ from types import SimpleNamespace
+ from fastapi import FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
+ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+ from fastapi.staticfiles import StaticFiles
+-from pydantic import BaseModel, Field, field_validator
++from pydantic import BaseModel, Field, ValidationError, field_validator
+ from sqlalchemy import select, func, delete, text, or_, event, update
+ 
+ from logging_config import ensure_log_file, get_logger
+@@ -2862,7 +2862,7 @@ def ensure_special_materials():
+             db.commit()
+ 
+ 
+-def _ensure_no_material_group_in_db(db) -> MaterialGroup:
++def _ensure_no_material_group_in_db(db, *, commit: bool = True) -> MaterialGroup:
+     row = db.execute(select(MaterialGroup).where(MaterialGroup.code == NO_MATERIAL_CODE)).scalar_one_or_none()
+     if row is None:
+         now = datetime.utcnow()
+@@ -2875,8 +2875,11 @@ def _ensure_no_material_group_in_db(db) -> MaterialGroup:
+             updated_at=now,
+         )
+         db.add(row)
+-        db.commit()
+-        db.refresh(row)
++        if commit:
++            db.commit()
++            db.refresh(row)
++        else:
++            db.flush()
+         return row
+     changed = False
+     if int(getattr(row, "is_active", 0) or 0) != 1:
+@@ -2888,8 +2891,11 @@ def _ensure_no_material_group_in_db(db) -> MaterialGroup:
+     if changed:
+         row.updated_at = datetime.utcnow()
+         db.add(row)
+-        db.commit()
+-        db.refresh(row)
++        if commit:
++            db.commit()
++            db.refresh(row)
++        else:
++            db.flush()
+     return row
+ 
+ 
+@@ -11351,6 +11357,169 @@ def _guard_admin_inventory_edit(db, *, rack_ids=(), location_ids=()) -> None:
+         raise HTTPException(status_code=409, detail=f"Inventario protegido por orden activa {active[0]}; usa recuperación con evidencia RCS o cierre extraordinario confirmado.")
+ 
+ 
++class ContextCellSave(BaseModel):
++    model_config = {"extra": "forbid"}
++    expected_location: str
++    expected_racks: Dict[int, str] = Field(default_factory=dict)
++    location: Dict[str, Any] = Field(default_factory=dict)
++    rack_id: Optional[int] = None
++    rack: Dict[str, Any] = Field(default_factory=dict)
++    reserved: Optional[int] = Field(default=None, ge=0, le=1)
++
++
++def _inventory_fingerprint(row) -> str:
++    # Compare every persisted column, including changes made outside our handlers.
++    values = {col.name: getattr(row, col.name) for col in row.__table__.columns}
++    return hashlib.sha256(json.dumps(values, sort_keys=True, default=str).encode()).hexdigest()
++
++
++def _context_rack_fingerprint(db, rack) -> str:
++    assigned_id = db.execute(select(Location.id).where(Location.rack_id == rack.id)).scalar_one_or_none()
++    return hashlib.sha256(f"{_inventory_fingerprint(rack)}:{assigned_id}".encode()).hexdigest()
++
++
++def _context_validate(model, values):
++    try:
++        return model(**values)
++    except ValidationError as exc:
++        raise HTTPException(422, str(exc)) from exc
++
++
++def _context_cell_payload(db, location, racks) -> dict:
++    return {
++        "location": _location_out(db, location).model_dump(mode="json"),
++        "racks": [_rack_out(db, row).model_dump(mode="json") for row in racks],
++        "expected_location": _inventory_fingerprint(location),
++        "expected_racks": {row.id: _context_rack_fingerprint(db, row) for row in racks},
++    }
++
++
++@app.get("/api/cell-editor/{location_id}")
++def get_context_cell(location_id: int, rack_id: Optional[int] = None):
++    # Same public inventory data as /api/catalog; no administrative secrets.
++    with SessionLocal() as db:
++        db.execute(text("BEGIN"))
++        location = db.get(Location, location_id)
++        if not location:
++            raise HTTPException(404, "Ubicación no encontrada")
++        ids = {value for value in (location.rack_id, rack_id) if value is not None}
++        racks = list(db.execute(select(Rack).where(Rack.id.in_(ids))).scalars()) if ids else []
++        if len(racks) != len(ids):
++            raise HTTPException(404, "Rack no encontrado")
++        return _context_cell_payload(db, location, racks)
++
++
++def _validated_rack_values(db, rack_id: int, body: RackIn, *, fields=None) -> dict:
++    code = body.code.strip()
++    if not code:
++        raise HTTPException(400, "El código del rack no puede estar vacío")
++    if db.execute(select(Rack.id).where(Rack.code == code, Rack.id != rack_id)).first():
++        raise HTTPException(400, "Ya existe un rack con ese código")
++    material_id = body.material_group_id
++    if not material_id and (fields is None or "material_group_id" in fields):
++        if fields is None:
++            material_id = _ensure_no_material_group_in_db(db, commit=False).id
++        else:
++            no_material = db.execute(select(MaterialGroup).where(MaterialGroup.code == NO_MATERIAL_CODE)).scalar_one_or_none()
++            material_id = (no_material or _ensure_no_material_group_in_db(db, commit=False)).id
++    if material_id:
++        material = db.get(MaterialGroup, material_id)
++        if not material:
++            raise HTTPException(400, "Material no encontrado")
++        if int(material.is_active or 0) != 1:
++            raise HTTPException(409, "El material está inactivo; restáuralo antes de asignarlo al rack")
++    values = body.model_dump(exclude={"status", "custom_fields"})
++    for key in ("code", "name", "lot", "manufacturer_code", "comment"):
++        values[key] = (values[key] or "").strip() or None
++    values["material_group_id"] = material_id
++    values["rack_custom_fields_json"] = json.dumps(_normalize_rack_custom_fields(body.custom_fields))
++    return values
++
++
++@app.put("/api/admin/cell-editor/{location_id}")
++def save_context_cell(location_id: int, body: ContextCellSave, x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
++    require_admin(x_admin_token)
++    with SessionLocal() as db:
++        # Acquire SQLite's writer lock BEFORE reading/checking any baseline.
++        # Other writers cannot pass validation against the same stale state.
++        db.execute(text("BEGIN IMMEDIATE"))
++        location = db.get(Location, location_id)
++        if not location:
++            raise HTTPException(404, "Ubicación no encontrada")
++        if _inventory_fingerprint(location) != body.expected_location:
++            raise HTTPException(409, "La casilla cambió. Conserva tu borrador y recarga para revisar.")
++        location_fields = set(LocationPatchAdmin.model_fields)
++        rack_fields = set(RackIn.model_fields) - {"status"}
++        if set(body.location) - location_fields or set(body.rack) - rack_fields:
++            raise HTTPException(422, "Campos de edición no permitidos")
++        requested_location = _context_validate(LocationPatchAdmin, body.location).model_dump(exclude_unset=True)
++        target_id = requested_location.get("rack_id", location.rack_id)
++        if (body.rack or body.reserved is not None) and (not body.rack_id or body.rack_id != target_id):
++            raise HTTPException(422, "El rack editado debe ser el asignado a la casilla")
++        ids = {value for value in (location.rack_id, target_id, body.rack_id) if value is not None}
++        racks = list(db.execute(select(Rack).where(Rack.id.in_(ids))).scalars()) if ids else []
++        if len(racks) != len(ids):
++            raise HTTPException(404, "Rack no encontrado")
++        for row in racks:
++            if body.expected_racks.get(row.id) != _context_rack_fingerprint(db, row):
++                raise HTTPException(409, "El rack cambió. Conserva tu borrador y recarga para revisar.")
++        values = requested_location
++        for key in ("status", "enabled", "is_visible"):
++            if key in values and (values[key] is None or values[key] not in (0, 1)):
++                raise HTTPException(422, f"{key} debe ser 0 o 1")
++        for key in ("code", "note"):
++            if key in values:
++                values[key] = (values[key] or "").strip() or None
++        values = {key: value for key, value in values.items() if getattr(location, key) != value}
++        rack = next((row for row in racks if row.id == body.rack_id), None)
++        rack_values = {}
++        if body.rack:
++            original = _rack_out(db, rack).model_dump(include=set(RackIn.model_fields))
++            merged = _context_validate(RackIn, {**original, **body.rack})
++            validated = _validated_rack_values(db, rack.id, merged, fields=set(body.rack))
++            for key in body.rack:
++                column = "rack_custom_fields_json" if key == "custom_fields" else key
++                if getattr(rack, column) != validated[column]:
++                    rack_values[column] = validated[column]
++        reservation_changed = rack is not None and body.reserved is not None and bool(body.reserved) != rack_status_is_reserved(rack.status)
++        if values or rack_values or reservation_changed:
++            _guard_admin_inventory_edit(db, location_ids=[location.id], rack_ids=ids)
++            _validate_foreign_keys(db, values.get("area_id", location.area_id), target_id, ignore_xy=(location.x, location.y))
++            if target_id != location.rack_id and any(rack_status_is_reserved(row.status) for row in racks):
++                raise HTTPException(409, "No se puede reasignar un rack reservado. Revisa Diagnóstico y limpieza.")
++            # Validate the final state, allowing an atomic detach + mark free.
++            if values.get("status") == 0 and target_id is not None:
++                raise HTTPException(409, "No se puede marcar libre una casilla con rack")
++            now = datetime.utcnow()
++            for key, value in values.items():
++                setattr(location, key, value)
++            if ("rack_id" in values or "status" in values) and location.rack_id is not None:
++                location.status = 1
++            elif "rack_id" in values and "status" not in values:
++                location.status = 0
++            if values:
++                location.updated_at = now
++            if "rack_id" in values or "area_id" in values:
++                # Assignment/area are derived fields in RackOut. Version both the
++                # previous and new rack so HTTP and other sessions converge too.
++                for affected in racks:
++                    affected.updated_at = now
++            for key, value in rack_values.items():
++                setattr(rack, key, value)
++            if reservation_changed:
++                previous = rack.status
++                # The guard already rejects ALL active orders. No cleanup or RCS call.
++                apply_rack_reservation_status(rack, bool(body.reserved), updated_at=now, source="context_cell", reason="admin_context_save")
++                _audit_rack_reservation_change(db, rack=rack, previous_status=previous, new_status=rack.status, source="local_ui", reason="admin_context_save", actor="admin", at=now, auto_commit=False)
++            if rack_values:
++                rack.updated_at = now
++            db.flush()
++            result = _context_cell_payload(db, location, racks)
++            db.commit()  # Existing hooks publish incremental events only after success.
++            return result
++        return _context_cell_payload(db, location, racks)
++
++
+ def _first_available_location_xy(db, max_cols: int = DB_GRID_W, max_rows: int = DB_GRID_H) -> tuple[int, int]:
+     used = {
+         (int(row.x), int(row.y))
+@@ -13143,15 +13312,7 @@ def update_rack(rack_id: int, body: RackIn, x_admin_token: Optional[str] = Heade
+             raise HTTPException(status_code=404, detail="Rack no encontrado")
+         previous_code = row.code
+         previous_status = row.status or ""
+-        dup = db.execute(select(Rack).where(Rack.code == body.code.strip(), Rack.id != rack_id)).scalar_one_or_none()
+-        if dup:
+-            raise HTTPException(status_code=400, detail="Ya existe un rack con ese código")
+-        normalized_material_group_id = body.material_group_id if body.material_group_id else _ensure_no_material_group_in_db(db).id
+-        mat = db.execute(select(MaterialGroup).where(MaterialGroup.id == normalized_material_group_id)).scalar_one_or_none()
+-        if not mat:
+-            raise HTTPException(status_code=400, detail="Material no encontrado")
+-        if int(mat.is_active or 0) != 1:
+-            raise HTTPException(status_code=409, detail="El material está inactivo; restáuralo antes de asignarlo al rack")
++        validated_values = _validated_rack_values(db, rack_id, body)
+         _guard_admin_inventory_edit(db, rack_ids=[rack_id])
+         requested_status = (body.status or "").strip()
+         if rack_status_is_reserved(requested_status):
+@@ -13188,20 +13349,12 @@ def update_rack(rack_id: int, body: RackIn, x_admin_token: Optional[str] = Heade
+                 previous_status,
+                 rack_status_is_reserved(previous_status),
+             )
+-        row.code = body.code.strip()
+-        row.name = (body.name or "").strip() or None
++        for key, value in validated_values.items():
++            setattr(row, key, value)
+         if (row.status or "") != requested_status:
+             apply_rack_reservation_status(row, rack_status_is_reserved(requested_status), updated_at=datetime.utcnow(), source="admin_racks_manual", reason="admin_rack_save_status")
+         else:
+             row.status = requested_status
+-        row.material_group_id = normalized_material_group_id
+-        row.lot = (body.lot or "").strip() or None
+-        row.manufacturer_code = (body.manufacturer_code or "").strip() or None
+-        row.quantity = body.quantity
+-        row.comment = (body.comment or "").strip() or None
+-        row.fifo_entered_at = body.fifo_entered_at
+-        row.last_moved_at = body.last_moved_at
+-        row.rack_custom_fields_json = json.dumps(_normalize_rack_custom_fields(body.custom_fields))
+         row.updated_at = datetime.utcnow()
+         db.add(row)
+         db.commit()
+diff --git a/static/app.js b/static/app.js
+index 310a9d6..562c901 100644
+--- a/static/app.js
++++ b/static/app.js
+@@ -4008,6 +4008,7 @@ function setAdminUI(enabled) {
+   ]);
+ 
+   document.querySelectorAll("input, textarea, select, button").forEach((el) => {
++    if (el.closest?.('#contextCellDialog') || ['btnContextCell', 'contextCellOffer'].includes(el.id)) return;
+     if (
+       el.closest?.(".action-tabs-header") ||
+       el.classList?.contains("action-tab-button")
+@@ -4048,6 +4049,7 @@ function setAdminUI(enabled) {
+   updateQrAdminRecordState("transition", selectedQrAdminRow("transition"));
+   updateCatalogRecordState("area", adminAreas.find(row => Number(row.id) === Number(areaId?.value || 0)) || null);
+   updateCatalogRecordState("material", adminMaterials.find(row => Number(row.id) === Number(materialId?.value || 0)) || null);
++  if (typeof syncContextCellPermissions === 'function') syncContextCellPermissions();
+ }
+ function applyAgvOverlayConfigFromGrid(cfg = {}) {
+   agvOverlayConfig.scale_x = Number(cfg.agv_overlay_scale_x ?? 1) || 1;
+@@ -8026,6 +8028,8 @@ function setCellBulkControlsState() {
+ }
+ function setPrimarySelection(loc, { preserveMulti = false } = {}) {
+   if (!loc) return;
++  const contextOffer = document.getElementById('contextCellOffer');
++  if (contextOffer) contextOffer.hidden = true;
+   finishEditingLock("cell", { applyPending: false });
+   selected = { x: Number(loc.x), y: Number(loc.y) };
+   if (!preserveMulti) multiSelectedLocationIds.clear();
+diff --git a/static/index.html b/static/index.html
+index 7aa8c5b..8dcff1d 100644
+--- a/static/index.html
++++ b/static/index.html
+@@ -285,6 +285,7 @@
+ <div class="card" id="card-cell">
+ <h3>Celda seleccionada</h3>
+ <div class="small" id="selectedCellTitle">Celda (0, 0)</div>
++<button class="btn" id="btnContextCell" type="button">Editar casilla</button>
+ <div class="edit-refresh-notice hidden" id="cellEditRefreshNotice">Edicion activa: actualizacion automatica pausada.</div>
+ <div class="row edit-refresh-actions hidden" id="cellEditRefreshActions"><button class="btn ghost" id="btnRefreshCellAfterEdit" type="button">Actualizar ahora</button></div>
+ <div class="row">
+@@ -1483,6 +1484,44 @@ Esta acci&oacute;n:<br/>
+ <div class="row qr-admin-modal-actions"><button class="btn ghost" id="btnCancelQrDeleteRestore" type="button">Cancelar</button><button class="btn danger" disabled="" id="btnConfirmQrDeleteRestore" type="button">Eliminar configuraci&oacute;n</button></div>
+ </div>
+ </div>
+-<script src="/static/app.js?v=catalog-safe-delete-ui-20260731"></script>
++<button class="btn context-cell-offer" id="contextCellOffer" type="button" hidden>Editar casilla</button>
++<dialog id="contextCellDialog" aria-labelledby="contextCellTitle">
++<form id="contextCellForm">
++<h3 id="contextCellTitle">Editar casilla</h3>
++<div class="row context-cell-views" role="group" aria-label="Vista del editor"><button class="btn" id="contextViewUser" type="button" aria-pressed="true">Usuario</button><button class="btn" id="contextViewAdmin" type="button" aria-pressed="false" hidden>Implementación / Admin</button></div>
++<p id="contextCellReference" class="small"></p>
++<p id="contextCellPermission" class="small"></p>
++<fieldset id="contextLocationFields"><legend>Ubicación</legend>
++<div class="context-cell-grid">
++<label data-context-admin hidden>Código<input name="code" maxlength="64"/></label>
++<label data-context-admin hidden>Área<select name="area_id"></select></label>
++<label data-context-admin hidden>Estado<select name="status"><option value="0">Libre</option><option value="1">Ocupado</option></select></label>
++<label data-context-admin hidden>Habilitada<select name="enabled"><option value="1">Sí</option><option value="0">No</option></select></label>
++<label data-context-admin hidden>Visible<select name="is_visible"><option value="1">Sí</option><option value="0">No</option></select></label>
++<label>Rack asignado<select name="rack_id"></select></label>
++<label class="context-cell-wide" data-context-admin hidden>Nota<textarea name="note" maxlength="512"></textarea></label>
++</div></fieldset>
++<fieldset id="contextRackFields"><legend>Rack y material</legend>
++<p id="contextRackTask" class="small"></p>
++<p id="contextRackHint" class="small"></p>
++<div class="context-cell-grid">
++<label data-context-admin hidden>Código<input name="rack_code" maxlength="64" required/></label>
++<label data-context-admin hidden>Nombre<input name="rack_name" maxlength="128"/></label>
++<label>Material<select name="rack_material_group_id"></select></label>
++<label>Reserva<select name="rack_reserved"><option value="0">No reservado</option><option value="1">Reservado</option></select></label>
++<label>Lote<input name="rack_lot" maxlength="128"/></label>
++<label data-context-admin hidden>Cantidad<input name="rack_quantity" type="number" min="0" max="999999" step="1"/></label>
++<label data-context-admin hidden>Fabricante<input name="rack_manufacturer_code" maxlength="128"/></label>
++<label data-context-admin hidden>Entrada FIFO<input name="rack_fifo_entered_at" type="datetime-local"/></label>
++<label data-context-admin hidden>Último movimiento<input name="rack_last_moved_at" type="datetime-local"/></label>
++<label class="context-cell-wide" data-context-admin hidden>Comentario<textarea name="rack_comment" maxlength="512"></textarea></label>
++<fieldset class="context-cell-wide" id="contextCustomAdminFields" data-context-admin hidden><legend>Características personalizadas</legend><input name="rack_custom_fields" type="hidden"/><div id="contextCustomFields"></div><button class="btn" id="contextAddCustomField" type="button">Añadir característica</button></fieldset>
++</div></fieldset>
++<p id="contextCellError" role="alert" aria-live="polite"></p>
++<div class="row"><button class="btn primary" id="contextCellSave" type="submit">Guardar cambios</button><button class="btn" id="contextCellReload" type="button">Recargar para revisar</button><button class="btn ghost" id="contextCellCancel" type="button">Cancelar</button></div>
++</form>
++</dialog>
++<script src="/static/app.js?v=context-cell-20261021"></script>
++<script src="/static/cell-editor.js?v=context-cell-views-20261021"></script>
+ </body>
+ </html>
+diff --git a/static/styles.css b/static/styles.css
+index c49beac..66c636c 100644
+--- a/static/styles.css
++++ b/static/styles.css
+@@ -922,3 +922,18 @@ textarea[disabled], select[disabled]{opacity:.6}
+   .qr-admin-modal-card { padding: 1rem; }
+   .qr-admin-modal-actions { flex-wrap: wrap; }
+ }
++/* A single native dialog keeps keyboard focus inside the contextual editor. */
++#contextCellDialog { width: min(780px, calc(100vw - 32px)); max-height: calc(100vh - 40px); overflow: auto; padding: 22px; border: 1px solid #64748b; border-radius: 14px; background: var(--panel, #172033); color: var(--text, #f1f5f9); }
++#contextCellDialog::backdrop { background: rgba(0, 0, 0, .65); }
++#contextCellDialog fieldset { margin: 14px 0; padding: 12px; border: 1px solid #64748b; border-radius: 8px; }
++.context-cell-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
++.context-cell-grid label { display: flex; flex-direction: column; gap: 5px; }
++.context-cell-wide { grid-column: 1 / -1; }
++.context-cell-offer { position: fixed; z-index: 50; box-shadow: 0 3px 12px #0008; }
++.context-cell-offer[hidden] { display: none; }
++#contextCellError { white-space: pre-wrap; overflow-wrap: anywhere; }
++#contextCellDialog [hidden] { display: none !important; }
++.context-cell-views { flex-wrap: wrap; }
++.context-cell-views [aria-pressed="true"] { border-color: var(--sel, #ffd166); }
++#contextCellReference { white-space: pre-line; }
++@media (max-width: 540px) { .context-cell-grid { grid-template-columns: 1fr; } }

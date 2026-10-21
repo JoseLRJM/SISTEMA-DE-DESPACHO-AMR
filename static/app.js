@@ -4008,6 +4008,7 @@ function setAdminUI(enabled) {
   ]);
 
   document.querySelectorAll("input, textarea, select, button").forEach((el) => {
+    if (el.closest?.('#contextCellDialog') || ['btnContextCell', 'contextCellOffer'].includes(el.id)) return;
     if (
       el.closest?.(".action-tabs-header") ||
       el.classList?.contains("action-tab-button")
@@ -4048,6 +4049,7 @@ function setAdminUI(enabled) {
   updateQrAdminRecordState("transition", selectedQrAdminRow("transition"));
   updateCatalogRecordState("area", adminAreas.find(row => Number(row.id) === Number(areaId?.value || 0)) || null);
   updateCatalogRecordState("material", adminMaterials.find(row => Number(row.id) === Number(materialId?.value || 0)) || null);
+  if (typeof syncContextCellPermissions === 'function') syncContextCellPermissions();
 }
 function applyAgvOverlayConfigFromGrid(cfg = {}) {
   agvOverlayConfig.scale_x = Number(cfg.agv_overlay_scale_x ?? 1) || 1;
@@ -8026,6 +8028,8 @@ function setCellBulkControlsState() {
 }
 function setPrimarySelection(loc, { preserveMulti = false } = {}) {
   if (!loc) return;
+  const contextOffer = document.getElementById('contextCellOffer');
+  if (contextOffer) contextOffer.hidden = true;
   finishEditingLock("cell", { applyPending: false });
   selected = { x: Number(loc.x), y: Number(loc.y) };
   if (!preserveMulti) multiSelectedLocationIds.clear();

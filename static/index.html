@@ -285,6 +285,7 @@
 <div class="card" id="card-cell">
 <h3>Celda seleccionada</h3>
 <div class="small" id="selectedCellTitle">Celda (0, 0)</div>
+<button class="btn" id="btnContextCell" type="button">Editar casilla</button>
 <div class="edit-refresh-notice hidden" id="cellEditRefreshNotice">Edicion activa: actualizacion automatica pausada.</div>
 <div class="row edit-refresh-actions hidden" id="cellEditRefreshActions"><button class="btn ghost" id="btnRefreshCellAfterEdit" type="button">Actualizar ahora</button></div>
 <div class="row">
@@ -1483,6 +1484,44 @@ Esta acci&oacute;n:<br/>
 <div class="row qr-admin-modal-actions"><button class="btn ghost" id="btnCancelQrDeleteRestore" type="button">Cancelar</button><button class="btn danger" disabled="" id="btnConfirmQrDeleteRestore" type="button">Eliminar configuraci&oacute;n</button></div>
 </div>
 </div>
-<script src="/static/app.js?v=catalog-safe-delete-ui-20260731"></script>
+<button class="btn context-cell-offer" id="contextCellOffer" type="button" hidden>Editar casilla</button>
+<dialog id="contextCellDialog" aria-labelledby="contextCellTitle">
+<form id="contextCellForm">
+<h3 id="contextCellTitle">Editar casilla</h3>
+<div class="row context-cell-views" role="group" aria-label="Vista del editor"><button class="btn" id="contextViewUser" type="button" aria-pressed="true">Usuario</button><button class="btn" id="contextViewAdmin" type="button" aria-pressed="false" hidden>Implementación / Admin</button></div>
+<p id="contextCellReference" class="small"></p>
+<p id="contextCellPermission" class="small"></p>
+<fieldset id="contextLocationFields"><legend>Ubicación</legend>
+<div class="context-cell-grid">
+<label data-context-admin hidden>Código<input name="code" maxlength="64"/></label>
+<label data-context-admin hidden>Área<select name="area_id"></select></label>
+<label data-context-admin hidden>Estado<select name="status"><option value="0">Libre</option><option value="1">Ocupado</option></select></label>
+<label data-context-admin hidden>Habilitada<select name="enabled"><option value="1">Sí</option><option value="0">No</option></select></label>
+<label data-context-admin hidden>Visible<select name="is_visible"><option value="1">Sí</option><option value="0">No</option></select></label>
+<label>Rack asignado<select name="rack_id"></select></label>
+<label class="context-cell-wide" data-context-admin hidden>Nota<textarea name="note" maxlength="512"></textarea></label>
+</div></fieldset>
+<fieldset id="contextRackFields"><legend>Rack y material</legend>
+<p id="contextRackTask" class="small"></p>
+<p id="contextRackHint" class="small"></p>
+<div class="context-cell-grid">
+<label data-context-admin hidden>Código<input name="rack_code" maxlength="64" required/></label>
+<label data-context-admin hidden>Nombre<input name="rack_name" maxlength="128"/></label>
+<label>Material<select name="rack_material_group_id"></select></label>
+<label>Reserva<select name="rack_reserved"><option value="0">No reservado</option><option value="1">Reservado</option></select></label>
+<label>Lote<input name="rack_lot" maxlength="128"/></label>
+<label data-context-admin hidden>Cantidad<input name="rack_quantity" type="number" min="0" max="999999" step="1"/></label>
+<label data-context-admin hidden>Fabricante<input name="rack_manufacturer_code" maxlength="128"/></label>
+<label data-context-admin hidden>Entrada FIFO<input name="rack_fifo_entered_at" type="datetime-local"/></label>
+<label data-context-admin hidden>Último movimiento<input name="rack_last_moved_at" type="datetime-local"/></label>
+<label class="context-cell-wide" data-context-admin hidden>Comentario<textarea name="rack_comment" maxlength="512"></textarea></label>
+<fieldset class="context-cell-wide" id="contextCustomAdminFields" data-context-admin hidden><legend>Características personalizadas</legend><input name="rack_custom_fields" type="hidden"/><div id="contextCustomFields"></div><button class="btn" id="contextAddCustomField" type="button">Añadir característica</button></fieldset>
+</div></fieldset>
+<p id="contextCellError" role="alert" aria-live="polite"></p>
+<div class="row"><button class="btn primary" id="contextCellSave" type="submit">Guardar cambios</button><button class="btn" id="contextCellReload" type="button">Recargar para revisar</button><button class="btn ghost" id="contextCellCancel" type="button">Cancelar</button></div>
+</form>
+</dialog>
+<script src="/static/app.js?v=context-cell-20261021"></script>
+<script src="/static/cell-editor.js?v=context-cell-views-20261021"></script>
 </body>
 </html>
